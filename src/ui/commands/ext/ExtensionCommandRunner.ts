@@ -2,87 +2,60 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { MetadataNode } from '../../tree/TreeNode';
-import type { AgentMessage } from '../../../domain/agent';
-import {
-  AgentCommandError,
-  AgentOperationService,
-  DesignerAgentProcess,
-  DesignerAgentSessionManager,
-  ProcessDesignerAgentTransportFactory,
-  buildDesignerAgentModeArgs,
-  waitForTcpPort,
-  type DesignerAgentInfoBaseConnection,
-  type DesignerAgentConnectionOptions,
-} from '../../../infra/agent';
 import {
   describeProcessInterruption,
-  getOrCreate,
   maskSensitiveCliArgs,
-  normalizeInfoBasePath,
-  resolveV8PathHintFromVersion,
   runProcess,
 } from '../../../infra/process';
-import { readExtensionListFromDumpFile, resolveDbPassword, type ProjectSecretStorage } from '../../../infra/environment';
+import { readExtensionListFromDumpFile } from '../../../infra/environment';
+import {
+  buildConnectionCliArgs,
+  resolveConnectionFromSettings,
+  resolveProjectSettingsPath,
+  resolveSettingsPath,
+  type ConnectionParams,
+} from './connectionSettings';
+import type { ConfigurationImportHooks, ConfigurationProgressHooks } from './configurationOperationTypes';
+import {
+  beginConfigurationOperationStatus,
+  endConfigurationOperationStatus,
+  trimStatusMessage,
+  updateConfigurationOperationStatus,
+} from './configurationOperationStatus';
+import { isAgentConfigurationOperationMode } from './agent/agentSettings';
+import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
+
+// Прежний публичный API модуля сохраняется реэкспортом: потребители (Container, команды, тесты)
+// импортируют из ExtensionCommandRunner, а реализация живёт в соседних модулях (Э2).
+export {
+  buildConnectionCliArgs,
+  resolveConnectionFromSettings,
+  resolveProjectSettingsPath,
+  resolveSettingsPath,
+  setProjectSecretStorage,
+  type ConnectionParams,
+} from './connectionSettings';
+export type { ConfigurationImportHooks, ConfigurationProgressHooks } from './configurationOperationTypes';
+export {
+  beginConfigurationOperationStatus,
+  endConfigurationOperationStatus,
+  setConfigurationOperationStatus,
+  updateConfigurationOperationStatus,
+} from './configurationOperationStatus';
+export {
+  isAgentConfigurationOperationMode,
+  readAgentCommandSettings,
+  splitAgentModeArgs,
+} from './agent/agentSettings';
+export {
+  disposeCachedAgentOperationServices,
+  getAgentOperationServiceForInteractiveDesigner,
+  getAgentServiceCacheKey,
+  getCachedAgentOperationService,
+  type InteractiveDesignerAgentService,
+} from './agent/AgentServiceRegistry';
 
 type NodeArg = MetadataNode | { xmlPath?: string; nodeKind?: string; label?: string };
-
-/**
- * Хранилище секретов проекта, внедряемое из композиционного корня (`Container`).
- * Модуль запускает процессы 1С из множества экспортируемых функций с разными
- * сигнатурами; вместо каскадного проброса `ProjectSecretStorage` через каждую из
- * них корень один раз регистрирует единственный экземпляр. Пароль БД читается
- * только через него (SecretStorage), в env.json пароль больше не хранится.
- */
-let injectedProjectSecretStorage: ProjectSecretStorage | undefined;
-
-/** Регистрирует хранилище секретов проекта. Вызывается один раз из `Container`. */
-export function setProjectSecretStorage(secrets: ProjectSecretStorage): void {
-  injectedProjectSecretStorage = secrets;
-}
-
-export interface ConfigurationProgressHooks {
-  readonly onProgressMessage?: (message: string) => void;
-}
-
-export interface ConfigurationImportHooks extends ConfigurationProgressHooks {
-  readonly beforeProjectFilesChanged?: (filePaths: string[]) => void;
-}
-
-export interface ConnectionParams {
-  infoBasePath?: string;
-  infoBaseServer?: string;
-  infoBaseRef?: string;
-  userName?: string;
-  password?: string;
-  v8Path?: string;
-}
-
-interface AgentCommandSettings {
-  readonly host: string;
-  readonly listenAddress: string;
-  readonly port: number;
-  readonly user: string;
-  readonly password: string;
-  readonly privateKeyPath: string;
-  readonly visible: boolean;
-  readonly autoStart: boolean;
-  readonly agentModeArgs: readonly string[];
-  readonly progressInterval: number;
-  readonly startupTimeoutMs: number;
-}
-
-interface RunAgentOptions {
-  readonly progressTitle: string;
-  readonly progressStartMessage: string;
-  readonly successMessage: string;
-  readonly errorTitle: string;
-  readonly showSuccessMessage?: boolean;
-  readonly workspaceFolder: vscode.WorkspaceFolder;
-  readonly outputChannel: vscode.OutputChannel;
-  readonly rootPath: string;
-  readonly hooks?: ConfigurationImportHooks | ConfigurationProgressHooks;
-  readonly onProgressMessage?: (message: string) => void;
-}
 
 export interface RunCliOptions {
   cliArgs: string[];
@@ -100,145 +73,6 @@ export interface RunCliOptions {
   onFailureReason?: (reason: string) => void;
   afterSuccess?: () => Promise<void>;
   onProgressMessage?: (message: string) => void;
-}
-
-interface CachedAgentService {
-  readonly service: AgentOperationService;
-  readonly sessions: DesignerAgentSessionManager;
-  readonly process?: DesignerAgentProcess;
-}
-
-export interface InteractiveDesignerAgentService {
-  readonly service: AgentOperationService;
-  readonly forceDisconnect: boolean;
-}
-
-// Кэшируем именно промис сервиса (а не готовый сервис), чтобы параллельные
-// запросы с одним ключом не запускали конфигуратор/подключение дважды (TOCTOU).
-const agentServices = new Map<string, Promise<CachedAgentService>>();
-
-let statusBarItem: vscode.StatusBarItem | undefined;
-let clearStatusTimer: NodeJS.Timeout | undefined;
-// Счётчик активных операций: параллельные операции делят один статус-бар-синглтон,
-// поэтому скрывать его по таймеру можно только когда завершилась ПОСЛЕДНЯЯ (count → 0).
-let activeOperationCount = 0;
-
-export function isAgentConfigurationOperationMode(): boolean {
-  const mode = vscode.workspace
-    .getConfiguration('v8vscedit.configuration')
-    .get<string>('operationMode', 'batch');
-  return mode === 'agent';
-}
-
-/**
- * Единая точка создания/переиспользования кэшированного сервиса агента.
- * getOrCreate кладёт промис в map до await (TOCTOU-защита), а при ошибке старта
- * удаляет ключ, чтобы неудачная попытка не «отравляла» кэш навсегда.
- */
-function ensureAgentService(
-  workspaceRoot: string,
-  factory: () => Promise<CachedAgentService>
-): Promise<CachedAgentService> {
-  const key = path.resolve(workspaceRoot).toLowerCase();
-  const entry = getOrCreate(agentServices, key, factory);
-  // Помечаем промис его значением для синхронного геттера getCachedAgentOperationService.
-  void entry.then((value) => resolvedServices.set(entry, value.service), () => undefined);
-  return entry;
-}
-
-export function getAgentServiceCacheKey(workspaceRoot: string): string {
-  return path.resolve(workspaceRoot).toLowerCase();
-}
-
-export function getCachedAgentOperationService(workspaceFolder: vscode.WorkspaceFolder): AgentOperationService | undefined {
-  const key = getAgentServiceCacheKey(workspaceFolder.uri.fsPath);
-  const cached = agentServices.get(key);
-  if (!cached) {
-    return undefined;
-  }
-  // Синхронный геттер отдаёт сервис, только если промис старта уже успешно
-  // разрешён (значение попало в resolvedServices при создании через ensureAgentService).
-  return resolvedServices.get(cached);
-}
-
-// Слабое сопоставление «промис старта → готовый сервис» для синхронного геттера:
-// как только промис разрешается успешно, кладём сюда его значение.
-const resolvedServices = new WeakMap<Promise<CachedAgentService>, AgentOperationService>();
-
-export async function disposeCachedAgentOperationServices(): Promise<void> {
-  // Статус-бар создаётся лениво при begin/update/end и не попадает в context.subscriptions,
-  // поэтому освобождаем его здесь — на общем пути остановки расширения.
-  if (clearStatusTimer) {
-    clearTimeout(clearStatusTimer);
-    clearStatusTimer = undefined;
-  }
-  statusBarItem?.dispose();
-  statusBarItem = undefined;
-  activeOperationCount = 0;
-
-  const entries = [...agentServices.values()];
-  agentServices.clear();
-  await Promise.all(entries.map(async (entryPromise) => {
-    // Зафейленный промис старта не должен ронять остановку расширения.
-    const entry = await entryPromise.catch(() => undefined);
-    if (!entry) {
-      return;
-    }
-    try {
-      await entry.sessions.disposeAll();
-    } finally {
-      await entry.process?.stop();
-    }
-  }));
-}
-
-export async function getAgentOperationServiceForInteractiveDesigner(
-  workspaceFolder: vscode.WorkspaceFolder,
-  outputChannel: vscode.OutputChannel
-): Promise<InteractiveDesignerAgentService | undefined> {
-  const cached = getCachedAgentOperationService(workspaceFolder);
-  if (cached) {
-    return { service: cached, forceDisconnect: false };
-  }
-
-  const workspaceRoot = workspaceFolder.uri.fsPath;
-  try {
-    // Сигнальным исключением помечаем случай «агент не найден» — тогда ключ
-    // не должен осесть в кэше отравленным, и getOrCreate его удалит.
-    const entry = await ensureAgentService(workspaceRoot, async () => {
-      const settingsPath = resolveSettingsPath(workspaceRoot, workspaceRoot);
-      const connection = await resolveConnectionFromSettings(settingsPath);
-      const agentSettings = readAgentCommandSettings(connection);
-      const portOpened = await waitForTcpPort({
-        host: agentSettings.host,
-        port: agentSettings.port,
-        timeoutMs: 500,
-      });
-      if (!portOpened) {
-        throw new AgentPortNotOpenError();
-      }
-      outputChannel.appendLine(
-        `[agent] Найден запущенный агент конфигуратора: ${agentSettings.host}:${String(agentSettings.port)}.`
-      );
-      return createAgentOperationServiceEntry(workspaceRoot, agentSettings);
-    });
-    return { service: entry.service, forceDisconnect: true };
-  } catch (error) {
-    if (error instanceof AgentPortNotOpenError) {
-      return undefined;
-    }
-    const message = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(`[agent][warn] Не удалось проверить запущенный агент конфигуратора: ${message}`);
-    return undefined;
-  }
-}
-
-/** Внутренний сигнал: агент не слушает порт — не ошибка старта, а «нет агента». */
-class AgentPortNotOpenError extends Error {
-  constructor() {
-    super('агент конфигуратора не обнаружен на порту');
-    this.name = 'AgentPortNotOpenError';
-  }
 }
 
 export function extractExtensionTarget(node: NodeArg): { extensionName: string; extensionRoot: string } | null {
@@ -1049,409 +883,6 @@ export async function runInternalCliCommand(
   }
 }
 
-async function runAgentConfigurationOperation(
-  options: RunAgentOptions,
-  operation: (
-    service: AgentOperationService,
-    hooks: {
-      onMessage: (message: string) => void;
-      onProjectFilesWillChange?: (filePaths: string[]) => void;
-      onQuestion: (message: AgentMessage) => Promise<string | undefined>;
-    }
-  ) => Promise<void>
-): Promise<boolean> {
-  options.outputChannel.appendLine(`[agent] Старт: ${options.progressTitle}`);
-  beginConfigurationOperationStatus(options.progressTitle, options.progressStartMessage);
-  options.hooks?.onProgressMessage?.(options.progressStartMessage);
-  options.onProgressMessage?.(options.progressStartMessage);
-
-  const importHooks = isImportHooks(options.hooks) ? options.hooks : undefined;
-  const buildOperationHooks = () => ({
-    onMessage: (message: string) => {
-      options.outputChannel.appendLine(`[agent] ${message}`);
-      const statusMessage = getAgentStatusMessage(message);
-      if (statusMessage) {
-        updateConfigurationOperationStatus(options.progressTitle, statusMessage);
-        options.hooks?.onProgressMessage?.(statusMessage);
-        options.onProgressMessage?.(statusMessage);
-      }
-    },
-    onProjectFilesWillChange: importHooks
-      ? (filePaths: string[]) => importHooks.beforeProjectFilesChanged?.(filePaths)
-      : undefined,
-    onQuestion: showAgentQuestion,
-  });
-
-  try {
-    const service = await getAgentOperationService(options.workspaceFolder, options.rootPath, options.outputChannel);
-    await operation(service, buildOperationHooks());
-
-    endConfigurationOperationStatus(options.progressTitle, 'завершено');
-    options.outputChannel.appendLine(`[agent] Завершено: ${options.progressTitle}`);
-    if (options.showSuccessMessage !== false) {
-      void vscode.window.showInformationMessage(options.successMessage);
-    }
-    return true;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    options.outputChannel.appendLine(`[agent][error] ${message}`);
-    if (error instanceof AgentCommandError) {
-      options.outputChannel.appendLine(`[agent][error] Команда: ${error.command}`);
-    }
-    logAgentDiagnostics(options.workspaceFolder, options.outputChannel);
-    endConfigurationOperationStatus(options.progressTitle, 'ошибка');
-    void vscode.window.showErrorMessage(
-      `${options.errorTitle}\n${message}`,
-      'Открыть журнал'
-    ).then((action) => {
-      if (action === 'Открыть журнал') {
-        options.outputChannel.show(true);
-      }
-    });
-    return false;
-  }
-}
-
-function logAgentDiagnostics(workspaceFolder: vscode.WorkspaceFolder, outputChannel: vscode.OutputChannel): void {
-  const workspaceRoot = workspaceFolder.uri.fsPath;
-  const agentBaseDir = path.join(workspaceRoot, '.v8vscedit', 'agent');
-  outputChannel.appendLine(`[agent][diag] Каталог агента: ${agentBaseDir}`);
-  // Сам конфигуратор пишет дамп в `~/.1cv8/1C/1cv8/dumps` либо в каталог временных файлов платформы.
-  // Здесь сообщаем только то, что мы заведомо знаем — служебный каталог расширения.
-}
-
-async function getAgentOperationService(
-  workspaceFolder: vscode.WorkspaceFolder,
-  rootPath: string,
-  outputChannel: vscode.OutputChannel
-): Promise<AgentOperationService> {
-  const workspaceRoot = workspaceFolder.uri.fsPath;
-  // ensureAgentService закрывает TOCTOU: параллельные операции не запустят
-  // конфигуратор дважды, а неудачный старт удалит ключ (getOrCreate).
-  const entry = await ensureAgentService(
-    workspaceRoot,
-    () => startAgentOperationService(workspaceRoot, rootPath, outputChannel)
-  );
-  return entry.service;
-}
-
-async function startAgentOperationService(
-  workspaceRoot: string,
-  rootPath: string,
-  outputChannel: vscode.OutputChannel
-): Promise<CachedAgentService> {
-  const settingsPath = resolveSettingsPath(workspaceRoot, rootPath);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const agentSettings = readAgentCommandSettings(connection);
-  let agentProcess: DesignerAgentProcess | undefined;
-  if (agentSettings.autoStart) {
-    agentProcess = new DesignerAgentProcess();
-    const agentBaseDir = path.join(workspaceRoot, '.v8vscedit', 'agent');
-    fs.mkdirSync(agentBaseDir, { recursive: true });
-    const args = buildAgentStartLogArgs(toDesignerAgentConnection(connection), agentSettings, agentBaseDir);
-    outputChannel.appendLine(`[agent] Запуск конфигуратора: ${args.join(' ')}`);
-    agentProcess.start({
-      connection: toDesignerAgentConnection(connection),
-      visible: agentSettings.visible,
-      agentPort: agentSettings.port,
-      agentListenAddress: agentSettings.listenAddress,
-      agentBaseDir,
-      agentModeArgs: agentSettings.agentModeArgs,
-      // 1С создаёт 1cv8u.pfl в рабочем каталоге процесса, поэтому держим его в служебной папке агента.
-      cwd: agentBaseDir,
-      onStdout: (text) => appendAgentProcessOutput(outputChannel, 'stdout', text),
-      onStderr: (text) => appendAgentProcessOutput(outputChannel, 'stderr', text),
-      onExit: (code, signal) => {
-        outputChannel.appendLine(`[agent][process] Конфигуратор в режиме агента завершился: код=${String(code ?? '-')}, сигнал=${signal ?? '-'}`);
-      },
-    });
-    outputChannel.appendLine('[agent] Конфигуратор запущен в режиме агента.');
-    outputChannel.appendLine(`[agent] Ожидание SSH-порта ${agentSettings.host}:${String(agentSettings.port)} до ${String(agentSettings.startupTimeoutMs)} мс.`);
-    const portOpened = await waitForTcpPort({
-      host: agentSettings.host,
-      port: agentSettings.port,
-      timeoutMs: agentSettings.startupTimeoutMs,
-      isAborted: () => agentProcess?.hasExited() ?? false,
-    });
-    if (!portOpened) {
-      throw new Error(
-        `Конфигуратор в режиме агента не открыл SSH-порт ${agentSettings.host}:${String(agentSettings.port)}. ` +
-        `Состояние процесса: ${agentProcess.getExitDescription()}. Подробности выше в журнале 1С Редактора.`
-      );
-    }
-    outputChannel.appendLine(`[agent] SSH-порт ${agentSettings.host}:${String(agentSettings.port)} открыт.`);
-  }
-
-  return createAgentOperationServiceEntry(workspaceRoot, agentSettings, agentProcess);
-}
-
-function createAgentOperationServiceEntry(
-  workspaceRoot: string,
-  agentSettings: AgentCommandSettings,
-  agentProcess?: DesignerAgentProcess
-): CachedAgentService {
-  const transportOptions: DesignerAgentConnectionOptions = {
-    host: agentSettings.host,
-    port: agentSettings.port,
-    user: agentSettings.user,
-    password: agentSettings.password,
-    privateKeyPath: nonEmptyString(agentSettings.privateKeyPath),
-    connectAttempts: 8,
-    connectRetryDelayMs: 1000,
-  };
-  const sessions = new DesignerAgentSessionManager(
-    new ProcessDesignerAgentTransportFactory(transportOptions),
-    { notifyProgressInterval: agentSettings.progressInterval }
-  );
-  return {
-    service: new AgentOperationService(workspaceRoot, sessions),
-    sessions,
-    process: agentProcess,
-  };
-}
-
-function readAgentCommandSettings(connection: ConnectionParams): AgentCommandSettings {
-  const config = vscode.workspace.getConfiguration('v8vscedit.agent');
-  const rawModeArgs = config.get<string>('agentModeArgs', '');
-  const configuredUser = config.get<string>('user', '').trim();
-  return {
-    host: nonEmptyString(config.get<string>('host', 'localhost')) ?? 'localhost',
-    listenAddress: nonEmptyString(config.get<string>('listenAddress', '127.0.0.1')) ?? '127.0.0.1',
-    port: config.get<number>('port', 1543),
-    user: configuredUser ? configuredUser : (nonEmptyString(connection.userName) ?? 'admin'),
-    password: connection.password ?? '',
-    privateKeyPath: config.get<string>('privateKeyPath', '').trim(),
-    visible: config.get<boolean>('visible', false),
-    autoStart: config.get<boolean>('autoStart', true),
-    agentModeArgs: splitAgentModeArgs(rawModeArgs),
-    progressInterval: config.get<number>('progressInterval', 0.5),
-    startupTimeoutMs: config.get<number>('startupTimeoutMs', 15000),
-  };
-}
-
-export function splitAgentModeArgs(rawValue: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let quote: '"' | '\'' | undefined;
-  let escaped = false;
-
-  for (let index = 0; index < rawValue.length; index += 1) {
-    const char = rawValue[index] ?? '';
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === '\\' && quote) {
-      const next = rawValue[index + 1];
-      if (next === quote || next === '\\') {
-        escaped = true;
-      } else {
-        current += char;
-      }
-      continue;
-    }
-    if ((char === '"' || char === "'") && (!quote || quote === char)) {
-      quote = quote ? undefined : char;
-      continue;
-    }
-    if (!quote && /\s/.test(char)) {
-      if (current) {
-        result.push(current);
-        current = '';
-      }
-      continue;
-    }
-    current += char;
-  }
-
-  if (escaped) {
-    current += '\\';
-  }
-  if (quote) {
-    throw new Error('Некорректные дополнительные параметры /AgentMode: не закрыта кавычка.');
-  }
-  if (current) {
-    result.push(current);
-  }
-  return result;
-}
-
-function toDesignerAgentConnection(connection: ConnectionParams): DesignerAgentInfoBaseConnection {
-  const v8Path = connection.v8Path ?? '';
-  if (connection.infoBaseServer && connection.infoBaseRef) {
-    return {
-      infoBasePath: '',
-      infoBaseServer: connection.infoBaseServer,
-      infoBaseRef: connection.infoBaseRef,
-      v8Path,
-    };
-  }
-  if (connection.infoBasePath) {
-    return {
-      infoBasePath: connection.infoBasePath,
-      v8Path,
-    };
-  }
-  throw new Error('Недостаточно параметров подключения к базе из env.json.');
-}
-
-function buildAgentStartLogArgs(
-  connection: DesignerAgentInfoBaseConnection,
-  settings: AgentCommandSettings,
-  agentBaseDir: string
-): string[] {
-  const args = ['1cv8', 'DESIGNER'];
-  if (connection.infoBaseServer && connection.infoBaseRef) {
-    args.push('/S', `${connection.infoBaseServer}/${connection.infoBaseRef}`);
-  } else {
-    args.push('/F', connection.infoBasePath);
-  }
-  args.push('/AgentMode', ...buildDesignerAgentModeArgs({
-    connection,
-    agentPort: settings.port,
-    agentListenAddress: settings.listenAddress,
-    agentBaseDir,
-    agentModeArgs: settings.agentModeArgs,
-  }));
-  if (settings.visible) {
-    args.push('/Visible');
-  }
-  return args;
-}
-
-function appendAgentProcessOutput(outputChannel: vscode.OutputChannel, stream: 'stdout' | 'stderr', text: string): void {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    outputChannel.appendLine(`[agent][process][${stream}] ${line}`);
-  }
-}
-
-async function showAgentQuestion(message: AgentMessage): Promise<string | undefined> {
-  const text = typeof message.message === 'string' && message.message.trim()
-    ? message.message.trim()
-    : typeof message.body === 'string'
-      ? message.body
-      : JSON.stringify(message.body ?? message);
-  if (/(парол|password)/i.test(text)) {
-    return vscode.window.showInputBox({
-      title: 'Пароль информационной базы',
-      prompt: text,
-      password: true,
-      ignoreFocusOut: true,
-    });
-  }
-  if (/(пользователь|логин|user|login)/i.test(text)) {
-    return vscode.window.showInputBox({
-      title: 'Пользователь информационной базы',
-      prompt: text,
-      ignoreFocusOut: true,
-    });
-  }
-  const action = await vscode.window.showWarningMessage(
-    text,
-    { modal: true },
-    'Да',
-    'Нет',
-    'Отмена'
-  );
-  if (action === 'Да') {
-    return 'yes';
-  }
-  if (action === 'Нет') {
-    return 'no';
-  }
-  return 'cancel';
-}
-
-function isImportHooks(hooks: ConfigurationImportHooks | ConfigurationProgressHooks | undefined): hooks is ConfigurationImportHooks {
-  return Boolean(hooks && 'beforeProjectFilesChanged' in hooks);
-}
-
-/**
- * Компат-обёртка: `running=true` трактуется как ГРАНИЦА старта операции (begin),
- * `running=false` — как терминал (end). Промежуточные обновления текста прогресса
- * должны идти через {@link updateConfigurationOperationStatus}, а НЕ сюда, иначе
- * счётчик активных операций растёт на каждом прогресс-сообщении и статус-бар
- * перестаёт скрываться (регресс M9). Тесты используют только begin/end.
- */
-export function setConfigurationOperationStatus(title: string, message: string, running: boolean): void {
-  if (running) {
-    beginConfigurationOperationStatus(title, message);
-  } else {
-    endConfigurationOperationStatus(title, message);
-  }
-}
-
-/** Начало операции: инкремент счётчика активных операций + спиннер-текст. */
-export function beginConfigurationOperationStatus(title: string, message: string): void {
-  ensureConfigurationStatusItem();
-  cancelConfigurationHideTimer();
-  activeOperationCount++;
-  showSpinnerStatus(title, message);
-}
-
-/** Обновление текста прогресса без изменения счётчика активных операций. */
-export function updateConfigurationOperationStatus(title: string, message: string): void {
-  ensureConfigurationStatusItem();
-  cancelConfigurationHideTimer();
-  showSpinnerStatus(title, message);
-}
-
-/**
- * Терминал операции: декремент счётчика; при достижении нуля — таймер скрытия.
- * Если `title`/`message` заданы — показывает финальный check-текст; без них
- * оставляет уже отображённый текст (используется финализирующим
- * `clearConfigurationProgress`, где сообщение уже выставлено предыдущим шагом).
- */
-export function endConfigurationOperationStatus(title?: string, message?: string): void {
-  ensureConfigurationStatusItem();
-  cancelConfigurationHideTimer();
-  activeOperationCount = Math.max(0, activeOperationCount - 1);
-
-  if (statusBarItem && title !== undefined && message !== undefined) {
-    const text = `${title}: ${message}`;
-    statusBarItem.text = `$(check) ${trimStatusMessage(text)}`;
-    statusBarItem.tooltip = text;
-    statusBarItem.show();
-  }
-
-  // Скрываем статус только когда завершилась последняя активная операция —
-  // завершение одной из параллельных операций не должно гасить статус остальных.
-  if (activeOperationCount === 0) {
-    clearStatusTimer = setTimeout(() => {
-      statusBarItem?.hide();
-      clearStatusTimer = undefined;
-    }, 5_000);
-  }
-}
-
-function ensureConfigurationStatusItem(): void {
-  if (!statusBarItem) {
-    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    statusBarItem.name = '1С: операция с конфигурацией';
-  }
-}
-
-function cancelConfigurationHideTimer(): void {
-  if (clearStatusTimer) {
-    clearTimeout(clearStatusTimer);
-    clearStatusTimer = undefined;
-  }
-}
-
-function showSpinnerStatus(title: string, message: string): void {
-  const text = `${title}: ${message}`;
-  if (statusBarItem) {
-    statusBarItem.text = `$(sync~spin) ${trimStatusMessage(text)}`;
-    statusBarItem.tooltip = text;
-    statusBarItem.show();
-  }
-}
-
 function syncDirectorySnapshot(sourceDir: string, targetDir: string): void {
   if (!fs.existsSync(sourceDir)) {
     throw new Error(`Временный каталог выгрузки не найден: ${sourceDir}`);
@@ -1683,138 +1114,6 @@ function addCandidate(target: string[], seen: Set<string>, candidatePath: string
   target.push(normalized);
 }
 
-export function resolveSettingsPath(workspaceRoot: string, extensionRoot: string): string {
-  const extensionParent = path.dirname(extensionRoot);
-  const extensionGrandParent = path.dirname(extensionParent);
-  const candidates = [
-    path.join(workspaceRoot, 'env.json'),
-    path.join(extensionGrandParent, 'env.json'),
-    path.join(extensionParent, 'env.json'),
-    path.join(workspaceRoot, 'example', 'env.json'),
-  ];
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return candidates[0];
-}
-
-/**
- * Файл настроек подключения ПРОЕКТА (не конкретного расширения): `env.json`
- * ищется от корня рабочей папки. Псевдо-корень `src/cfe/_probe` — способ
- * переиспользовать общий `resolveSettingsPath` там, где конкретного расширения
- * нет (список расширений базы, операции с CF/CFE-файлами, пакетные операции):
- * третьей копии этого литерала быть не должно.
- */
-export function resolveProjectSettingsPath(workspaceRoot: string): string {
-  return resolveSettingsPath(workspaceRoot, path.join(workspaceRoot, 'src', 'cfe', '_probe'));
-}
-
-export async function resolveConnectionFromSettings(settingsPath: string): Promise<ConnectionParams> {
-  if (!fs.existsSync(settingsPath)) {
-    throw new Error(`Не найден env.json для подключения к базе: ${settingsPath}`);
-  }
-
-  const raw = fs.readFileSync(settingsPath, 'utf-8');
-  const parsed = JSON.parse(raw) as {
-    default?: Record<string, unknown>;
-  };
-  const defaults = parsed.default ?? {};
-
-  const ibConnectionRaw = asString(defaults['--ibconnection']);
-  if (!ibConnectionRaw) {
-    throw new Error(`В env.json отсутствует "--ibconnection": ${settingsPath}`);
-  }
-
-  const connection: ConnectionParams = parseIbConnection(ibConnectionRaw);
-  connection.userName = asString(defaults['--db-user']) ?? '';
-  connection.password = await resolveConnectionPassword(asString(defaults['--db-pwd']) ?? '');
-  connection.v8Path = resolveV8PathFromSettings(defaults);
-  return connection;
-}
-
-/**
- * Резолвит пароль подключения: приоритет — `ProjectSecretStorage`, fallback —
- * legacy-значение из env.json (для конфигураций, ещё не пересохранённых новым
- * `ProjectEnvironmentService.save`). Без внедрённого хранилища деградирует до
- * legacy-значения, не роняя запуск.
- */
-async function resolveConnectionPassword(legacyEnvJsonPassword: string): Promise<string> {
-  if (!injectedProjectSecretStorage) {
-    return legacyEnvJsonPassword;
-  }
-  return resolveDbPassword(injectedProjectSecretStorage, legacyEnvJsonPassword);
-}
-
-function parseIbConnection(rawValue: string): ConnectionParams {
-  const normalized = rawValue.replace(/^"+|"+$/g, '');
-  if (/^\/F/i.test(normalized)) {
-    const infoBasePath = normalizeInfoBasePath(normalized.slice(2).trim());
-    return { infoBasePath };
-  }
-
-  if (/^\/S/i.test(normalized)) {
-    const serverRef = normalized.slice(2).trim();
-    const slashIndex = serverRef.indexOf('/');
-    if (slashIndex > 0) {
-      return {
-        infoBaseServer: serverRef.slice(0, slashIndex),
-        infoBaseRef: serverRef.slice(slashIndex + 1),
-      };
-    }
-  }
-
-  throw new Error(`Не удалось разобрать "--ibconnection": ${rawValue}`);
-}
-
-export function buildConnectionCliArgs(params: ConnectionParams): string[] {
-  const args: string[] = [];
-  if (params.infoBasePath) {
-    args.push('-InfoBasePath', params.infoBasePath);
-  } else if (params.infoBaseServer && params.infoBaseRef) {
-    args.push('-InfoBaseServer', params.infoBaseServer, '-InfoBaseRef', params.infoBaseRef);
-  } else {
-    throw new Error('Недостаточно параметров подключения к базе из env.json');
-  }
-
-  if (params.userName) {
-    args.push('-UserName', params.userName);
-  }
-  if (params.password) {
-    args.push('-Password', params.password);
-  }
-  if (params.v8Path) {
-    args.push('-V8Path', params.v8Path);
-  }
-  return args;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
-
-function nonEmptyString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  if (trimmed) {
-    return trimmed;
-  }
-  return undefined;
-}
-
-function resolveV8PathFromSettings(defaults: Record<string, unknown>): string {
-  return asString(defaults['--path']) ?? resolveV8PathHintFromVersion(asString(defaults['--v8version']) ?? '');
-}
-
-function trimStatusMessage(text: string): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim();
-  if (oneLine.length <= 80) {
-    return oneLine;
-  }
-  return `${oneLine.slice(0, 77)}...`;
-}
-
 function appendOutputTail(outputTail: string[], text: string): void {
   outputTail.push(text);
   if (outputTail.length > 40) {
@@ -1923,17 +1222,3 @@ function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function getAgentStatusMessage(message: string): string | undefined {
-  const text = trimStatusMessage(message);
-  if (isRawAgentCommandMessage(text)) {
-    return undefined;
-  }
-  return text;
-}
-
-function isRawAgentCommandMessage(message: string): boolean {
-  const normalized = message.replace(/\s+/g, ' ').trim().toLowerCase();
-  return /^(common|config|options|infobase-tools)\s+/.test(normalized) ||
-    /^выполнено:\s*(common|config|options|infobase-tools)\s+/.test(normalized) ||
-    /^the operation is completed:\s*(common|config|options|infobase-tools)\s+/.test(normalized);
-}
