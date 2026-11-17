@@ -933,6 +933,7 @@
     "lint": "eslint . --max-warnings=0",
     "test": "node ./out/test/runTests.js",
     "test:fast": "node ./out/test/runTests.js",
+    "test:hidden": "node scripts/test-hidden.mjs",
     "coverage": "c8 --check-coverage --100 npm test",
     "coverage:report": "c8 npm test",
     "coverage:changed": "node scripts/patch-coverage.mjs",
