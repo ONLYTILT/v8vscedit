@@ -229,7 +229,9 @@ suite('CLI и запуск процессов', () => {
   // установленному killTimer, а не поставить второй SIGKILL-таймер поверх первого.
   // Процесс сам игнорирует SIGTERM, чтобы дожить до обоих срабатываний и реально
   // проверить повторный вызов forceKill(), а не просто закрыться по первому SIGTERM.
-  test('гонка таймаута и отмены: повторный forceKill не ставит второй SIGKILL-таймер', async () => {
+  test('гонка таймаута и отмены: повторный forceKill не ставит второй SIGKILL-таймер', async function () {
+    // На Windows SIGTERM — немедленный TerminateProcess (обработчик сигнала не вызывается): тест про POSIX-семантику.
+    if (process.platform === 'win32') { this.skip(); }
     let cancelListener: (() => void) | undefined;
     const cancellationToken = {
       isCancellationRequested: false,
@@ -306,7 +308,9 @@ suite('CLI и запуск процессов', () => {
   // Волна 2 (C1): killGraceMs не указан явно — должен применяться DEFAULT_KILL_GRACE_MS.
   // Ждать полные 5с в тесте нельзя, но процесс, который сам выходит по SIGTERM,
   // проверяет именно факт вычисления дефолтной паузы (грациозный путь), а не таймер SIGKILL.
-  test('таймаут без явного killGraceMs использует значение по умолчанию (грациозный SIGTERM)', async () => {
+  test('таймаут без явного killGraceMs использует значение по умолчанию (грациозный SIGTERM)', async function () {
+    // На Windows SIGTERM — немедленный TerminateProcess (обработчик сигнала не вызывается): тест про POSIX-семантику.
+    if (process.platform === 'win32') { this.skip(); }
     const result = await runProcess({
       command: process.execPath,
       args: ['-e', "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"],
