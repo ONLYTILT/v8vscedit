@@ -1,6 +1,7 @@
 ﻿import * as path from 'path';
 import * as vscode from 'vscode';
-import type { RepositoryBinding, RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import type { RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import { REPOSITORY_DUMP_OUTPUT, repositoryReportOutputName } from '../../../infra/repository/RepositoryDesignerArgs';
 import type { CommandServices, NodeArg } from '../_shared';
 import {
   runApplyDatabaseConfiguration,
@@ -17,18 +18,28 @@ import {
   runRepositoryUnlockAction,
   runRepositoryUpdateAction,
 } from './RepositoryCommandRunner';
+import {
+  buildAddUserOperation,
+  buildBindOperation,
+  buildCopyUsersOperation,
+  buildCreateOperation,
+  buildDumpOperation,
+  buildReportOperation,
+  buildSetLabelOperation,
+  normalizeUpdateVersion,
+  reportDefaultExtension,
+  sanitizeFileName,
+  validateBindingForm,
+  type RepositoryReportFlag,
+  type RepositoryReportFormat,
+} from './repositoryOperationBuilders';
 
 interface BooleanPickItem extends vscode.QuickPickItem {
   value: boolean;
 }
 
 interface ReportFlagItem extends vscode.QuickPickItem {
-  flag:
-    | 'GroupByObject'
-    | 'GroupByComment'
-    | 'DoNotIncludeVersionsWithLabels'
-    | 'IncludeOnlyVersionsWithLabels'
-    | 'IncludeCommentLinesWithDoubleSlash';
+  flag: RepositoryReportFlag;
 }
 
 interface RightsPickItem extends vscode.QuickPickItem {
@@ -69,13 +80,9 @@ export function registerRepositoryCommands(
       }
 
       const ok = await runRepositoryCliCommand({
-        command: 'repository-bind',
+        operation: buildBindOperation(formData),
         target,
         bindingOverride: validation.binding,
-        extraArgs: [
-          ...(formData.forceBindAlreadyBindedUser ? ['-ForceBindAlreadyBindedUser'] : []),
-          ...(formData.forceReplaceCfg ? ['-ForceReplaceCfg'] : []),
-        ],
         progressTitle: `Подключение к хранилищу: ${target.displayName}`,
         progressStartMessage: 'Подключаю конфигурацию к хранилищу...',
         successMessage: `Конфигурация "${target.displayName}" подключена к хранилищу.`,
@@ -117,15 +124,9 @@ export function registerRepositoryCommands(
       }
 
       const ok = await runRepositoryCliCommand({
-        command: 'repository-create',
+        operation: buildCreateOperation(formData),
         target,
         bindingOverride: validation.binding,
-        extraArgs: [
-          ...(formData.allowConfigurationChanges ? ['-AllowConfigurationChanges'] : []),
-          ...(formData.changesAllowedRule ? ['-ChangesAllowedRule', formData.changesAllowedRule] : []),
-          ...(formData.changesNotRecommendedRule ? ['-ChangesNotRecommendedRule', formData.changesNotRecommendedRule] : []),
-          ...(formData.noBind ? ['-NoBind'] : []),
-        ],
         progressTitle: `Создание хранилища: ${target.displayName}`,
         progressStartMessage: 'Создаю хранилище конфигурации...',
         successMessage: `Хранилище для "${target.displayName}" создано.`,
@@ -160,9 +161,8 @@ export function registerRepositoryCommands(
       }
 
       await runRepositoryCliCommand({
-        command: 'repository-unbind',
+        operation: { kind: 'unbind', force },
         target,
-        extraArgs: force ? ['-Force'] : [],
         progressTitle: `Отключение от хранилища: ${target.displayName}`,
         progressStartMessage: 'Отключаю конфигурацию от хранилища...',
         successMessage: `Конфигурация "${target.displayName}" отключена от хранилища.`,
@@ -286,7 +286,7 @@ export function registerRepositoryCommands(
       const ok = await runRepositoryUpdateAction(toCliServices(services), repositoryNode, {
         recursive,
         force,
-        version: version.trim() || undefined,
+        version: normalizeUpdateVersion(version),
       });
       if (ok) {
         refreshRepositoryUi(services);
@@ -322,14 +322,8 @@ export function registerRepositoryCommands(
       }
 
       await runRepositoryCliCommand({
-        command: 'repository-add-user',
+        operation: buildAddUserOperation({ user: userName, password, rights, restoreDeletedUser }),
         target,
-        extraArgs: [
-          '-User', userName,
-          '-Pwd', password,
-          '-Rights', rights,
-          ...(restoreDeletedUser ? ['-RestoreDeletedUser'] : []),
-        ],
         progressTitle: `Пользователь хранилища: ${target.displayName}`,
         progressStartMessage: 'Добавляю пользователя в хранилище...',
         successMessage: `Пользователь "${userName}" добавлен в хранилище.`,
@@ -367,14 +361,8 @@ export function registerRepositoryCommands(
       }
 
       await runRepositoryCliCommand({
-        command: 'repository-copy-users',
+        operation: buildCopyUsersOperation({ path: sourcePath, user: userName, password, restoreDeletedUser }),
         target,
-        extraArgs: [
-          '-Path', sourcePath,
-          '-User', userName,
-          '-Pwd', password,
-          ...(restoreDeletedUser ? ['-RestoreDeletedUser'] : []),
-        ],
         progressTitle: `Копирование пользователей: ${target.displayName}`,
         progressStartMessage: 'Копирую пользователей из другого хранилища...',
         successMessage: `Пользователи для "${target.displayName}" скопированы.`,
@@ -416,12 +404,9 @@ export function registerRepositoryCommands(
       }
 
       await runRepositoryCliCommand({
-        command: 'repository-dump',
+        operation: buildDumpOperation(version),
         target,
-        extraArgs: [
-          '-File', fileUri.fsPath,
-          ...(version.trim() ? ['-Version', version.trim()] : []),
-        ],
+        output: { name: REPOSITORY_DUMP_OUTPUT, targetPath: fileUri.fsPath },
         progressTitle: `Выгрузка версии: ${target.displayName}`,
         progressStartMessage: 'Выгружаю конфигурацию из хранилища...',
         successMessage: `Версия хранилища "${target.displayName}" выгружена в "${fileUri.fsPath}".`,
@@ -440,7 +425,7 @@ export function registerRepositoryCommands(
       if (!format) {
         return;
       }
-      const defaultExtension = format === 'mxl' ? 'mxl' : 'txt';
+      const defaultExtension = reportDefaultExtension(format);
       const fileUri = await vscode.window.showSaveDialog({
         title: 'Отчёт по хранилищу',
         defaultUri: vscode.Uri.file(path.join(
@@ -486,19 +471,11 @@ export function registerRepositoryCommands(
         return;
       }
 
+      const reportOperation = buildReportOperation({ nBegin, nEnd, dateBegin, dateEnd, configurationVersion, format, flags });
       await runRepositoryCliCommand({
-        command: 'repository-report',
+        operation: reportOperation,
         target,
-        extraArgs: [
-          '-File', fileUri.fsPath,
-          ...(nBegin.trim() ? ['-NBegin', nBegin.trim()] : []),
-          ...(nEnd.trim() ? ['-NEnd', nEnd.trim()] : []),
-          ...(dateBegin.trim() ? ['-DateBegin', dateBegin.trim()] : []),
-          ...(dateEnd.trim() ? ['-DateEnd', dateEnd.trim()] : []),
-          ...(configurationVersion.trim() ? ['-ConfigurationVersion', configurationVersion.trim()] : []),
-          '-ReportFormat', format,
-          ...flags.flatMap((flag) => [`-${flag}`]),
-        ],
+        output: { name: repositoryReportOutputName(reportOperation), targetPath: fileUri.fsPath },
         progressTitle: `Отчёт по хранилищу: ${target.displayName}`,
         progressStartMessage: 'Строю отчёт по истории хранилища...',
         successMessage: `Отчёт по хранилищу "${target.displayName}" сформирован.`,
@@ -527,13 +504,8 @@ export function registerRepositoryCommands(
       }
 
       await runRepositoryCliCommand({
-        command: 'repository-set-label',
+        operation: buildSetLabelOperation({ name: labelName, version, comment }),
         target,
-        extraArgs: [
-          '-LabelName', labelName,
-          ...(version.trim() ? ['-Version', version.trim()] : []),
-          ...(comment.trim() ? ['-Comment', comment.trim()] : []),
-        ],
         progressTitle: `Установка метки: ${target.displayName}`,
         progressStartMessage: 'Устанавливаю метку версии в хранилище...',
         successMessage: `Метка "${labelName}" установлена для "${target.displayName}".`,
@@ -550,6 +522,7 @@ function toCliServices(services: CommandServices): RepositoryCliServices {
     outputChannel: services.outputChannel,
     repositoryService: services.repositoryService,
     projectSecretStorage: services.projectSecretStorage,
+    createDesignerExecutor: services.createDesignerExecutor,
   };
 }
 
@@ -701,33 +674,6 @@ function ensureConnected(repositoryService: RepositoryService, target: Repositor
   return true;
 }
 
-function validateBindingForm(
-  formData: { repoPath: string; repoUser: string; repoPassword: string }
-): { ok: true; binding: RepositoryBinding } | { ok: false; errorMessage: string } {
-  const repoPath = formData.repoPath.trim();
-  const repoUser = formData.repoUser.trim();
-  if (!repoPath) {
-    return {
-      ok: false,
-      errorMessage: '\u041d\u0443\u0436\u043d\u043e \u0443\u043a\u0430\u0437\u0430\u0442\u044c \u043f\u0443\u0442\u044c \u043a \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0443 \u0438\u043b\u0438 \u0430\u0434\u0440\u0435\u0441 \u0441\u0435\u0440\u0432\u0435\u0440\u0430.',
-    };
-  }
-  if (!repoUser) {
-    return {
-      ok: false,
-      errorMessage: '\u041d\u0443\u0436\u043d\u043e \u0443\u043a\u0430\u0437\u0430\u0442\u044c \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0430.',
-    };
-  }
-  return {
-    ok: true,
-    binding: {
-      repoPath,
-      repoUser,
-      repoPassword: formData.repoPassword,
-    },
-  };
-}
-
 async function askRecursiveMode(title: string, nodeLabel: string): Promise<boolean | undefined> {
   return pickBoolean(
     title,
@@ -786,7 +732,7 @@ async function pickRights(): Promise<RightsPickItem['value'] | undefined> {
   return picked?.value;
 }
 
-async function pickReportFormat(): Promise<'txt' | 'mxl' | undefined> {
+async function pickReportFormat(): Promise<RepositoryReportFormat | undefined> {
   const picked = await vscode.window.showQuickPick([
     { label: 'txt', description: 'Текстовый отчёт' },
     { label: 'mxl', description: 'Табличный документ 1С' },
@@ -857,8 +803,4 @@ async function promptOptionalText(title: string, prompt: string): Promise<string
     prompt,
     ignoreFocusOut: true,
   });
-}
-
-function sanitizeFileName(value: string): string {
-  return value.replace(/[\\/:*?"<>|]/g, '_');
 }

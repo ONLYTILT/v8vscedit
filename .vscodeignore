@@ -9,6 +9,7 @@ node_modules/**
 !node_modules/tweetnacl/**
 example/**
 example2/**
+tmp/**
 .cursor/**
 .cursorignore
 docs/**

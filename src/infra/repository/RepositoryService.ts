@@ -508,7 +508,12 @@ export class RepositoryService {
     return this.buildRootObjectFullName(kind, node.xmlPath, node.label);
   }
 
-  createObjectsFileForNode(node: RepositoryNodeRef, recursive: boolean): { filePath: string; fullNames: string[] } {
+  /**
+   * XML выбора объектов для `-Objects` строится в памяти: исполнитель сам кладёт его
+   * во временный каталог запуска и удаляет после — прежняя запись в
+   * `.v8vscedit/repository/objects` копилась без удаления.
+   */
+  buildObjectsSelectionForNode(node: RepositoryNodeRef, recursive: boolean): { xml: string; fullNames: string[] } {
     const target = node.xmlPath ? this.resolveTargetByXmlPath(node.xmlPath) : null;
     if (!target) {
       throw new Error('Не удалось определить корень конфигурации для выбранного узла.');
@@ -524,9 +529,10 @@ export class RepositoryService {
         `<Objects xmlns="${REPOSITORY_NAMESPACE}" version="1.0">`,
         `  <Configuration includeChildObjects="${recursive ? 'true' : 'false'}"/>`,
         `</Objects>`,
+        '',
       ].join('\n');
       return {
-        filePath: this.writeObjectsFile(target, xml),
+        xml,
         fullNames: [this.getRootLockName(target)],
       };
     }
@@ -545,10 +551,11 @@ export class RepositoryService {
         `    <Subsystem includeObjectsFromSubordinateSubsystems="${recursive ? 'true' : 'false'}"/>`
       );
     }
-    lines.push('  </Object>', '</Objects>');
+    // Завершающий перевод строки — как в прежнем файле: формат принимает платформа.
+    lines.push('  </Object>', '</Objects>', '');
 
     return {
-      filePath: this.writeObjectsFile(target, lines.join('\n')),
+      xml: lines.join('\n'),
       fullNames: [fullName],
     };
   }
@@ -837,20 +844,6 @@ export class RepositoryService {
   private buildScopeKey(target: RepositoryTarget): string {
     const raw = `${target.configKind}|${path.resolve(target.configRoot)}|${target.extensionName ?? ''}`;
     return crypto.createHash('sha1').update(raw).digest('hex');
-  }
-
-  private writeObjectsFile(target: RepositoryTarget, xml: string): string {
-    const scopeKey = this.buildScopeKey(target);
-    const filePath = path.join(
-      this.workspaceRoot,
-      '.v8vscedit',
-      'repository',
-      'objects',
-      `${scopeKey}-${String(Date.now())}.xml`
-    );
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, `${xml}\n`, 'utf-8');
-    return filePath;
   }
 
   private getRootLockName(target: RepositoryTarget): string {

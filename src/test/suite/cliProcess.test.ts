@@ -7,7 +7,6 @@ import { parseArgs, getBool, getRequiredString, getString } from '../../cli/core
 import { resolveConnection } from '../../cli/core/connection';
 import {
   appendConnectionArgs,
-  appendRepositoryArgs,
   createTempDir,
   printLogFile,
   safeRemoveDir,
@@ -71,9 +70,6 @@ suite('CLI и запуск процессов', () => {
     });
     assert.deepStrictEqual(fileArgs, ['/F', '/tmp/base']);
 
-    const repoArgs: string[] = [];
-    appendRepositoryArgs(repoArgs, { repoPath: '/repo', repoUser: 'dev', repoPassword: 'pwd' });
-    assert.deepStrictEqual(repoArgs, ['/ConfigurationRepositoryF', '/repo', '/ConfigurationRepositoryN', 'dev', '/ConfigurationRepositoryP', 'pwd']);
     assert.throws(() => resolveConnection({ V8Path: v8Path }), /specify -InfoBasePath/);
     safeRemoveDir(binDir);
   });
