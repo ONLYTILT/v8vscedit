@@ -616,3 +616,33 @@ suite('verdict.mjs — parseLcov/summarizeBranchCoverage/buildVerdict (T-coverag
     assert.ok(verdict.offenders[1]?.startsWith('mixed/b.ts: НЕТ ДАННЫХ О ВЕТКАХ'), `неожиданный формат: ${verdict.offenders[1]}`);
   });
 });
+
+interface LcovKeyModule {
+  lcovKeyRelativeToRoot(sf: string, root: string, pathApi: typeof path.posix): string;
+}
+
+// Ключ lcov сопоставляется с путями git (`src/a/b.ts`). На Windows `path.relative`
+// отдаёт обратные слэши, и без нормализации гейт видел «НЕТ данных покрытия» у ВСЕХ
+// файлов. pathApi внедряется, чтобы обе семантики проверялись на любой ОС.
+suite('verdict.mjs — lcovKeyRelativeToRoot (ключи lcov в виде путей git)', () => {
+  let mod: LcovKeyModule | undefined;
+
+  suiteSetup(async () => {
+    mod = await importEsmModule<LcovKeyModule>(MODULE_PATH);
+  });
+
+  const cases: { name: string; api: typeof path.posix; root: string; sf: string; expected: string }[] = [
+    { name: 'win32: абсолютный SF с обратными слэшами', api: path.win32, root: 'C:\\repo', sf: 'C:\\repo\\src\\infra\\a.ts', expected: 'src/infra/a.ts' },
+    { name: 'win32: относительный SF с обратными слэшами', api: path.win32, root: 'C:\\repo', sf: 'src\\infra\\a.ts', expected: 'src/infra/a.ts' },
+    { name: 'win32: SF с прямыми слэшами', api: path.win32, root: 'C:\\repo', sf: 'C:/repo/src/ui/b.ts', expected: 'src/ui/b.ts' },
+    { name: 'win32: регистр буквы диска не мешает', api: path.win32, root: 'C:\\repo', sf: 'c:\\repo\\src\\c.ts', expected: 'src/c.ts' },
+    { name: 'posix: абсолютный SF', api: path.posix, root: '/repo', sf: '/repo/src/infra/a.ts', expected: 'src/infra/a.ts' },
+    { name: 'posix: относительный SF', api: path.posix, root: '/repo', sf: 'src/infra/a.ts', expected: 'src/infra/a.ts' },
+  ];
+  for (const c of cases) {
+    test(c.name, () => {
+      assert.ok(mod);
+      assert.strictEqual(mod.lcovKeyRelativeToRoot(c.sf, c.root, c.api), c.expected);
+    });
+  }
+});
