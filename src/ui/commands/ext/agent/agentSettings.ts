@@ -15,6 +15,7 @@ export interface AgentCommandSettings {
   readonly agentModeArgs: readonly string[];
   readonly progressInterval: number;
   readonly startupTimeoutMs: number;
+  readonly authWarmupMs: number;
 }
 
 export function isAgentConfigurationOperationMode(): boolean {
@@ -40,6 +41,7 @@ export function readAgentCommandSettings(connection: ConnectionParams): AgentCom
     agentModeArgs: splitAgentModeArgs(rawModeArgs),
     progressInterval: config.get<number>('progressInterval', 0.5),
     startupTimeoutMs: config.get<number>('startupTimeoutMs', 15000),
+    authWarmupMs: config.get<number>('authWarmupMs', 90000),
   };
 }
 
@@ -50,10 +52,7 @@ export function splitAgentModeArgs(rawValue: string): string[] {
   let escaped = false;
 
   for (let index = 0; index < rawValue.length; index += 1) {
-    // Э2 переносит код без изменения поведения: `?? ''` недостижим (индекс внутри длины),
-    // упрощение — вне этапа декомпозиции.
-    /* c8 ignore next */
-    const char = rawValue[index] ?? '';
+    const char = rawValue.charAt(index);
     if (escaped) {
       current += char;
       escaped = false;
@@ -82,13 +81,6 @@ export function splitAgentModeArgs(rawValue: string): string[] {
     current += char;
   }
 
-  // Недостижимо: `escaped` ставится только при существующем следующем символе, и тот же
-  // цикл его потребляет. Оставлено ради дословного переноса (Э2).
-  /* c8 ignore start */
-  if (escaped) {
-    current += '\\';
-  }
-  /* c8 ignore stop */
   if (quote) {
     throw new Error('Некорректные дополнительные параметры /AgentMode: не закрыта кавычка.');
   }

@@ -8,4 +8,5 @@ export * from './DesignerAgentSessionManager';
 export * from './DirectorySnapshot';
 export * from './InteractiveDesignerLauncher';
 export * from './ProcessDesignerAgentTransport';
+export * from './SshConnectErrorClassifier';
 export * from './TcpPortWaiter';

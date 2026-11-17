@@ -24,7 +24,7 @@ import {
 
 const AGENT_KEYS = [
   'host', 'listenAddress', 'port', 'user', 'privateKeyPath',
-  'autoStart', 'visible', 'agentModeArgs', 'progressInterval', 'startupTimeoutMs',
+  'autoStart', 'visible', 'agentModeArgs', 'progressInterval', 'startupTimeoutMs', 'authWarmupMs',
 ] as const;
 
 async function setAgentConfig(key: string, value: unknown): Promise<void> {
@@ -117,6 +117,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
       agentModeArgs: [],
       progressInterval: 0.5,
       startupTimeoutMs: 15000,
+      authWarmupMs: 90000,
     });
   });
 
@@ -151,6 +152,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
     await setAgentConfig('agentModeArgs', '/AgentBaseDir "a b"');
     await setAgentConfig('progressInterval', 2);
     await setAgentConfig('startupTimeoutMs', 99);
+    await setAgentConfig('authWarmupMs', 4321);
     const settings = read({});
     assert.strictEqual(settings.host, '10.0.0.5');
     assert.strictEqual(settings.listenAddress, '0.0.0.0');
@@ -161,6 +163,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
     assert.deepStrictEqual(settings.agentModeArgs, ['/AgentBaseDir', 'a b']);
     assert.strictEqual(settings.progressInterval, 2);
     assert.strictEqual(settings.startupTimeoutMs, 99);
+    assert.strictEqual(settings.authWarmupMs, 4321);
   });
 
   test('некорректный agentModeArgs пробрасывает исключение разбора', async () => {

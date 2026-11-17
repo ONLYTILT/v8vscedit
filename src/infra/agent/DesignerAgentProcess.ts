@@ -27,12 +27,15 @@ export class DesignerAgentProcess {
   private exitCode: number | null = null;
   private exitSignal: NodeJS.Signals | null = null;
   private spawnError: Error | undefined;
+  private startedAt: number | undefined;
 
   start(options: DesignerAgentProcessOptions): void {
     if (this.child && !this.child.killed) {
       return;
     }
 
+    // Отметка до spawn: окно прогрева SSH отсчитывается от запуска, а не от появления порта.
+    this.startedAt = Date.now();
     this.exited = false;
     this.exitCode = null;
     this.exitSignal = null;
@@ -125,6 +128,10 @@ export class DesignerAgentProcess {
       };
       child.once('exit', onExit);
     });
+  }
+
+  getStartedAt(): number | undefined {
+    return this.startedAt;
   }
 
   hasExited(): boolean {

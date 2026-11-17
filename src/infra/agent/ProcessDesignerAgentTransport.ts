@@ -1,8 +1,9 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2';
-import type { AgentMessage } from '../../domain/agent';
-import { getAgentMessageText, isTerminalAgentMessage } from '../../domain/agent';
+import type { AgentConnectPolicyOptions, AgentMessage } from '../../domain/agent';
+import { decideAgentConnectRetry, getAgentMessageText, isTerminalAgentMessage } from '../../domain/agent';
+import { SSH_CLOSED_BEFORE_READY_CODE, classifySshConnectError } from './SshConnectErrorClassifier';
 import { DesignerAgentJsonReader } from './DesignerAgentJsonReader';
 import type { AgentCommandHooks, AgentCommandResult, DesignerAgentTransport, DesignerAgentTransportFactory } from './AgentTransport';
 import { AgentCommandError } from './AgentTransport';
@@ -15,36 +16,93 @@ export interface DesignerAgentSshClient {
   end(): void;
 }
 
-export interface DesignerAgentConnectionOptions {
+/** Параметры одного SSH-подключения: всё, что нужно транспорту для единственной попытки. */
+export interface DesignerAgentEndpointOptions {
   readonly host: string;
   readonly port: number;
   readonly user: string;
   readonly password?: string;
   readonly privateKeyPath?: string;
   readonly connectTimeoutSeconds?: number;
-  readonly connectAttempts?: number;
-  readonly connectRetryDelayMs?: number;
+}
+
+/** Параметры фабрики: конечная точка плюс политика повторов — повторы решает только фабрика. */
+export interface DesignerAgentConnectionOptions extends DesignerAgentEndpointOptions {
+  readonly policy: AgentConnectPolicyOptions;
+  /** Момент старта локально запущенного агента: открывает окно прогрева для auth-отказов. */
+  readonly agentStartedAt?: number;
+}
+
+export interface DesignerAgentTransportFactoryDeps {
+  readonly clock?: () => number;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly createClient?: () => DesignerAgentSshClient;
 }
 
 export class ProcessDesignerAgentTransportFactory implements DesignerAgentTransportFactory {
-  constructor(private readonly options: DesignerAgentConnectionOptions) {}
+  // Состояние конечной точки живёт между вызовами create(): refused в прошлой сессии означает,
+  // что агент только что поднимался, и auth-отказ вскоре после этого — ещё прогрев, а не пароль.
+  private lastRefusedAt: number | undefined;
+  private readonly clock: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly createClient: () => DesignerAgentSshClient;
+
+  constructor(private readonly options: DesignerAgentConnectionOptions, deps: DesignerAgentTransportFactoryDeps = {}) {
+    this.clock = deps.clock ?? Date.now;
+    this.sleep = deps.sleep ?? delay;
+    this.createClient = deps.createClient ?? (() => new Client());
+  }
 
   async create(): Promise<DesignerAgentTransport> {
-    const attempts = Math.max(1, this.options.connectAttempts ?? 1);
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const firstAttemptAt = this.clock();
+    for (let attempt = 1; ; attempt += 1) {
+      const transport = new ProcessDesignerAgentTransport(this.options, this.createClient);
       try {
-        const transport = new ProcessDesignerAgentTransport(this.options);
         await transport.connect();
         return transport;
       } catch (error) {
-        lastError = error;
-        if (attempt < attempts) {
-          await delay(this.options.connectRetryDelayMs ?? 1000);
+        await transport.reset();
+        const kind = classifySshConnectError(error);
+        const now = this.clock();
+        if (kind === 'refused') {
+          this.lastRefusedAt = now;
         }
+        const decision = decideAgentConnectRetry(kind, {
+          attempt,
+          now,
+          firstAttemptAt,
+          agentStartedAt: this.options.agentStartedAt,
+          lastRefusedAt: this.lastRefusedAt,
+        }, this.options.policy);
+        if (decision.action === 'fail') {
+          throw new Error(describeConnectFailure(decision.reason, this.options, error), { cause: error });
+        }
+        await this.sleep(decision.delayMs);
       }
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    /* c8 ignore start */
+    // Цикл выходит только через return или throw, но V8 считает неявный return после него отдельным блоком.
+  }
+  /* c8 ignore stop */
+}
+
+function describeConnectFailure(
+  reason: 'credentials' | 'unreachable' | 'timeout' | 'other',
+  options: DesignerAgentEndpointOptions,
+  error: unknown
+): string {
+  const endpoint = `${options.host}:${String(options.port)}`;
+  // connect() отклоняется только объектами Error (события 'error' ssh2, колбэк shell, закрытая сессия).
+  const original = (error as Error).message;
+  switch (reason) {
+    case 'credentials':
+      return `Не удалось подключиться к ${endpoint}: неверный логин или пароль агента конфигуратора для пользователя «${options.user}».`;
+    case 'unreachable':
+      return `Не удалось подключиться: агент конфигуратора не отвечает на ${endpoint}.`;
+    case 'timeout':
+      return `Не удалось подключиться: агент конфигуратора на ${endpoint} не ответил вовремя (${original}).`;
+    default:
+      return `Не удалось подключиться к агенту конфигуратора на ${endpoint}: ${original}`;
   }
 }
 
@@ -59,7 +117,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   private closeEmitted = false;
 
   constructor(
-    private readonly options: DesignerAgentConnectionOptions,
+    private readonly options: DesignerAgentEndpointOptions,
     private readonly createClient: () => DesignerAgentSshClient = () => new Client()
   ) {}
 
@@ -108,10 +166,23 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
         });
       });
       client.on('error', (error) => {
-        this.output.emit('error', error);
+        // Сначала отказ connect(): на этапе подключения у output нет слушателей 'error', и
+        // EventEmitter бросил бы прямо отсюда — промис connect() так и не отклонился бы.
         settle(error);
+        // Слушатель есть только у выполняющейся команды; вне её ошибку сообщит последующий 'close'.
+        if (this.output.listenerCount('error') > 0) {
+          this.output.emit('error', error);
+        }
       });
-      client.on('close', () => this.handleClose());
+      client.on('close', () => {
+        // ssh2 при обрыве во время KEX/auth (и при DISCONNECT BY_APPLICATION) даёт только 'close'
+        // без 'error' и снимает readyTimeout: без отказа здесь connect() не завершился бы никогда.
+        // После готовности settle — no-op.
+        settle(Object.assign(new Error('SSH-соединение с агентом закрыто до готовности.'), {
+          code: SSH_CLOSED_BEFORE_READY_CODE,
+        }));
+        this.handleClose();
+      });
       client.connect(buildSshConnectConfig(this.options));
     });
 
@@ -260,7 +331,7 @@ function delay(timeoutMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, timeoutMs));
 }
 
-export function buildSshConnectConfig(options: DesignerAgentConnectionOptions): ConnectConfig {
+export function buildSshConnectConfig(options: DesignerAgentEndpointOptions): ConnectConfig {
   const config: ConnectConfig = {
     host: options.host,
     port: options.port,

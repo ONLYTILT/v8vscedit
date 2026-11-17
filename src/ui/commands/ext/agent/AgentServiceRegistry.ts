@@ -130,7 +130,7 @@ export async function getAgentOperationServiceForInteractiveDesigner(
 }
 
 /** Внутренний сигнал: агент не слушает порт — не ошибка старта, а «нет агента». */
-export class AgentPortNotOpenError extends Error {
+class AgentPortNotOpenError extends Error {
   constructor() {
     super('агент конфигуратора не обнаружен на порту');
     this.name = 'AgentPortNotOpenError';
@@ -170,7 +170,9 @@ export async function startAgentOperationService(
   const agentSettings = readAgentCommandSettings(connection);
   let agentProcess: DesignerAgentProcess | undefined;
   if (agentSettings.autoStart) {
-    agentProcess = new DesignerAgentProcess();
+    // Отдельная неизменяемая ссылка: замыкание isAborted видит процесс без проверки на undefined.
+    const startedProcess = new DesignerAgentProcess();
+    agentProcess = startedProcess;
     const agentBaseDir = path.join(workspaceRoot, '.v8vscedit', 'agent');
     fs.mkdirSync(agentBaseDir, { recursive: true });
     const args = buildAgentStartLogArgs(toDesignerAgentConnection(connection), agentSettings, agentBaseDir);
@@ -196,14 +198,12 @@ export async function startAgentOperationService(
       host: agentSettings.host,
       port: agentSettings.port,
       timeoutMs: agentSettings.startupTimeoutMs,
-      // Внутри ветки autoStart процесс всегда создан, `?.`/`??` недостижимы; дословный перенос (Э2).
-      /* c8 ignore next */
-      isAborted: () => agentProcess?.hasExited() ?? false,
+      isAborted: () => startedProcess.hasExited(),
     });
     if (!portOpened) {
       throw new Error(
         `Конфигуратор в режиме агента не открыл SSH-порт ${agentSettings.host}:${String(agentSettings.port)}. ` +
-        `Состояние процесса: ${agentProcess.getExitDescription()}. Подробности выше в журнале 1С Редактора.`
+        `Состояние процесса: ${startedProcess.getExitDescription()}. Подробности выше в журнале 1С Редактора.`
       );
     }
     outputChannel.appendLine(`[agent] SSH-порт ${agentSettings.host}:${String(agentSettings.port)} открыт.`);
@@ -223,8 +223,12 @@ export function createAgentOperationServiceEntry(
     user: agentSettings.user,
     password: agentSettings.password,
     privateKeyPath: nonEmptyString(agentSettings.privateKeyPath),
-    connectAttempts: 8,
-    connectRetryDelayMs: 1000,
+    policy: {
+      startupTimeoutMs: agentSettings.startupTimeoutMs,
+      authWarmupMs: agentSettings.authWarmupMs,
+      retryDelayMs: 1000,
+    },
+    agentStartedAt: agentProcess?.getStartedAt(),
   };
   const sessions = new DesignerAgentSessionManager(
     new ProcessDesignerAgentTransportFactory(transportOptions),

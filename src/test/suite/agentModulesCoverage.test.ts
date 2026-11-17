@@ -91,12 +91,12 @@ async function setAgentConfig(key: string, value: unknown): Promise<void> {
 }
 
 const AGENT_KEYS = ['host', 'listenAddress', 'port', 'user', 'privateKeyPath', 'autoStart', 'visible',
-  'agentModeArgs', 'progressInterval', 'startupTimeoutMs'];
+  'agentModeArgs', 'progressInterval', 'startupTimeoutMs', 'authWarmupMs'];
 
 function settings(overrides: Partial<AgentCommandSettings> = {}): AgentCommandSettings {
   return {
     host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
-    visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5, startupTimeoutMs: 15000,
+    visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5, startupTimeoutMs: 15000, authWarmupMs: 90000,
     ...overrides,
   };
 }
@@ -346,7 +346,10 @@ suite('Агент: showAgentQuestion', () => {
   });
 });
 
-suite('Агент: AgentServiceRegistry и runAgentConfigurationOperation', () => {
+suite('Агент: AgentServiceRegistry и runAgentConfigurationOperation', function () {
+  // Старт поддельного процесса и ожидание порта под нагрузкой (задача планировщика, параллельные
+  // прогоны) не укладываются в 2 с по умолчанию; таймаут распространяется и на setup/teardown.
+  this.timeout(60_000);
   let tmp: string;
   let folder: vscode.WorkspaceFolder;
   let log: string[];
@@ -436,7 +439,9 @@ suite('Агент: AgentServiceRegistry и runAgentConfigurationOperation', () =
     for (const key of AGENT_KEYS) { await setAgentConfig(key, undefined); }
     Reflect.deleteProperty(process.env, 'FAKE_AGENT_RECORD');
     Reflect.deleteProperty(process.env, 'FAKE_AGENT_EXIT');
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // dispose выше дожидается выхода процесса; повторы — на случай, когда Windows ещё не отпустила
+    // дескрипторы каталога (антивирус/индексатор), а не подавление ошибки.
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   test('logAgentDiagnostics: пишет каталог агента', () => {
