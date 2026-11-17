@@ -1,78 +1,76 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import { createHash } from 'crypto';
 import type { AgentConfigurationTarget } from '../../domain/agent';
+import type { AgentFileStore } from './files/AgentFileStore';
 
+/**
+ * Раскладка рабочей области в персональном корне агента. Все пути — относительные POSIX-пути
+ * от корня хранилища, в том виде, в каком их принимает агент (`--dir`, `--list-file`).
+ */
 export interface AgentWorkspacePaths {
-  readonly projectRoot: string;
-  readonly agentRoot: string;
-  readonly sessionsRoot: string;
+  readonly projectId: string;
+  /** `workspace/<projectId>`. */
   readonly workspaceRoot: string;
   readonly listsRoot: string;
   readonly exchangeRoot: string;
-  readonly targetDir: string;
+  /** Серверное зеркало выгрузки цели: `workspace/<projectId>/cf` или `…/cfe/<имя>`. */
   readonly targetAgentDir: string;
 }
 
+const LISTS_ROOT = 'lists';
+const EXCHANGE_ROOT = 'exchange';
+
+/**
+ * Сегмент проекта в персональном корне. Корень у пользователя один на агента, а одну базу
+ * могут обслуживать два проекта (или два окна): без сегмента их зеркала затирали бы друг
+ * друга. Форма записи корня (слэши, хвостовой разделитель, регистр буквы диска — VS Code
+ * отдаёт `c:\`, а настройки и терминал — `C:\`) на сегмент не влияет.
+ */
+export function buildAgentProjectId(projectRoot: string): string {
+  const normalized = projectRoot
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .replace(/^([A-Za-z]):/, (_match, drive: string) => `${drive.toLowerCase()}:`);
+  return createHash('sha1').update(normalized, 'utf8').digest('hex').slice(0, 8);
+}
+
 export class AgentWorkspaceService {
-  constructor(private readonly projectRoot: string) {}
+  private readonly projectId: string;
 
-  resolveWorkspace(sessionId: string, target: AgentConfigurationTarget): AgentWorkspacePaths {
-    const safeSessionId = sanitizePathPart(sessionId);
-    const agentRoot = path.join(this.projectRoot, '.v8vscedit', 'agent');
-    const agentFileRoot = path.join(agentRoot, '0');
-    const workspaceRoot = path.join(agentFileRoot, 'workspace', safeSessionId);
-    const agentWorkspaceRoot = path.posix.join('workspace', safeSessionId);
-    const targetDir = target.kind === 'cf'
-      ? path.join(workspaceRoot, 'cf')
-      : path.join(workspaceRoot, 'cfe', sanitizePathPart(requireExtensionName(target)));
+  constructor(private readonly store: AgentFileStore, projectId: string) {
+    this.projectId = sanitizePathPart(projectId);
+  }
+
+  resolveWorkspace(target: AgentConfigurationTarget): AgentWorkspacePaths {
+    const workspaceRoot = `workspace/${this.projectId}`;
     const targetAgentDir = target.kind === 'cf'
-      ? path.posix.join(agentWorkspaceRoot, 'cf')
-      : path.posix.join(agentWorkspaceRoot, 'cfe', sanitizePathPart(requireExtensionName(target)));
-
+      ? `${workspaceRoot}/cf`
+      : `${workspaceRoot}/cfe/${sanitizePathPart(requireExtensionName(target))}`;
     return {
-      projectRoot: this.projectRoot,
-      agentRoot,
-      sessionsRoot: path.join(agentRoot, 'sessions'),
+      projectId: this.projectId,
       workspaceRoot,
-      listsRoot: path.join(agentFileRoot, 'lists'),
-      exchangeRoot: path.join(agentFileRoot, 'exchange'),
-      targetDir,
+      listsRoot: LISTS_ROOT,
+      exchangeRoot: EXCHANGE_ROOT,
       targetAgentDir,
     };
   }
 
-  ensureWorkspace(sessionId: string, target: AgentConfigurationTarget): AgentWorkspacePaths {
-    const workspace = this.resolveWorkspace(sessionId, target);
-    fs.mkdirSync(workspace.sessionsRoot, { recursive: true });
-    fs.mkdirSync(workspace.workspaceRoot, { recursive: true });
-    fs.mkdirSync(workspace.listsRoot, { recursive: true });
-    fs.mkdirSync(workspace.exchangeRoot, { recursive: true });
-    fs.mkdirSync(workspace.targetDir, { recursive: true });
+  async ensureWorkspace(target: AgentConfigurationTarget): Promise<AgentWorkspacePaths> {
+    const workspace = this.resolveWorkspace(target);
+    await this.store.mkdirp(workspace.targetAgentDir);
+    await this.store.mkdirp(workspace.listsRoot);
+    await this.store.mkdirp(workspace.exchangeRoot);
     return workspace;
   }
 
-  writeListFile(operationId: string, relativeFiles: readonly string[]): string {
-    const listPath = path.join(this.getAgentFileRoot(), 'lists', `${sanitizePathPart(operationId)}.txt`);
-    fs.mkdirSync(path.dirname(listPath), { recursive: true });
+  /**
+   * Пишет list-файл частичной загрузки и возвращает его путь для агента (`lists/<op>.txt`).
+   * Формат — UTF-8 с BOM и `\n` между путями: так его читает конфигуратор.
+   */
+  async writeListFile(operationId: string, relativeFiles: readonly string[]): Promise<string> {
+    const listPath = `${LISTS_ROOT}/${sanitizePathPart(operationId)}.txt`;
     const normalized = relativeFiles.map(normalizeRelativeFilePath);
-    fs.writeFileSync(listPath, `\uFEFF${normalized.join('\n')}`, 'utf-8');
+    await this.store.writeFile(listPath, `\uFEFF${normalized.join('\n')}`);
     return listPath;
-  }
-
-  getAgentRoot(): string {
-    return path.join(this.projectRoot, '.v8vscedit', 'agent');
-  }
-
-  getAgentFileRoot(): string {
-    return path.join(this.getAgentRoot(), '0');
-  }
-
-  toAgentPath(localPath: string): string {
-    const relative = path.relative(this.getAgentFileRoot(), localPath);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-      throw new Error(`Путь агента должен находиться внутри проекта: ${localPath}`);
-    }
-    return relative.split(path.sep).join('/');
   }
 }
 
@@ -94,7 +92,9 @@ function sanitizePathPart(value: string): string {
 
 function normalizeRelativeFilePath(filePath: string): string {
   const normalized = filePath.replace(/\\/g, '/').trim();
-  if (!normalized || path.isAbsolute(normalized)) {
+  // Абсолютность проверяется по обеим нотациям (POSIX и диск Windows) независимо от ОС:
+  // путь уходит агенту, который может работать на другой платформе.
+  if (!normalized || /^(\/|[A-Za-z]:)/.test(normalized)) {
     throw new Error('Пути в list-файле агента должны быть относительными.');
   }
 

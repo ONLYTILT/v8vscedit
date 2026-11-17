@@ -10,7 +10,10 @@ import {
   buildDesignerAgentModeArgs,
   describeError,
   releaseInfoBase,
+  resolveAgentBaseDir,
+  resolveDefaultAgentBaseDir,
   waitForTcpPort,
+  type AgentOperationFilesOptions,
   type DesignerAgentInfoBaseConnection,
   type DesignerAgentConnectionOptions,
 } from '../../../../infra/agent';
@@ -32,6 +35,8 @@ export interface CachedAgentService {
   readonly transportOptions: DesignerAgentConnectionOptions;
   /** Порог idle-отключения базы, переданный сессии; 0 — выключено. */
   readonly idleDisconnectMs: number;
+  /** Пользователь и `/AgentBaseDir`, по которым сервис находит персональный корень агента. */
+  readonly files: AgentOperationFilesOptions;
 }
 
 export type CreateAgentServiceEntry = (workspaceRoot: string, settings: AgentCommandSettings) => CachedAgentService;
@@ -202,7 +207,7 @@ class AgentPortNotOpenError extends Error {
 
 export function logAgentDiagnostics(workspaceFolder: vscode.WorkspaceFolder, outputChannel: vscode.OutputChannel): void {
   const workspaceRoot = workspaceFolder.uri.fsPath;
-  const agentBaseDir = path.join(workspaceRoot, '.v8vscedit', 'agent');
+  const agentBaseDir = resolveDefaultAgentBaseDir(workspaceRoot);
   outputChannel.appendLine(`[agent][diag] Каталог агента: ${agentBaseDir}`);
   // Сам конфигуратор пишет дамп в `~/.1cv8/1C/1cv8/dumps` либо в каталог временных файлов платформы.
   // Здесь сообщаем только то, что мы заведомо знаем — служебный каталог расширения.
@@ -236,7 +241,7 @@ export async function startAgentOperationService(
     // Отдельная неизменяемая ссылка: замыкание isAborted видит процесс без проверки на undefined.
     const startedProcess = new DesignerAgentProcess();
     agentProcess = startedProcess;
-    const agentBaseDir = path.join(workspaceRoot, '.v8vscedit', 'agent');
+    const agentBaseDir = resolveDefaultAgentBaseDir(workspaceRoot);
     fs.mkdirSync(agentBaseDir, { recursive: true });
     const args = buildAgentStartLogArgs(toDesignerAgentConnection(connection), agentSettings, agentBaseDir);
     outputChannel.appendLine(`[agent] Запуск конфигуратора: ${args.join(' ')}`);
@@ -298,12 +303,19 @@ export function createAgentOperationServiceEntry(
     { notifyProgressInterval: agentSettings.progressInterval }
   );
   const idleDisconnectMs = agentSettings.idleDisconnectMinutes * 60_000;
+  // Каталог тот же, что получает агент при автозапуске (`/AgentBaseDir` из agentModeArgs
+  // побеждает умолчание): иначе agentbasedir.json искался бы не там, где его пишет агент.
+  const files: AgentOperationFilesOptions = {
+    userName: agentSettings.user,
+    agentBaseDir: resolveAgentBaseDir(workspaceRoot, agentSettings.agentModeArgs),
+  };
   return {
-    service: new AgentOperationService(workspaceRoot, sessions, { idleDisconnectMs }),
+    service: new AgentOperationService(workspaceRoot, sessions, { idleDisconnectMs }, files),
     sessions,
     process: agentProcess,
     transportOptions,
     idleDisconnectMs,
+    files,
   };
 }
 

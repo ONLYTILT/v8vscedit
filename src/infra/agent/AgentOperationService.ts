@@ -1,9 +1,9 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import {
   buildDumpConfigToFilesCommand,
   buildLoadConfigFromFilesCommand,
   buildUpdateDbCfgCommand,
+  type AgentConfigurationTarget,
   type AgentMessage,
 } from '../../domain/agent';
 import {
@@ -16,13 +16,17 @@ import {
   saveHashCache,
 } from '../cache/HashCache';
 import { saveMetadataCacheForEntry } from '../cache/MetadataCache';
-import { AgentWorkspaceService } from './AgentWorkspaceService';
-import { collectConfigFilesForLoad, detectPotentialRename } from './ConfigLoadFileCollector';
+import { AgentWorkspaceService, buildAgentProjectId } from './AgentWorkspaceService';
 import {
-  collectSnapshotProjectFiles,
-  mirrorDirectorySnapshot,
-  syncSelectedSnapshotFiles,
-} from './DirectorySnapshot';
+  hasAgentConfigurationDump,
+  mirrorAgentToProject,
+  mirrorProjectToAgent,
+  uploadProjectFiles,
+} from './AgentWorkspaceMirror';
+import { collectConfigFilesForLoad, detectPotentialRename } from './ConfigLoadFileCollector';
+import { resolveDefaultAgentBaseDir } from './DesignerAgentProcess';
+import type { AgentFileStore } from './files/AgentFileStore';
+import { createLocalAgentFileStore } from './files/LocalAgentFileStore';
 import type {
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
@@ -52,6 +56,21 @@ export interface AgentOperationResult {
   readonly skipped?: boolean;
 }
 
+/**
+ * Кто работает с файлами агента. Персональный корень пользователя агент назначает при
+ * первом SSH-входе (`agentbasedir.json`), поэтому без логина файловые операции невозможны.
+ */
+export interface AgentOperationFilesOptions {
+  readonly userName: string;
+  /** `/AgentBaseDir` агента; по умолчанию — служебный каталог агента проекта. */
+  readonly agentBaseDir?: string;
+}
+
+interface AgentFiles {
+  readonly store: AgentFileStore;
+  readonly workspace: AgentWorkspaceService;
+}
+
 export interface DesignerAgentInfoBaseSession {
   isInfoBaseConnected(): boolean;
   disconnectInfoBase(hooks?: AgentOperationHooks, options?: { readonly force?: boolean }): Promise<boolean>;
@@ -64,15 +83,15 @@ export interface DesignerAgentInfoBaseSession {
  * здесь только алгоритмы выгрузки/загрузки поверх исполнителя команд сессии.
  */
 export class AgentOperationService implements DesignerAgentInfoBaseSession {
-  private readonly workspaceService: AgentWorkspaceService;
   private readonly session: AgentInfoBaseSession;
+  private files: AgentFiles | undefined;
 
   constructor(
     private readonly projectRoot: string,
     transportFactory: DesignerAgentTransportFactory | ResettableDesignerAgentTransportFactory,
-    sessionOptions: Partial<AgentInfoBaseSessionOptions> = {}
+    sessionOptions: Partial<AgentInfoBaseSessionOptions> = {},
+    private readonly filesOptions?: AgentOperationFilesOptions
   ) {
-    this.workspaceService = new AgentWorkspaceService(projectRoot);
     this.session = new AgentInfoBaseSession(transportFactory, {
       // По умолчанию база держится до явного release (план: idleDisconnectMinutes = 0).
       idleDisconnectMs: sessionOptions.idleDisconnectMs ?? 0,
@@ -94,38 +113,45 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
   }
 
   /** Снимает idle-таймер; SSH-сессии закрывает владелец фабрики транспорта (реестр сервисов). */
-  dispose(): Promise<void> {
-    return this.session.dispose();
+  async dispose(): Promise<void> {
+    const files = this.files;
+    this.files = undefined;
+    try {
+      await this.session.dispose();
+    } finally {
+      // Хранилище (в Э6 — SFTP-канал) освобождается и при сбое остановки сессии.
+      await files?.store.dispose();
+    }
   }
 
   async importFromDatabase(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+    const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
-      const workspace = this.workspaceService.ensureWorkspace(buildSessionKey(target), target);
+      const { store, workspace: workspaceService } = await this.getFiles(filesOptions);
+      const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
       const command = buildDumpConfigToFilesCommand(workspace.targetAgentDir, {
         extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined,
         format: 'hierarchical',
-        update: fs.existsSync(path.join(workspace.targetDir, 'ConfigDumpInfo.xml')),
+        update: (await store.stat(`${workspace.targetAgentDir}/ConfigDumpInfo.xml`)) !== undefined,
         force: true,
       });
 
       await exec.execute(command);
-      const changedProjectFiles = collectSnapshotProjectFiles(workspace.targetDir, target.rootPath);
-      hooks?.onProjectFilesWillChange?.(changedProjectFiles);
-      // Раньше тут стоял `syncDirectorySnapshot`, который через `rename` переносил
-      // workspace в проект и оставлял workspace.targetDir пустым. После этого
-      // первая же `load-config-from-files --partial` валилась с пустым UnknownError,
-      // потому что в `--dir=workspace/...` не было целостной структуры конфигурации
-      // (Configuration.xml, родительских XML для модулей форм и т.п.).
-      // Сейчас зеркалим в проект копированием — workspace остаётся полным
-      // снимком текущего состояния БД и пригоден для последующих частичных загрузок.
-      mirrorDirectorySnapshot(workspace.targetDir, target.rootPath);
-      hooks?.onProjectFilesWillChange?.(changedProjectFiles);
+      // M остаётся полным снимком базы (копирование, а не перенос): частичной загрузке
+      // `load-config-from-files --partial` нужен целостный каркас выгрузки в `--dir`.
+      const changedProjectFiles = await mirrorAgentToProject(
+        store,
+        workspace.targetAgentDir,
+        target.rootPath,
+        hooks?.onProjectFilesWillChange
+      );
       this.refreshCaches(target);
       return { changedProjectFiles };
     }, hooks);
   }
 
   async loadFullAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+    this.requireFilesOptions();
     return this.session.run(async (exec) => {
       await this.loadFull(target, exec, hooks);
       return this.updateDatabaseConfigurationConnected(target, exec, hooks);
@@ -133,6 +159,7 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
   }
 
   async loadChangedAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+    this.requireFilesOptions();
     return this.session.run(async (exec) => {
       const loaded = await this.loadChanged(target, exec, hooks);
       if (loaded.skipped) {
@@ -165,9 +192,10 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentOperationResult> {
-    const workspace = this.workspaceService.ensureWorkspace(buildSessionKey(target), target);
+    const { store, workspace: workspaceService } = await this.getFiles(this.requireFilesOptions());
+    const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
     hooks?.onMessage?.('Подготовка файлов для полной загрузки.');
-    mirrorDirectorySnapshot(target.rootPath, workspace.targetDir);
+    await mirrorProjectToAgent(store, target.rootPath, workspace.targetAgentDir);
     hooks?.onMessage?.('Полная загрузка конфигурации из файлов.');
     await exec.execute(
       buildLoadConfigFromFilesCommand(workspace.targetAgentDir, {
@@ -224,18 +252,19 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
       return { changedProjectFiles: [], skipped: true };
     }
 
-    const workspace = this.workspaceService.ensureWorkspace(buildSessionKey(target), target);
+    const { store, workspace: workspaceService } = await this.getFiles(this.requireFilesOptions());
+    const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
     hooks?.onMessage?.(`Подготовка частичной загрузки: ${String(filesForLoad.length)} файл(ов).`);
     // Конфигуратору на `load-config-from-files --partial` нужен целостный каркас
     // выгрузки в `--dir`: Configuration.xml, родительские XML для модулей форм и т.д.
-    // Если workspace пуст (например, проект только что заведён или каталог был очищен),
-    // зеркалим проект целиком. Иначе агент валится в пустой UnknownError, не имея
-    // контекста для частичной загрузки.
-    this.ensureWorkspaceMirrored(target.rootPath, workspace.targetDir);
-    syncSelectedSnapshotFiles(target.rootPath, workspace.targetDir, filesForLoad);
+    // Без каркаса (проект только что заведён, M очищено) зеркалим проект целиком —
+    // иначе агент валится в пустой UnknownError, не имея контекста для частичной загрузки.
+    if (!(await hasAgentConfigurationDump(store, workspace.targetAgentDir))) {
+      await mirrorProjectToAgent(store, target.rootPath, workspace.targetAgentDir);
+    }
+    await uploadProjectFiles(store, target.rootPath, workspace.targetAgentDir, filesForLoad);
     const operationId = `${buildSessionKey(target)}-${String(Date.now())}`;
-    const listFile = this.workspaceService.writeListFile(operationId, filesForLoad);
-    const agentListFile = this.workspaceService.toAgentPath(listFile);
+    const agentListFile = await workspaceService.writeListFile(operationId, filesForLoad);
 
     hooks?.onMessage?.('Частичная загрузка изменённых файлов.');
     // ConfigDumpInfo.xml для расширения/конфигурации поддерживается на стороне `loadFull`.
@@ -264,24 +293,30 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     saveMetadataCacheForEntry(this.projectRoot, scopeKey, { kind: target.kind, rootPath: target.rootPath });
   }
 
+  /** Проверка до подключения ИБ: без пользователя файловую операцию незачем и начинать. */
+  private requireFilesOptions(): AgentOperationFilesOptions {
+    if (!this.filesOptions) {
+      throw new Error(
+        'Не задан пользователь агента конфигуратора: операции с файлами рабочей области агента недоступны.'
+      );
+    }
+    return this.filesOptions;
+  }
+
   /**
-   * Гарантирует, что в `workspace.targetDir` лежит полный снимок исходников проекта.
-   * Используется перед частичной загрузкой: точечный sync только изменённых файлов
-   * требует, чтобы остальной каркас выгрузки уже присутствовал в воркспейсе.
+   * Хранилище создаётся лениво, внутри операции — уже ПОСЛЕ `connect-ib`: персональный корень
+   * агент назначает при первом SSH-входе пользователя, до него индекса может не быть.
+   * Неудачная попытка не кэшируется — следующая операция перечитает индекс.
    */
-  private ensureWorkspaceMirrored(sourceDir: string, workspaceDir: string): void {
-    if (!fs.existsSync(workspaceDir)) {
-      mirrorDirectorySnapshot(sourceDir, workspaceDir);
-      return;
+  private async getFiles(options: AgentOperationFilesOptions): Promise<AgentFiles> {
+    if (!this.files) {
+      const store = await createLocalAgentFileStore(
+        options.agentBaseDir ?? resolveDefaultAgentBaseDir(this.projectRoot),
+        options.userName
+      );
+      this.files = { store, workspace: new AgentWorkspaceService(store, buildAgentProjectId(this.projectRoot)) };
     }
-    const entries = fs.readdirSync(workspaceDir);
-    if (entries.length === 0) {
-      mirrorDirectorySnapshot(sourceDir, workspaceDir);
-      return;
-    }
-    if (!fs.existsSync(path.join(workspaceDir, 'Configuration.xml'))) {
-      mirrorDirectorySnapshot(sourceDir, workspaceDir);
-    }
+    return this.files;
   }
 
   private refreshHashCache(target: AgentConfigurationOperationTarget): void {
@@ -293,4 +328,9 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
 
 function buildSessionKey(target: AgentConfigurationOperationTarget): string {
   return target.kind === 'cf' ? 'cf' : `cfe-${target.extensionName ?? target.name}`;
+}
+
+/** Без явного `extensionName` расширение называется по имени цели — как и в командах агента. */
+function toWorkspaceTarget(target: AgentConfigurationOperationTarget): AgentConfigurationTarget {
+  return target.kind === 'cf' ? { kind: 'cf' } : { kind: 'cfe', extensionName: target.extensionName ?? target.name };
 }

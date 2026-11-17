@@ -4,7 +4,6 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   AgentOperationService,
-  AgentWorkspaceService,
   isInfoBaseAlreadyConnectedMessage,
   type DesignerAgentTransport,
   type DesignerAgentTransportFactory,
@@ -13,6 +12,7 @@ import {
 } from '../../infra/agent';
 import { buildHashSnapshot, buildScopeKey, saveHashCache } from '../../infra/cache/HashCache';
 import { FakeTimers, ScriptedFactory, agentError } from './support/agentInfoBaseFakes';
+import { mirrorDirOf, newService } from './support/agentWorkspaceFixtures';
 
 class FakeTransport implements DesignerAgentTransport {
   readonly commands: string[] = [];
@@ -93,7 +93,7 @@ suite('AgentOperationService', () => {
 
     test('load → update → load → update: один connect-ib, ноль disconnect-ib, ноль сбросов SSH', async () => {
       const factory = new ScriptedFactory();
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
 
       await service.loadFullAndUpdate(target());
       await service.loadFullAndUpdate(target());
@@ -114,7 +114,7 @@ suite('AgentOperationService', () => {
       fs.writeFileSync(changedModule, 'Процедура ПослеИзменения() КонецПроцедуры', 'utf-8');
 
       const factory = new ScriptedFactory();
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
       await service.updateDatabaseConfiguration(target());
       await service.loadChangedAndUpdate(target());
 
@@ -130,7 +130,7 @@ suite('AgentOperationService', () => {
       const factory = new ScriptedFactory((command) => (
         command.startsWith('config update-db-cfg') && failUpdate ? new Error('обновление упало') : undefined
       ));
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
 
       await assert.rejects(service.updateDatabaseConfiguration(target()), /обновление упало/);
       assert.strictEqual(factory.count('common disconnect-ib'), 1);
@@ -148,7 +148,7 @@ suite('AgentOperationService', () => {
         if (command === 'common disconnect-ib') { return agentError('DesignerNotConnectedToInfoBase'); }
         return undefined;
       });
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
       await service.updateDatabaseConfiguration(target());
       assert.strictEqual(service.isInfoBaseConnected(), true);
       assert.strictEqual(await service.disconnectInfoBase(), true);
@@ -157,7 +157,7 @@ suite('AgentOperationService', () => {
 
     test('disconnectInfoBase(force) без кэша шлёт disconnect-ib; без force и без подключения — ничего', async () => {
       const factory = new ScriptedFactory();
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
       assert.strictEqual(await service.disconnectInfoBase(), false);
       assert.deepStrictEqual(factory.log, []);
       assert.strictEqual(await service.disconnectInfoBase(undefined, { force: true }), true);
@@ -166,7 +166,7 @@ suite('AgentOperationService', () => {
 
     test('reconnectInfoBase подключает ИБ', async () => {
       const factory = new ScriptedFactory();
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
       await service.reconnectInfoBase();
       assert.deepStrictEqual(factory.log, ['common connect-ib']);
       assert.strictEqual(service.isInfoBaseConnected(), true);
@@ -175,7 +175,7 @@ suite('AgentOperationService', () => {
     test('опции idle пробрасываются в сессию: таймер на idleDisconnectMs после операции, срабатывание отпускает базу', async () => {
       const factory = new ScriptedFactory();
       const timers = new FakeTimers();
-      const service = new AgentOperationService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
+      const service = newService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
       await service.updateDatabaseConfiguration(target());
       assert.deepStrictEqual(timers.setCalls, [60_000]);
       await timers.fireAll();
@@ -185,7 +185,7 @@ suite('AgentOperationService', () => {
 
     test('по умолчанию (опции не заданы) база остаётся подключённой без таймеров', async () => {
       const factory = new ScriptedFactory();
-      const service = new AgentOperationService(tempRoot, factory);
+      const service = newService(tempRoot, factory);
       await service.updateDatabaseConfiguration(target());
       assert.strictEqual(service.isInfoBaseConnected(), true);
     });
@@ -193,7 +193,7 @@ suite('AgentOperationService', () => {
     test('dispose сервиса снимает idle-таймер', async () => {
       const factory = new ScriptedFactory();
       const timers = new FakeTimers();
-      const service = new AgentOperationService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
+      const service = newService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
       await service.updateDatabaseConfiguration(target());
       await service.dispose();
       assert.strictEqual(timers.pending.size, 0);
@@ -228,11 +228,11 @@ suite('AgentOperationService', () => {
       fs.writeFileSync(changedModule, 'Процедура Новая() КонецПроцедуры', 'utf-8');
 
       const transport = new FakeTransport();
-      const service = new AgentOperationService(tempRoot, new FakeTransportFactory(transport));
+      const service = newService(tempRoot, new FakeTransportFactory(transport));
 
       await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
 
-      const agentRoot = path.join(tempRoot, '.v8vscedit', 'agent', '0', 'workspace', 'cf', 'cf');
+      const agentRoot = mirrorDirOf(tempRoot);
       // Изменённый модуль скопирован.
       assert.strictEqual(fs.existsSync(path.join(agentRoot, 'Documents', 'Заказ', 'Ext', 'ObjectModule.bsl')), true);
       // Раньше тест требовал, чтобы НЕизменённый модуль отсутствовал в воркспейсе — это и приводило
@@ -267,7 +267,7 @@ suite('AgentOperationService', () => {
       fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Новый.xml'), '<xml/>', 'utf-8');
 
       const transport = new FakeTransport();
-      const service = new AgentOperationService(tempRoot, new FakeTransportFactory(transport));
+      const service = newService(tempRoot, new FakeTransportFactory(transport));
 
       await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
 
@@ -305,10 +305,10 @@ suite('AgentOperationService', () => {
       fs.writeFileSync(changedModule, 'Процедура Новая() КонецПроцедуры', 'utf-8');
 
       const transport = new FakeTransport();
-      const service = new AgentOperationService(tempRoot, new FakeTransportFactory(transport));
+      const service = newService(tempRoot, new FakeTransportFactory(transport));
       await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
 
-      const agentRoot = path.join(tempRoot, '.v8vscedit', 'agent', '0', 'workspace', 'cf', 'cf');
+      const agentRoot = mirrorDirOf(tempRoot);
       assert.strictEqual(
         fs.existsSync(path.join(agentRoot, 'Configuration.xml')),
         true,
@@ -356,14 +356,14 @@ suite('AgentOperationService: Э4, все операции идут через �
 
   test('importFromDatabase: connect-ib и dump-config-to-files через сессию, база остаётся подключённой', async () => {
     // Фейковый агент «выгружает базу» в каталог воркспейса — так, как это делает настоящий dump.
-    const workspaceDir = new AgentWorkspaceService(tempRoot).ensureWorkspace('cf', cf()).targetDir;
+    const workspaceDir = mirrorDirOf(tempRoot);
     const factory = new ScriptedFactory((command) => {
       if (command.startsWith('config dump-config-to-files')) {
         fs.cpSync(configRoot, workspaceDir, { recursive: true });
       }
       return undefined;
     });
-    const service = new AgentOperationService(tempRoot, factory);
+    const service = newService(tempRoot, factory);
     const result = await service.importFromDatabase(cf());
     assert.strictEqual(factory.log[0], 'common connect-ib');
     assert.match(factory.log[1], /^config dump-config-to-files /);
@@ -374,7 +374,7 @@ suite('AgentOperationService: Э4, все операции идут через �
 
   test('cfe: имя расширения уходит в команды; без extensionName — имя цели', async () => {
     const factory = new ScriptedFactory();
-    const service = new AgentOperationService(tempRoot, factory);
+    const service = newService(tempRoot, factory);
     await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Расш1', rootPath: configRoot });
     await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Узел', extensionName: 'Расш2', rootPath: configRoot });
     await service.loadFullAndUpdate({ kind: 'cfe', name: 'Узел', extensionName: 'Расш3', rootPath: configRoot });
@@ -393,7 +393,7 @@ suite('AgentOperationService: Э4, все операции идут через �
 
   test('loadChangedAndUpdate без кэша хешей → полная загрузка', async () => {
     const factory = new ScriptedFactory();
-    const service = new AgentOperationService(tempRoot, factory);
+    const service = newService(tempRoot, factory);
     const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
     assert.ok(messages.includes('Кэш изменений не найден, выполняется полная загрузка.'));
     assert.ok(factory.log.some((c) => c.startsWith('config load-config-from-files') && !c.includes('--partial')));
@@ -403,7 +403,7 @@ suite('AgentOperationService: Э4, все операции идут через �
     saveCurrentHashes();
     fs.rmSync(path.join(configRoot, 'Catalogs', 'Товары.xml'));
     const factory = new ScriptedFactory();
-    const service = new AgentOperationService(tempRoot, factory);
+    const service = newService(tempRoot, factory);
     const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
     assert.ok(messages.includes('Обнаружено удаление файлов, выполняется полная загрузка.'), messages.join('|'));
   });
@@ -412,7 +412,7 @@ suite('AgentOperationService: Э4, все операции идут через �
     saveCurrentHashes();
     fs.renameSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), path.join(configRoot, 'Catalogs', 'Номенклатура.xml'));
     const factory = new ScriptedFactory();
-    const service = new AgentOperationService(tempRoot, factory);
+    const service = newService(tempRoot, factory);
     const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
     assert.ok(messages.includes('Обнаружено переименование объектов, выполняется полная загрузка.'), messages.join('|'));
   });

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'child_process';
+import * as path from 'path';
 import { resolveV8ExecutablePath, decodeProcessOutput } from '../process';
 
 export interface DesignerAgentInfoBaseConnection {
@@ -207,6 +208,29 @@ export function buildDesignerAgentModeArgs(options: DesignerAgentProcessOptions)
   appendSwitchWithValue(args, userArgs, '/AgentBaseDir', options.agentBaseDir);
   args.push(...userArgs);
   return args;
+}
+
+/** Служебный каталог агента проекта: `/AgentBaseDir` и рабочий каталог процесса по умолчанию. */
+export function resolveDefaultAgentBaseDir(projectRoot: string): string {
+  return path.join(projectRoot, '.v8vscedit', 'agent');
+}
+
+/**
+ * Фактический `/AgentBaseDir` агента. Ключ из пользовательских `agentModeArgs` побеждает
+ * умолчание (см. {@link buildDesignerAgentModeArgs}), и тогда `agentbasedir.json` лежит там,
+ * а не в служебном каталоге проекта. Относительное значение агент разрешает от своего
+ * рабочего каталога — это и есть каталог по умолчанию.
+ */
+export function resolveAgentBaseDir(projectRoot: string, agentModeArgs: readonly string[] = []): string {
+  const fallback = resolveDefaultAgentBaseDir(projectRoot);
+  const index = agentModeArgs.findIndex((arg) => normalizeAgentSwitch(arg) === 'agentbasedir');
+  if (index < 0) {
+    return fallback;
+  }
+  const arg = agentModeArgs[index];
+  const separator = arg.indexOf('=');
+  const value = separator >= 0 ? arg.slice(separator + 1) : agentModeArgs[index + 1];
+  return value ? path.resolve(fallback, value) : fallback;
 }
 
 function appendSwitchWithValue(

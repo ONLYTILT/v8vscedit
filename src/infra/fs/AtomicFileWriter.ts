@@ -43,14 +43,17 @@ export function resolveAtomicTempPath(targetPath: string, uniqueSuffix: string):
 }
 
 /**
- * Пишет `data` в `targetPath` подменой файла.
+ * Пишет `data` в `targetPath` подменой файла. Строка пишется как UTF-8 без BOM,
+ * `Uint8Array` — байт-в-байт (кодировка Node для двоичных данных игнорируется):
+ * двоичный вариант нужен для файлов, которые приходят от агента конфигуратора
+ * уже готовыми байтами (BOM/CRLF платформы сохраняются как есть).
  *
  * Отказ на любом этапе — громкий: исходное исключение пробрасывается, цель
  * остаётся нетронутой, временный файл убирается. Молчаливого отката на прямую
  * `writeFileSync` здесь нет сознательно — он вернул бы ровно тот дефект
  * (обрезанный файл), ради которого функция и написана.
  */
-export function writeFileAtomic(targetPath: string, data: string): void {
+export function writeFileAtomic(targetPath: string, data: string | Uint8Array): void {
   const target = resolveWriteTarget(targetPath);
   writeCounter += 1;
   const tempPath = resolveAtomicTempPath(

@@ -7,6 +7,8 @@ import {
   buildDesignerAgentArgs,
   buildDesignerAgentModeArgs,
   DesignerAgentProcess,
+  resolveAgentBaseDir,
+  resolveDefaultAgentBaseDir,
   waitForTcpPort,
   type DesignerAgentInfoBaseConnection,
 } from '../../infra/agent';
@@ -293,3 +295,30 @@ function waitUntil(condition: () => boolean, timeoutMs: number): Promise<void> {
     check();
   });
 }
+
+suite('resolveAgentBaseDir: фактический /AgentBaseDir агента (Э5)', () => {
+  const project = path.join(os.tmpdir(), 'v8-agent-basedir-project');
+  const fallback = path.join(project, '.v8vscedit', 'agent');
+
+  test('умолчание — служебный каталог агента проекта', () => {
+    assert.strictEqual(resolveDefaultAgentBaseDir(project), fallback);
+    assert.strictEqual(resolveAgentBaseDir(project), fallback);
+    assert.strictEqual(resolveAgentBaseDir(project, ['/AgentPort', '1601', '/Visible']), fallback);
+  });
+
+  test('ключ из agentModeArgs побеждает умолчание: раздельная форма и форма с "=", регистр и префикс "-" не важны', () => {
+    const manual = path.join(os.tmpdir(), 'manual base');
+    assert.strictEqual(resolveAgentBaseDir(project, ['/AgentPort', '1', '/AgentBaseDir', manual]), manual);
+    assert.strictEqual(resolveAgentBaseDir(project, [`/agentbasedir=${manual}`]), manual);
+    assert.strictEqual(resolveAgentBaseDir(project, ['-AgentBaseDir', manual]), manual);
+  });
+
+  test('относительное значение разрешается от рабочего каталога агента (каталога по умолчанию)', () => {
+    assert.strictEqual(resolveAgentBaseDir(project, ['/AgentBaseDir', 'sub']), path.join(fallback, 'sub'));
+  });
+
+  test('ключ без значения → умолчание', () => {
+    assert.strictEqual(resolveAgentBaseDir(project, ['/AgentBaseDir']), fallback);
+    assert.strictEqual(resolveAgentBaseDir(project, ['/AgentBaseDir=']), fallback);
+  });
+});

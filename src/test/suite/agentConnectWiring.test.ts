@@ -172,4 +172,14 @@ suite('Агент Э4: настройка idleDisconnectMinutes и провод�
     assert.strictEqual(entry.transportOptions.port, 2000);
     assert.strictEqual(entry.transportOptions.user, 'adm');
   });
+
+  test('createAgentOperationServiceEntry: файлы агента — логин из настроек и тот же /AgentBaseDir, что получает агент', () => {
+    const root = os.tmpdir();
+    const byDefault = createAgentOperationServiceEntry(root, { ...baseSettings, user: 'КытмановА' });
+    assert.deepStrictEqual(byDefault.files, { userName: 'КытмановА', agentBaseDir: path.join(root, '.v8vscedit', 'agent') });
+
+    const manual = path.join(root, 'manual-agent-base');
+    const overridden = createAgentOperationServiceEntry(root, { ...baseSettings, agentModeArgs: ['/AgentBaseDir', manual] });
+    assert.strictEqual(overridden.files.agentBaseDir, manual);
+  });
 });
