@@ -35,6 +35,18 @@ $allowedEnv = @{
 
 $requestId = ''
 
+# schtasks /End гасит только этот powershell: дочерние Code.exe тестового VS Code остаются
+# сиротами в сессии 0, держат single-instance и роняют следующий прогон, а пользователь без
+# прав администратора убить их не может. Поэтому исполнитель сам убирает их до и после прогона.
+# Фильтр — только исполняемые файлы из .vscode-test этого репозитория: рабочий VS Code
+# пользователя (другой путь, другая сессия) не затрагивается.
+function Stop-OrphanTestCode {
+  $testRoot = (Join-Path $RepoRoot '.vscode-test') + '\'
+  Get-CimInstance Win32_Process -Filter "Name='Code.exe'" |
+    Where-Object { $_.SessionId -eq 0 -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($testRoot, [StringComparison]::OrdinalIgnoreCase) } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
 function Write-Result([int]$code) {
   # Через временный файл: наблюдатель ждёт result.json и не должен прочитать его недописанным.
   # id запроса в результате — защита от чужого результата при гонке двух запусков.
@@ -73,10 +85,16 @@ try {
   $env:PATH = "C:\Program Files\nodejs;C:\Program Files\Git\cmd;$env:PATH"
 
   Set-Location -LiteralPath $RepoRoot
+  Stop-OrphanTestCode
   [IO.File]::WriteAllText($logPath, "[hidden-tests] npm run $($request.script)`r`n", $utf8NoBom)
   # chcp 65001: собственные сообщения cmd иначе ушли бы в лог в OEM-кодировке среди UTF-8.
   & cmd.exe /d /s /c "chcp 65001 >nul & npm.cmd run $($request.script) >> `"$logPath`" 2>&1"
-  Write-Result $LASTEXITCODE
+  $exitCode = $LASTEXITCODE
+  # Сбой уборки после прогона не должен подменять настоящий код выхода тестов на 3.
+  try { Stop-OrphanTestCode } catch {
+    [IO.File]::AppendAllText($logPath, "[hidden-tests][warn] уборка Code.exe: $($_.Exception.Message)`r`n", $utf8NoBom)
+  }
+  Write-Result $exitCode
 } catch {
   [IO.File]::AppendAllText($logPath, "[hidden-tests][error] $($_.Exception.Message)`r`n", $utf8NoBom)
   Write-Result 3

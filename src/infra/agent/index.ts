@@ -16,3 +16,6 @@ export * from './AgentWorkspaceMirror';
 export * from './files/AgentFileStore';
 export * from './files/AgentFileTransfer';
 export * from './files/LocalAgentFileStore';
+export * from './AgentConnectRetry';
+export * from './files/SftpConnection';
+export * from './files/SftpAgentFileStore';

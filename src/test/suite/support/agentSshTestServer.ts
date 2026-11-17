@@ -1,4 +1,5 @@
 import { Server, utils, type Connection } from 'ssh2';
+import { SftpTestBackend } from './agentSftpTestBackend';
 
 /**
  * Эмулятор SSH-стороны агента конфигуратора 1С (in-process ssh2.Server).
@@ -18,6 +19,8 @@ export interface AgentSshTestServerOptions {
   /** 0 или не задан — свободный порт; конкретный номер нужен сценариям «порт сначала закрыт». */
   readonly port?: number;
   readonly behavior?: AgentAuthBehavior;
+  /** Э6: корневой каталог настоящего SFTP; не задан — подсистема `sftp` отклоняется, как агентом без SFTP. */
+  readonly sftpRoot?: string;
 }
 
 export class AgentSshTestServer {
@@ -26,12 +29,43 @@ export class AgentSshTestServer {
   private behavior: AgentAuthBehavior;
   private readonly clients = new Set<Connection>();
 
-  private constructor(private readonly server: Server, readonly port: number, behavior: AgentAuthBehavior) {
+  /** Э6: SFTP-сторона (журнал операций, управление поведением); `undefined`, если `sftpRoot` не задан. */
+  readonly sftp: SftpTestBackend | undefined;
+  private clientCountWaiters: { count: number; resolve: () => void }[] = [];
+
+  private constructor(
+    private readonly server: Server,
+    readonly port: number,
+    behavior: AgentAuthBehavior,
+    sftpRoot: string | undefined
+  ) {
     this.behavior = behavior;
+    this.sftp = sftpRoot === undefined ? undefined : new SftpTestBackend(sftpRoot);
+  }
+
+  /** Число открытых SSH-соединений (shell и SFTP — разные соединения, факт пилота §5b). */
+  get clientCount(): number {
+    return this.clients.size;
+  }
+
+  /** Резолвится, когда число открытых SSH-соединений стало равно `count` (в т.ч. сразу, если уже равно). */
+  whenClientCount(count: number): Promise<void> {
+    if (this.clients.size === count) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.clientCountWaiters.push({ count, resolve }));
+  }
+
+  private notifyClientCount(): void {
+    const ready = this.clientCountWaiters.filter((waiter) => waiter.count === this.clients.size);
+    this.clientCountWaiters = this.clientCountWaiters.filter((waiter) => !ready.includes(waiter));
+    for (const waiter of ready) {
+      waiter.resolve();
+    }
   }
 
   static async start(options: AgentSshTestServerOptions = {}): Promise<AgentSshTestServer> {
-    const hostKey = utils.generateKeyPairSync('ed25519').private;
+    const hostKey = getHostKey();
     const holder: { instance?: AgentSshTestServer } = {};
     const server = new Server({ hostKeys: [hostKey] }, (client) => holder.instance?.handleClient(client));
     await new Promise<void>((resolve, reject) => {
@@ -44,7 +78,7 @@ export class AgentSshTestServer {
     const address = server.address();
     // listen на TCP всегда даёт объект с портом; строка бывает только у unix-сокета.
     const port = typeof address === 'object' && address ? address.port : 0;
-    holder.instance = new AgentSshTestServer(server, port, options.behavior ?? { mode: 'accept' });
+    holder.instance = new AgentSshTestServer(server, port, options.behavior ?? { mode: 'accept' }, options.sftpRoot);
     return holder.instance;
   }
 
@@ -92,6 +126,7 @@ export class AgentSshTestServer {
       client.end();
     }
     this.clients.clear();
+    this.sftp?.closeAll();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
@@ -111,8 +146,12 @@ export class AgentSshTestServer {
 
   private handleClient(client: Connection): void {
     this.clients.add(client);
+    this.notifyClientCount();
     client.on('error', () => undefined);
-    client.on('close', () => this.clients.delete(client));
+    client.on('close', () => {
+      this.clients.delete(client);
+      this.notifyClientCount();
+    });
     client.on('authentication', (ctx) => {
       if (ctx.method !== 'password') {
         ctx.reject(['password']);
@@ -128,6 +167,13 @@ export class AgentSshTestServer {
     client.on('ready', () => {
       client.on('session', (accept) => {
         const session = accept();
+        session.on('sftp', (acceptSftp, rejectSftp) => {
+          if (this.sftp) {
+            this.sftp.attach(acceptSftp());
+          } else {
+            rejectSftp();
+          }
+        });
         session.on('shell', (acceptShell) => {
           const stream = acceptShell();
           const log: string[] = [];
@@ -154,4 +200,21 @@ export class AgentSshTestServer {
       });
     });
   }
+}
+
+let cachedHostKey: string | undefined;
+
+/**
+ * Ключ хоста один на прогон: генерация на каждый сервер медленна, а ssh2 изредка выдаёт ed25519-ключ,
+ * который сам же не может разобрать («Malformed OpenSSH private key») — при десятках серверов на прогон
+ * это давало случайные падения. Поэтому ключ проверяется разбором и при браке генерируется заново.
+ */
+function getHostKey(): string {
+  while (cachedHostKey === undefined) {
+    const candidate = utils.generateKeyPairSync('ed25519').private;
+    if (!(utils.parseKey(candidate) instanceof Error)) {
+      cachedHostKey = candidate;
+    }
+  }
+  return cachedHostKey;
 }
