@@ -14,6 +14,11 @@ import { RepositoryService, type RepositoryNodeRef } from '../../infra/repositor
 import type { CommandServices } from '../../ui/commands/_shared';
 import { registerRepositoryCommands } from '../../ui/commands/repository/RepositoryCommands';
 import { disposeRepositoryCommandStatusBar } from '../../ui/commands/repository/RepositoryCommandRunner';
+import {
+  endConfigurationOperation,
+  isConfigurationOperationRunning,
+  tryBeginConfigurationOperation,
+} from '../../ui/commands/ext/configurationOperationLock';
 
 /**
  * Обработчики команд хранилища, вызванные настоящим `registerRepositoryCommands`:
@@ -62,6 +67,9 @@ suite('RepositoryCommands — обработчики команд', () => {
   let commitForm: { calls: unknown[][]; answer: unknown };
   let refreshes: number;
   let executorCalls: { v8Path: string; cwd: string }[];
+  let lockDuringRun: boolean[];
+  let changedConfigs: { rootPath: string; name: string; changedFilesCount: number }[];
+  let outputLog: { line: string; locked: boolean }[];
 
   const w = vscode.window as unknown as Record<string, unknown>;
   const commandsRef = vscode.commands as unknown as { registerCommand: unknown };
@@ -134,8 +142,11 @@ suite('RepositoryCommands — обработчики команд', () => {
       return { exitCode: 0, log: '', outputs };
     };
     executorCalls = [];
+    lockDuringRun = [];
+    changedConfigs = [];
+    outputLog = [];
     const fakeExecutor: DesignerBatchExecutor = {
-      run: (request) => { runs.push(request); return Promise.resolve(runResult(request)); },
+      run: (request) => { runs.push(request); lockDuringRun.push(isConfigurationOperationRunning()); return Promise.resolve(runResult(request)); },
       dispose: () => Promise.resolve(),
     };
 
@@ -164,12 +175,15 @@ suite('RepositoryCommands — обработчики команд', () => {
 
     const services = {
       workspaceFolder: { uri: vscode.Uri.file(root), name: 'cmds', index: 0 },
-      outputChannel: { appendLine: () => undefined } as unknown as vscode.OutputChannel,
+      outputChannel: {
+        appendLine: (line: string) => { outputLog.push({ line, locked: isConfigurationOperationRunning() }); },
+        show: () => undefined,
+      } as unknown as vscode.OutputChannel,
       repositoryService: service,
       projectSecretStorage: new ProjectSecretStorage(fakeSecretStore(), root),
       treeProvider: { refresh: () => { refreshes += 1; } },
       refreshActionsView: () => undefined,
-      getChangedConfigurations: () => [],
+      getChangedConfigurations: () => changedConfigs,
       repositoryConnectionViewProvider: {
         show: (...args: unknown[]) => { connectionForm.calls.push(args); return Promise.resolve(connectionForm.answer); },
       },
@@ -192,7 +206,8 @@ suite('RepositoryCommands — обработчики команд', () => {
     }
   });
 
-  teardown(() => {
+  teardown(async () => {
+    await endConfigurationOperation();
     for (const key of ['showErrorMessage', 'showWarningMessage', 'showInformationMessage', 'showInputBox', 'showQuickPick', 'showSaveDialog']) {
       w[key] = saved[key];
     }
@@ -524,6 +539,161 @@ suite('RepositoryCommands — обработчики команд', () => {
       assert.strictEqual(valueAfter(request, '-name'), 'Метка');
       assert.strictEqual(valueAfter(request, '-v'), '3');
       assert.strictEqual(valueAfter(request, '-comment'), 'коммент');
+    });
+  });
+
+  suite('Э4: общий замок операций над конфигурацией', () => {
+    interface Scenario { readonly id: string; readonly node?: unknown; readonly prepare: () => void }
+    // Каждая команда, доходящая до пакетного Конфигуратора. connect и update в успешной ветке запускают
+    // фоновую пост-синхронизацию, поэтому сценарии ниже используют отказ исполнителя (exitCode 1):
+    // замок и так должен сниматься и при отказе.
+    const scenarios = (): Scenario[] => [
+      { id: 'v8vscedit.repository.connect', prepare: () => { connectionForm.answer = { repoPath: 'p', repoUser: 'u', repoPassword: 'w' }; } },
+      { id: 'v8vscedit.repository.create', prepare: () => { connectionForm.answer = { repoPath: 'p', repoUser: 'u', repoPassword: 'w' }; } },
+      { id: 'v8vscedit.repository.disconnect', prepare: () => { picks.push(pickLabel('Штатно')); } },
+      { id: 'v8vscedit.repository.lock', node: catalogNode, prepare: () => { picks.push(pickLabel('Рекурсивно')); } },
+      { id: 'v8vscedit.repository.unlock', node: catalogNode, prepare: () => { picks.push(pickLabel('Только выбранный объект'), pickLabel('Без force')); } },
+      { id: 'v8vscedit.repository.commit', node: catalogNode, prepare: () => { commitForm.answer = { recursive: true, comment: 'Правка', keepLocked: false, force: false }; } },
+      { id: 'v8vscedit.repository.update', node: catalogNode, prepare: () => { picks.push(pickLabel('Рекурсивно'), pickLabel('Без force')); inputs.push(''); } },
+      { id: 'v8vscedit.repository.addUser', prepare: () => { inputs.push('user', 'pwd'); picks.push(pickLabel('ReadOnly'), pickLabel('Нет')); } },
+      { id: 'v8vscedit.repository.copyUsers', prepare: () => { inputs.push('C:\\src-repo', 'usr', 'pwd'); picks.push(pickLabel('Нет')); } },
+      { id: 'v8vscedit.repository.dump', prepare: () => { saveAnswers.push(vscode.Uri.file(path.join(root, 'd.cf'))); inputs.push(''); } },
+      { id: 'v8vscedit.repository.report', prepare: () => { picks.push(pickLabel('txt'), pickMany([])); saveAnswers.push(vscode.Uri.file(path.join(root, 'r.txt'))); inputs.push('', '', '', '', ''); } },
+      { id: 'v8vscedit.repository.setLabel', prepare: () => { inputs.push('Метка', '3', 'к'); } },
+    ];
+    const ids = scenarios().map((s) => s.id);
+
+    for (const id of ids) {
+      test(`${id}: замок занят на время запуска и освобождён после (при отказе исполнителя тоже)`, async () => {
+        runResult = () => ({ exitCode: 1, log: '', outputs: new Map() });
+        const scenario = scenarios().find((s) => s.id === id);
+        assert.ok(scenario);
+        scenario.prepare();
+        await call(id, scenario.node);
+        assert.strictEqual(runs.length, 1, 'сценарий не дошёл до запуска исполнителя — подготовка теста неверна');
+        assert.deepStrictEqual(lockDuringRun, [true], 'на время работы Конфигуратора замок должен быть занят');
+        assert.strictEqual(isConfigurationOperationRunning(), false, 'после завершения замок обязан быть свободен');
+      });
+
+      test(`${id}: замок уже занят другой операцией — исполнитель не запускается, чужой замок не снимается, пользователь уведомлён`, async () => {
+        const scenario = scenarios().find((s) => s.id === id);
+        assert.ok(scenario);
+        scenario.prepare();
+        assert.strictEqual(await tryBeginConfigurationOperation(), true);
+        await call(id, scenario.node);
+        assert.strictEqual(runs.length, 0);
+        assert.strictEqual(isConfigurationOperationRunning(), true, 'чужой замок не должен быть снят');
+        assert.ok([...infos, ...warnings].some((m) => m.includes('уже выполняется')), [...infos, ...warnings].join('|'));
+      });
+    }
+
+    test('замок освобождается и когда исполнитель бросает исключение', async () => {
+      runResult = () => { throw new Error('исполнитель упал'); };
+      const scenario = scenarios().find((s) => s.id === 'v8vscedit.repository.lock');
+      assert.ok(scenario);
+      scenario.prepare();
+      await call(scenario.id, scenario.node);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('успешная операция тоже освобождает замок (lock)', async () => {
+      picks.push(pickLabel('Рекурсивно'));
+      await call('v8vscedit.repository.lock', catalogNode);
+      assert.deepStrictEqual(lockDuringRun, [true]);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('B3: ошибка операции не держит замок, пока открыта нотификация об ошибке', async () => {
+      runResult = () => ({ exitCode: 1, log: '', outputs: new Map() });
+      let errorShown = false;
+      // Нотификация «висит», пока пользователь её не закроет: промис не резолвится никогда.
+      w.showErrorMessage = () => { errorShown = true; return new Promise(() => undefined); };
+      picks.push(pickLabel('Рекурсивно'));
+      await call('v8vscedit.repository.lock', catalogNode);
+      assert.strictEqual(errorShown, true);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('commit: форма помещения показывается ДО замка; узел без подписи и без полного имени', async () => {
+      const lockWhileForm: boolean[] = [];
+      commitForm.answer = undefined;
+      const unlabeledRoot = { ...rootNode, label: undefined };
+      const original = commitForm;
+      commitForm = {
+        calls: original.calls,
+        get answer() { lockWhileForm.push(isConfigurationOperationRunning()); return undefined; },
+      };
+      await call('v8vscedit.repository.commit', unlabeledRoot);
+      assert.deepStrictEqual(lockWhileForm, [false], 'форма не должна открываться под замком');
+      // Подпись — имя конфигурации; у корня нет полного имени объекта → «не захвачен».
+      assert.deepStrictEqual(original.calls[0], ['Основная', false]);
+      assert.strictEqual(runs.length, 0);
+    });
+
+    test('commit: отказ от обязательного обновления перед помещением — ни формы, ни запуска, замок свободен', async () => {
+      changedConfigs = [{ rootPath: path.dirname(rootXml()), name: 'Основная', changedFilesCount: 2 }];
+      picks.push(pickLabel('$(close) Отменить помещение'));
+      await call('v8vscedit.repository.commit', catalogNode);
+      assert.strictEqual(commitForm.calls.length, 0);
+      assert.strictEqual(runs.length, 0);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('отмена в диалоге (до запуска) замок не занимает и не оставляет занятым', async () => {
+      picks.push(PICK_CANCEL);
+      await call('v8vscedit.repository.lock', catalogNode);
+      assert.strictEqual(runs.length, 0);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+  });
+
+  // Составные сценарии держат замок ОДНОЙ секцией: между шагами не может вклиниться другая
+  // операция над той же базой. Шаг обновления/пост-синхронизации идёт через настоящий
+  // внутренний CLI (платформа — пустая заглушка, поэтому CLI завершается отказом); момент его
+  // старта наблюдается по строке журнала `[actions] Старт`, записанной под замком.
+  suite('Э4: составные сценарии — один замок на весь сценарий', function () {
+    this.timeout(120_000);
+
+    function cliStarts(): { line: string; locked: boolean }[] {
+      return outputLog.filter((entry) => entry.line.startsWith('[actions] Старт'));
+    }
+
+    test('commit с предварительным обновлением БД: обновление и помещение под одним замком', async () => {
+      changedConfigs = [{ rootPath: path.dirname(rootXml()), name: 'Основная', changedFilesCount: 1 }];
+      picks.push(pickLabel('$(sync) Обновить и продолжить'));
+      commitForm.answer = { recursive: true, comment: 'Правка', keepLocked: false, force: false };
+
+      await call('v8vscedit.repository.commit', catalogNode);
+
+      assert.ok(cliStarts().length >= 1, 'шаг обновления БД не запускался');
+      assert.ok(cliStarts().every((entry) => entry.locked), 'обновление перед помещением шло без замка');
+      assert.ok(lockDuringRun.every((locked) => locked));
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('connect: подключение и пост-синхронизация с базой — под одним замком', async () => {
+      connectionForm.answer = { repoPath: 'p', repoUser: 'u', repoPassword: 'w' };
+
+      await call('v8vscedit.repository.connect');
+
+      assert.deepStrictEqual(lockDuringRun, [true]);
+      assert.ok(cliStarts().length >= 1, 'пост-синхронизация не запускалась');
+      assert.ok(cliStarts().every((entry) => entry.locked), 'пост-синхронизация шла без замка');
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('create с подключением: пост-синхронизация под тем же замком; с noBind — без неё', async () => {
+      connectionForm.answer = { repoPath: 'p', repoUser: 'u', repoPassword: 'w' };
+      await call('v8vscedit.repository.create');
+      assert.ok(cliStarts().length >= 1);
+      assert.ok(cliStarts().every((entry) => entry.locked));
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+
+      outputLog.length = 0;
+      connectionForm.answer = { repoPath: 'p', repoUser: 'u', repoPassword: 'w', noBind: true };
+      await call('v8vscedit.repository.create');
+      assert.strictEqual(cliStarts().length, 0);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
     });
   });
 });

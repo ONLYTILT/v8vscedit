@@ -4,7 +4,6 @@ import {
   buildDumpConfigToFilesCommand,
   buildLoadConfigFromFilesCommand,
   buildUpdateDbCfgCommand,
-  getAgentMessageText,
   type AgentMessage,
 } from '../../domain/agent';
 import {
@@ -25,11 +24,15 @@ import {
   syncSelectedSnapshotFiles,
 } from './DirectorySnapshot';
 import type {
-  AgentCommandHooks,
-  DesignerAgentTransport,
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
 } from './AgentTransport';
+import {
+  AgentInfoBaseSession,
+  SYSTEM_TIMERS,
+  type AgentCommandExecutor,
+  type AgentInfoBaseSessionOptions,
+} from './AgentInfoBaseSession';
 
 export interface AgentConfigurationOperationTarget {
   readonly kind: 'cf' | 'cfe';
@@ -55,48 +58,48 @@ export interface DesignerAgentInfoBaseSession {
   reconnectInfoBase(hooks?: AgentOperationHooks): Promise<void>;
 }
 
-export class AgentOperationService {
+/**
+ * Фасад агентских операций над конфигурацией. Жизненный цикл подключения ИБ (ленивый
+ * `connect-ib`, удержание между операциями, release, idle) — в {@link AgentInfoBaseSession};
+ * здесь только алгоритмы выгрузки/загрузки поверх исполнителя команд сессии.
+ */
+export class AgentOperationService implements DesignerAgentInfoBaseSession {
   private readonly workspaceService: AgentWorkspaceService;
-  private connected = false;
+  private readonly session: AgentInfoBaseSession;
 
   constructor(
     private readonly projectRoot: string,
-    private readonly transportFactory: DesignerAgentTransportFactory | ResettableDesignerAgentTransportFactory
+    transportFactory: DesignerAgentTransportFactory | ResettableDesignerAgentTransportFactory,
+    sessionOptions: Partial<AgentInfoBaseSessionOptions> = {}
   ) {
     this.workspaceService = new AgentWorkspaceService(projectRoot);
+    this.session = new AgentInfoBaseSession(transportFactory, {
+      // По умолчанию база держится до явного release (план: idleDisconnectMinutes = 0).
+      idleDisconnectMs: sessionOptions.idleDisconnectMs ?? 0,
+      timers: sessionOptions.timers ?? SYSTEM_TIMERS,
+      clock: sessionOptions.clock ?? Date.now,
+    });
   }
 
   isInfoBaseConnected(): boolean {
-    return this.connected;
+    return this.session.isInfoBaseConnected();
   }
 
-  async disconnectInfoBase(hooks?: AgentOperationHooks, options?: { readonly force?: boolean }): Promise<boolean> {
-    if (!this.connected && options?.force !== true) {
-      return false;
-    }
-
-    const transport = await this.transportFactory.create('default');
-    const commandHooks = this.createCommandHooks(hooks);
-    hooks?.onMessage?.('Отключение информационной базы от агента конфигуратора.');
-    try {
-      await transport.execute('common disconnect-ib', commandHooks);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!isInfoBaseNotConnectedMessage(message)) {
-        throw error;
-      }
-    }
-    this.connected = false;
-    return true;
+  disconnectInfoBase(hooks?: AgentOperationHooks, options?: { readonly force?: boolean }): Promise<boolean> {
+    return this.session.disconnectInfoBase(hooks, options);
   }
 
-  async reconnectInfoBase(hooks?: AgentOperationHooks): Promise<void> {
-    const transport = await this.transportFactory.create('default');
-    await this.ensureConnected(transport, this.createCommandHooks(hooks));
+  reconnectInfoBase(hooks?: AgentOperationHooks): Promise<void> {
+    return this.session.reconnectInfoBase(hooks);
+  }
+
+  /** Снимает idle-таймер; SSH-сессии закрывает владелец фабрики транспорта (реестр сервисов). */
+  dispose(): Promise<void> {
+    return this.session.dispose();
   }
 
   async importFromDatabase(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    return this.runInfoBaseOperation(hooks, async () => {
+    return this.session.run(async (exec) => {
       const workspace = this.workspaceService.ensureWorkspace(buildSessionKey(target), target);
       const command = buildDumpConfigToFilesCommand(workspace.targetAgentDir, {
         extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined,
@@ -105,7 +108,7 @@ export class AgentOperationService {
         force: true,
       });
 
-      await this.executeAgentCommand(command, hooks);
+      await exec.execute(command);
       const changedProjectFiles = collectSnapshotProjectFiles(workspace.targetDir, target.rootPath);
       hooks?.onProjectFilesWillChange?.(changedProjectFiles);
       // Раньше тут стоял `syncDirectorySnapshot`, который через `rename` переносил
@@ -119,59 +122,69 @@ export class AgentOperationService {
       hooks?.onProjectFilesWillChange?.(changedProjectFiles);
       this.refreshCaches(target);
       return { changedProjectFiles };
-    });
+    }, hooks);
   }
 
   async loadFullAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    return this.runInfoBaseOperation(hooks, async () => {
-      await this.loadFull(target, hooks);
-      return this.updateDatabaseConfigurationConnected(target, hooks);
-    });
+    return this.session.run(async (exec) => {
+      await this.loadFull(target, exec, hooks);
+      return this.updateDatabaseConfigurationConnected(target, exec, hooks);
+    }, hooks);
   }
 
   async loadChangedAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    return this.runInfoBaseOperation(hooks, async () => {
-      const loaded = await this.loadChanged(target, hooks);
+    return this.session.run(async (exec) => {
+      const loaded = await this.loadChanged(target, exec, hooks);
       if (loaded.skipped) {
         hooks?.onMessage?.('изменений для загрузки нет');
         return loaded;
       }
-      await this.updateDatabaseConfigurationConnected(target, hooks);
+      await this.updateDatabaseConfigurationConnected(target, exec, hooks);
       return loaded;
-    });
+    }, hooks);
   }
 
   async updateDatabaseConfiguration(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    return this.runInfoBaseOperation(hooks, () => this.updateDatabaseConfigurationConnected(target, hooks));
+    return this.session.run((exec) => this.updateDatabaseConfigurationConnected(target, exec, hooks), hooks);
   }
 
-  private async updateDatabaseConfigurationConnected(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+  private async updateDatabaseConfigurationConnected(
+    target: AgentConfigurationOperationTarget,
+    exec: AgentCommandExecutor,
+    hooks?: AgentOperationHooks
+  ): Promise<AgentOperationResult> {
     hooks?.onMessage?.('Обновление конфигурации базы данных.');
-    await this.executeAgentCommand(
-      buildUpdateDbCfgCommand({ extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined }),
-      hooks
+    await exec.execute(
+      buildUpdateDbCfgCommand({ extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined })
     );
     return { changedProjectFiles: [] };
   }
 
-  private async loadFull(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+  private async loadFull(
+    target: AgentConfigurationOperationTarget,
+    exec: AgentCommandExecutor,
+    hooks?: AgentOperationHooks
+  ): Promise<AgentOperationResult> {
     const workspace = this.workspaceService.ensureWorkspace(buildSessionKey(target), target);
     hooks?.onMessage?.('Подготовка файлов для полной загрузки.');
     mirrorDirectorySnapshot(target.rootPath, workspace.targetDir);
     hooks?.onMessage?.('Полная загрузка конфигурации из файлов.');
-    await this.executeAgentCommand(
+    await exec.execute(
       buildLoadConfigFromFilesCommand(workspace.targetAgentDir, {
         extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined,
         format: 'hierarchical',
         updateConfigDumpInfo: true,
-      }),
-      hooks
+      })
     );
     this.refreshHashCache(target);
     return { changedProjectFiles: [] };
   }
 
-  private async loadChanged(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+  private async loadChanged(
+    target: AgentConfigurationOperationTarget,
+    exec: AgentCommandExecutor,
+    hooks?: AgentOperationHooks
+  ): Promise<AgentOperationResult> {
     if (!fs.existsSync(target.rootPath)) {
       throw new Error(`Каталог исходников не найден: ${target.rootPath}`);
     }
@@ -190,18 +203,20 @@ export class AgentOperationService {
 
     if (Object.keys(previousSnapshot.files).length === 0) {
       hooks?.onMessage?.('Кэш изменений не найден, выполняется полная загрузка.');
-      return this.loadFull(target, hooks);
+      return this.loadFull(target, exec, hooks);
+    }
+
+    // Переименование проверяется ДО удаления: оно всегда содержит удалённые файлы, и в
+    // обратном порядке ветка переименования была недостижима (сообщение — всегда «удаление»).
+    const forceFullLoad = detectPotentialRename(previousSnapshot.files, currentSnapshot.files, diff.added, diff.deleted);
+    if (forceFullLoad) {
+      hooks?.onMessage?.('Обнаружено переименование объектов, выполняется полная загрузка.');
+      return this.loadFull(target, exec, hooks);
     }
 
     if (diff.deleted.length > 0) {
       hooks?.onMessage?.('Обнаружено удаление файлов, выполняется полная загрузка.');
-      return this.loadFull(target, hooks);
-    }
-
-    const forceFullLoad = detectPotentialRename(previousSnapshot.files, currentSnapshot.files, diff.added, diff.deleted);
-    if (forceFullLoad) {
-      hooks?.onMessage?.('Обнаружено переименование объектов, выполняется полная загрузка.');
-      return this.loadFull(target, hooks);
+      return this.loadFull(target, exec, hooks);
     }
 
     const filesForLoad = collectConfigFilesForLoad(target.rootPath, changedFiles, false);
@@ -227,15 +242,14 @@ export class AgentOperationService {
     // На частичной загрузке передавать `--update-config-dump-info` нельзя:
     // конфигуратор перезаписывает файл «срезом» только из переданного списка и при
     // повторных частичных загрузках уходит во внутреннее `UnknownError` с пустым телом.
-    await this.executeAgentCommand(
+    await exec.execute(
       buildLoadConfigFromFilesCommand(workspace.targetAgentDir, {
         extensionName: commandExtensionName,
         format: 'hierarchical',
         listFile: agentListFile,
         partial: true,
         noCheck: true,
-      }),
-      hooks
+      })
     );
 
     const changedHashes = collectCurrentHashes(target.rootPath, changedFiles);
@@ -275,100 +289,8 @@ export class AgentOperationService {
     const scopeKey = buildScopeKey(target.kind, target.rootPath, extensionName);
     saveHashCache(this.projectRoot, buildHashSnapshot(scopeKey, target.rootPath));
   }
-
-  private async executeAgentCommand(command: string, hooks?: AgentOperationHooks): Promise<void> {
-    const transport = await this.transportFactory.create('default');
-    const commandHooks = this.createCommandHooks(hooks);
-    await this.ensureConnected(transport, commandHooks);
-    await transport.execute(command, commandHooks);
-  }
-
-  private async runInfoBaseOperation<T>(hooks: AgentOperationHooks | undefined, operation: () => Promise<T>): Promise<T> {
-    try {
-      return await operation();
-    } catch (error) {
-      try {
-        await this.disconnectInfoBase(hooks);
-      } catch (disconnectError) {
-        const message = disconnectError instanceof Error ? disconnectError.message : String(disconnectError);
-        hooks?.onMessage?.(`Не удалось отключить информационную базу после ошибки операции: ${message}`);
-      }
-      throw error;
-    } finally {
-      if (this.connected) {
-        await this.disconnectInfoBase(hooks);
-      }
-      await this.resetAgentSession(hooks);
-    }
-  }
-
-  private async resetAgentSession(hooks?: AgentOperationHooks): Promise<void> {
-    if (!isResettableTransportFactory(this.transportFactory)) {
-      return;
-    }
-    try {
-      await this.transportFactory.reset('default');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      hooks?.onMessage?.(`Не удалось сбросить SSH-сессию агента: ${message}`);
-    }
-  }
-
-  private createCommandHooks(hooks?: AgentOperationHooks): AgentCommandHooks {
-    return {
-      onQuestion: hooks?.onQuestion,
-      onMessage: (message) => {
-        const text = getAgentMessageText(message);
-        if (text) {
-          hooks?.onMessage?.(text);
-        }
-      },
-    };
-  }
-
-  private async ensureConnected(transport: DesignerAgentTransport, commandHooks: AgentCommandHooks): Promise<void> {
-    if (!this.connected) {
-      try {
-        commandHooks.onMessage?.({ type: 'log', message: 'Подключение информационной базы к агенту конфигуратора.' });
-        await transport.execute('common connect-ib', commandHooks);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!isInfoBaseAlreadyConnectedMessage(message)) {
-          throw error;
-        }
-      }
-      this.connected = true;
-    }
-  }
 }
 
 function buildSessionKey(target: AgentConfigurationOperationTarget): string {
   return target.kind === 'cf' ? 'cf' : `cfe-${target.extensionName ?? target.name}`;
-}
-
-function normalizeAgentErrorMessage(message: string): string {
-  return message.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function isResettableTransportFactory(
-  factory: DesignerAgentTransportFactory | ResettableDesignerAgentTransportFactory
-): factory is ResettableDesignerAgentTransportFactory {
-  return typeof (factory as Partial<ResettableDesignerAgentTransportFactory>).reset === 'function';
-}
-
-export function isInfoBaseAlreadyConnectedMessage(message: string): boolean {
-  const normalized = normalizeAgentErrorMessage(message);
-  return /designeralreadyconnectedtoinfobase/i.test(message) ||
-    normalized.includes('already connected') ||
-    normalized.includes('уже установлено') ||
-    /соединение.*информационн.*баз.*уже.*установлен/.test(normalized) ||
-    /подключ.*уже.*установлен/.test(normalized);
-}
-
-function isInfoBaseNotConnectedMessage(message: string): boolean {
-  const normalized = normalizeAgentErrorMessage(message);
-  return normalized.includes('not connected') ||
-    normalized.includes('не подключ') ||
-    normalized.includes('не установлено') ||
-    /соединение.*информационн.*баз.*не.*установлен/.test(normalized);
 }

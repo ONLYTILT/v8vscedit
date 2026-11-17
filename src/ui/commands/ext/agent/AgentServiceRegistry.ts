@@ -8,6 +8,8 @@ import {
   DesignerAgentSessionManager,
   ProcessDesignerAgentTransportFactory,
   buildDesignerAgentModeArgs,
+  describeError,
+  releaseInfoBase,
   waitForTcpPort,
   type DesignerAgentInfoBaseConnection,
   type DesignerAgentConnectionOptions,
@@ -15,12 +17,28 @@ import {
 import { getOrCreate } from '../../../../infra/process';
 import { nonEmptyString, resolveConnectionFromSettings, resolveSettingsPath } from '../connectionSettings';
 import { resetConfigurationOperationStatus } from '../configurationOperationStatus';
-import { readAgentCommandSettings, toDesignerAgentConnection, type AgentCommandSettings } from './agentSettings';
+import {
+  isAgentConfigurationOperationMode,
+  readAgentCommandSettings,
+  toDesignerAgentConnection,
+  type AgentCommandSettings,
+} from './agentSettings';
 
 export interface CachedAgentService {
   readonly service: AgentOperationService;
   readonly sessions: DesignerAgentSessionManager;
   readonly process?: DesignerAgentProcess;
+  /** Ровно тот объект опций, что получила фабрика транспорта (публичный контракт вместо приватных полей менеджера). */
+  readonly transportOptions: DesignerAgentConnectionOptions;
+  /** Порог idle-отключения базы, переданный сессии; 0 — выключено. */
+  readonly idleDisconnectMs: number;
+}
+
+export type CreateAgentServiceEntry = (workspaceRoot: string, settings: AgentCommandSettings) => CachedAgentService;
+
+export interface AgentReleaseDeps {
+  /** Шов под тест: внешний агент 1С в CI недоступен. По умолчанию — {@link createAgentOperationServiceEntry}. */
+  readonly createEntry?: CreateAgentServiceEntry;
 }
 
 export interface InteractiveDesignerAgentService {
@@ -81,6 +99,8 @@ export async function disposeCachedAgentOperationServices(): Promise<void> {
       return;
     }
     try {
+      // Сначала снимается idle-таймер: иначе он сработал бы уже на закрытом транспорте.
+      await entry.service.dispose();
       await entry.sessions.disposeAll();
     } finally {
       await entry.process?.stop();
@@ -92,12 +112,54 @@ export async function getAgentOperationServiceForInteractiveDesigner(
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel
 ): Promise<InteractiveDesignerAgentService | undefined> {
+  return findAgentServiceForRelease(workspaceFolder, outputChannel, createAgentOperationServiceEntry);
+}
+
+/**
+ * Отпускает базу у агента конфигуратора перед пакетной операцией (пакетный Конфигуратор,
+ * хранилище, внутренний CLI). Возвращает `true`, если `disconnect-ib` был отправлен.
+ *
+ * Без закэшированного сервиса агент ищется на порту только в агентском режиме: внешний агент,
+ * переживший перезапуск VS Code, может держать базу, о чём кэш не знает, — тогда отключение
+ * принудительное. Ошибка отключения пробрасывается: пакетная операция стартовать не должна.
+ */
+export async function releaseAgentInfoBaseForBatch(
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  deps: AgentReleaseDeps = {}
+): Promise<boolean> {
+  const mayHaveAgent = getCachedAgentOperationService(workspaceFolder) !== undefined || isAgentConfigurationOperationMode();
+  const found = mayHaveAgent
+    ? await findAgentServiceForRelease(workspaceFolder, outputChannel, deps.createEntry ?? createAgentOperationServiceEntry)
+    : undefined;
+  try {
+    return await releaseInfoBase(found?.service, {
+      force: found?.forceDisconnect,
+      hooks: { onMessage: (message) => outputChannel.appendLine(`[agent] ${message}`) },
+    });
+  } catch (error) {
+    throw new Error(`Не удалось отключить информационную базу от агента конфигуратора: ${describeError(error)}`, { cause: error });
+  }
+}
+
+/**
+ * Общий поиск сервиса агента для «отпустить базу»: интерактивный Конфигуратор и пакетные
+ * операции конфликтуют с подключённым агентом по одной и той же блокировке базы.
+ */
+async function findAgentServiceForRelease(
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  createEntry: CreateAgentServiceEntry
+): Promise<InteractiveDesignerAgentService | undefined> {
   const cached = getCachedAgentOperationService(workspaceFolder);
   if (cached) {
     return { service: cached, forceDisconnect: false };
   }
 
   const workspaceRoot = workspaceFolder.uri.fsPath;
+  // Принудительно отключает только тот, кто создал запись: параллельные вызовы получают
+  // тот же сервис, и повторный disconnect-ib без подключения им не нужен.
+  let createdHere = false;
   try {
     // Сигнальным исключением помечаем случай «агент не найден» — тогда ключ
     // не должен осесть в кэше отравленным, и getOrCreate его удалит.
@@ -116,9 +178,10 @@ export async function getAgentOperationServiceForInteractiveDesigner(
       outputChannel.appendLine(
         `[agent] Найден запущенный агент конфигуратора: ${agentSettings.host}:${String(agentSettings.port)}.`
       );
-      return createAgentOperationServiceEntry(workspaceRoot, agentSettings);
+      createdHere = true;
+      return createEntry(workspaceRoot, agentSettings);
     });
-    return { service: entry.service, forceDisconnect: true };
+    return { service: entry.service, forceDisconnect: createdHere };
   } catch (error) {
     if (error instanceof AgentPortNotOpenError) {
       return undefined;
@@ -234,10 +297,13 @@ export function createAgentOperationServiceEntry(
     new ProcessDesignerAgentTransportFactory(transportOptions),
     { notifyProgressInterval: agentSettings.progressInterval }
   );
+  const idleDisconnectMs = agentSettings.idleDisconnectMinutes * 60_000;
   return {
-    service: new AgentOperationService(workspaceRoot, sessions),
+    service: new AgentOperationService(workspaceRoot, sessions, { idleDisconnectMs }),
     sessions,
     process: agentProcess,
+    transportOptions,
+    idleDisconnectMs,
   };
 }
 

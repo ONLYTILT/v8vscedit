@@ -115,6 +115,10 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   private queue: Promise<unknown> = Promise.resolve();
   private disposed = false;
   private closeEmitted = false;
+  // Соединение, однажды поднятое и потерянное (close/error SSH-клиента), не реанимируется
+  // внутри этого объекта: новый SSH требует заново `options set` (его шлёт менеджер сессий)
+  // и `connect-ib` (подключение ИБ не переживает закрытие SSH-сессии, план §5b п.1).
+  private lost = false;
 
   constructor(
     private readonly options: DesignerAgentEndpointOptions,
@@ -130,9 +134,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     }
     // disposed не сбрасываем здесь: после reset()/dispose() сессия считается
     // выброшенной, и команда из очереди не должна реанимировать её через connect().
-    if (this.disposed) {
-      throw new Error('Сессия агента уже закрыта.');
-    }
+    this.assertUsable();
 
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const client = this.createClient();
@@ -166,6 +168,11 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
         });
       });
       client.on('error', (error) => {
+        // Ошибка ПОСЛЕ готовности — соединение потеряно уже сейчас, не дожидаясь 'close' (Н13):
+        // команда, пришедшая между 'error' и 'close', иначе ушла бы в мёртвый канал.
+        if (settled) {
+          this.lost = true;
+        }
         // Сначала отказ connect(): на этапе подключения у output нет слушателей 'error', и
         // EventEmitter бросил бы прямо отсюда — промис connect() так и не отклонился бы.
         settle(error);
@@ -226,10 +233,22 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     return Promise.resolve();
   }
 
-  private async executeQueued(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+  /** Транспорт выброшен (reset/dispose) или его SSH-соединение потеряно — нужен новый экземпляр. */
+  isClosed(): boolean {
+    return this.disposed || this.lost;
+  }
+
+  private assertUsable(): void {
     if (this.disposed) {
       throw new Error('Сессия агента уже закрыта.');
     }
+    if (this.lost) {
+      throw new Error('SSH-соединение с агентом потеряно; команда не отправлена, нужна новая сессия.');
+    }
+  }
+
+  private async executeQueued(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+    this.assertUsable();
     await this.connect();
     const channel = this.requireChannel();
     const messages: AgentMessage[] = [];
@@ -311,6 +330,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   }
 
   private handleClose(): void {
+    this.lost = true;
     this.channel = undefined;
     this.client = undefined;
     if (!this.disposed && !this.closeEmitted) {

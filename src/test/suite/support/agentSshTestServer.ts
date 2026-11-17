@@ -49,6 +49,24 @@ export class AgentSshTestServer {
   }
 
   private readonly inputWaiters: ((text: string) => void)[] = [];
+  private jsonReplies = false;
+  /** Строки команд, принятые каждым shell-каналом (по каналу на SSH-сессию), в порядке прихода. */
+  readonly shellLog: string[][] = [];
+
+  /**
+   * Э4: эмуляция протокола агента — на каждую строку команды ответ `[{"type":"success"}]`.
+   * Достаточно, чтобы транспорт и менеджер сессий прошли полный цикл команды.
+   */
+  enableJsonReplies(): void {
+    this.jsonReplies = true;
+  }
+
+  /** Неожиданный обрыв со стороны агента: сервер закрывает все SSH-соединения, сам продолжая слушать порт. */
+  dropClients(): void {
+    for (const client of this.clients) {
+      client.end();
+    }
+  }
 
   /** Резолвится текстом следующего ввода клиента в shell-канал (строка команды агента). */
   nextShellInput(): Promise<string> {
@@ -112,11 +130,24 @@ export class AgentSshTestServer {
         const session = accept();
         session.on('shell', (acceptShell) => {
           const stream = acceptShell();
+          const log: string[] = [];
+          this.shellLog.push(log);
+          let pending = '';
           // Строки команд транспорта: тесты ждут их, чтобы действовать в момент «команда ушла, ответа нет».
           stream.on('data', (chunk: Buffer) => {
+            const text = chunk.toString('utf-8');
             const waiter = this.inputWaiters.shift();
             if (waiter) {
-              waiter(chunk.toString('utf-8'));
+              waiter(text);
+            }
+            pending += text;
+            const lines = pending.split('\n');
+            pending = lines.pop() ?? '';
+            for (const line of lines) {
+              log.push(line);
+              if (this.jsonReplies) {
+                stream.write(`${JSON.stringify([{ type: 'success', message: line }])}\n`);
+              }
             }
           });
         });

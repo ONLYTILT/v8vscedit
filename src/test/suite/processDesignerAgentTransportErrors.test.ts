@@ -112,23 +112,21 @@ suite('ProcessDesignerAgentTransport: ошибки клиента после con
     await outcome;
   });
 
-  test('ошибка клиента без активной команды не бросается; следующая команда переподключается', async () => {
+  test('ошибка клиента без активной команды не бросается; транспорт мёртв, следующая команда отклоняется сразу', async () => {
     const t = transport();
     await t.connect();
     // Нет слушателей 'error': обработчик не должен бросить uncaught из emit.
     await proxy.corruptClients();
-    // Ошибка без команды не роняет процесс; сброс канала делает последующий 'close' клиента —
-    // дожидаемся его (и слушателя транспорта, идущего следом в том же emit).
     await clientClosed;
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const input = server.nextShellInput();
-    const pending = t.execute('common shutdown');
-    // Фактическое поведение: канал сброшен, execute поднимает новое соединение и шлёт команду.
-    assert.strictEqual(await input, 'common shutdown\n');
-    const outcome = assert.rejects(pending, Error);
-    await proxy.corruptClients();
-    await outcome;
+    // Э4 (B1): новое SSH внутри того же объекта не поднимается — на нём не было бы `options set`
+    // (ответы не JSON) и `connect-ib`. Пересоздаёт транспорт менеджер сессий по isClosed().
+    assert.strictEqual(t.isClosed(), true);
+    let reachedServer = false;
+    void server.nextShellInput().then(() => { reachedServer = true; });
+    await assert.rejects(t.execute('common shutdown'), /потеряно/);
+    assert.strictEqual(reachedServer, false);
   });
 });
 

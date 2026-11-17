@@ -24,6 +24,7 @@ import {
 } from './configurationOperationStatus';
 import { isAgentConfigurationOperationMode } from './agent/agentSettings';
 import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
+import { releaseAgentInfoBaseForBatch } from './agent/AgentServiceRegistry';
 
 // Прежний публичный API модуля сохраняется реэкспортом: потребители (Container, команды, тесты)
 // импортируют из ExtensionCommandRunner, а реализация живёт в соседних модулях (Э2).
@@ -793,6 +794,10 @@ export async function runInternalCliCommand(
   options.onProgressMessage?.(options.progressStartMessage);
 
   try {
+    // Пакетный Конфигуратор упрётся в блокировку базы, пока её держит агент (connect-ib
+    // живёт между операциями) — отпускаем ДО спавна; сбой отключения = отказ операции.
+    await releaseAgentInfoBaseForBatch(workspaceFolder, outputChannel);
+
     let lastStdout = '';
     let lastStderr = '';
     const outputTail: string[] = [];

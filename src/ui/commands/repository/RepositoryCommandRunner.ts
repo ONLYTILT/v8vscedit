@@ -15,6 +15,7 @@ import {
   buildRepositoryDesignerRequest,
   type RepositoryOperation,
 } from '../../../infra/repository/RepositoryDesignerArgs';
+import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
 
 interface ConnectionParams {
   infoBasePath?: string;
@@ -84,6 +85,9 @@ export async function runRepositoryCliCommand(
   beginRepositoryOperationStatus(options.progressTitle, options.progressStartMessage);
 
   try {
+    // Пакетный Конфигуратор не войдёт в базу, пока её держит агент: отпускаем до запуска,
+    // а сбой отключения — отказ операции (ошибка показывается, исполнитель освобождается в finally).
+    await releaseAgentInfoBaseForBatch(services.workspaceFolder, services.outputChannel);
     const request = buildRepositoryDesignerRequest(connection, binding, options.operation, options.target.extensionName);
     // Секреты (пароли базы, хранилища и пользователя операции) маскируются ЗНАЧЕНИЯМИ —
     // это точнее правил по ключам и не зависит от формы записи.
@@ -152,7 +156,9 @@ export async function runRepositoryCliCommand(
     const message = error instanceof Error ? error.message : String(error);
     services.outputChannel.appendLine(`[repository][error] ${message}`);
     endRepositoryOperationStatus(options.progressTitle, 'ошибка');
-    await vscode.window.showErrorMessage(`${options.errorTitle}\n${message}`);
+    // Без await (запрет №18): раннер выполняется внутри секции общего замка, и открытая
+    // нотификация держала бы «операция уже выполняется» до её закрытия.
+    void vscode.window.showErrorMessage(`${options.errorTitle}\n${message}`);
     return false;
   } finally {
     // Не забранный staging (сбой/отмена) не должен пережить операцию.

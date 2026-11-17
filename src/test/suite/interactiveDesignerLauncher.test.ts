@@ -44,7 +44,11 @@ class FakeAgentSession implements DesignerAgentInfoBaseSession {
     return this.connected;
   }
 
-  disconnectInfoBase(): Promise<boolean> {
+  disconnectInfoBase(_hooks?: unknown, options?: { readonly force?: boolean }): Promise<boolean> {
+    // Как настоящая сессия: состояние проверяется внутри неё, без подключения и force — ничего.
+    if (!this.connected && options?.force !== true) {
+      return Promise.resolve(false);
+    }
     this.events.push('disconnect');
     this.connected = false;
     return Promise.resolve(true);
@@ -102,7 +106,25 @@ suite('InteractiveDesignerLauncher', () => {
     assert.strictEqual(agentSession.isInfoBaseConnected(), true);
   });
 
-  test('не трогает агентную сессию, если база уже отключена от агента', async () => {
+  test('сообщает об отключении базы только когда disconnect действительно выполнен', async () => {
+    const messages: string[] = [];
+    await launchInteractiveDesignerWithAgentPause({
+      agentSession: new FakeAgentSession(true, []),
+      launch: () => new FakeDesignerProcess(),
+      onMessage: (message) => messages.push(message),
+    });
+    assert.deepStrictEqual(messages, ['Информационная база отключена от агента конфигуратора.']);
+
+    messages.length = 0;
+    await launchInteractiveDesignerWithAgentPause({
+      agentSession: new FakeAgentSession(false, []),
+      launch: () => new FakeDesignerProcess(),
+      onMessage: (message) => messages.push(message),
+    });
+    assert.deepStrictEqual(messages, []);
+  });
+
+  test('без подключения агенту команд нет (решение за сессией)', async () => {
     const events: string[] = [];
     const agentSession = new FakeAgentSession(false, events);
 

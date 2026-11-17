@@ -22,9 +22,13 @@ export async function launchInteractiveDesignerWithAgentPause(
   const agentSession = options.agentSession;
   let shouldReconnect = false;
 
-  if (agentSession && (options.forceAgentDisconnect === true || agentSession.isInfoBaseConnected())) {
-    options.onMessage?.('Отключение информационной базы от агента конфигуратора.');
+  // Подключено ли — решает сессия в своей очереди (см. releaseInfoBase): внешняя проверка
+  // гонялась бы с поставленным в очередь переподключением.
+  if (agentSession) {
     shouldReconnect = await agentSession.disconnectInfoBase(options.hooks, { force: options.forceAgentDisconnect });
+    if (shouldReconnect) {
+      options.onMessage?.('Информационная база отключена от агента конфигуратора.');
+    }
   }
 
   let process: InteractiveDesignerProcess;

@@ -4,6 +4,7 @@ import { registerAiMcpCommands } from './ai/AiMcpCommands';
 import { registerConfigurationReportCommands } from './configuration/ConfigurationReportCommands';
 import { registerDbCommands } from './db/DbCommands';
 import { registerExternalObjectCommands } from './external/ExternalObjectCommands';
+import { registerReleaseInfoBaseCommand } from './ext/agent/ReleaseInfoBaseCommand';
 import { registerBorrowToExtensionCommand } from './ext/BorrowToExtensionCommand';
 import { registerCfFileCommands } from './ext/CfFileCommands';
 import { registerCfeBatchCommands } from './ext/CfeBatchCommands';
@@ -64,4 +65,5 @@ export function registerCommands(
   registerCfFileCommands(context, services);
   registerCfeBatchCommands(context, services);
   registerRepositoryCommands(context, services);
+  registerReleaseInfoBaseCommand(context, services);
 }

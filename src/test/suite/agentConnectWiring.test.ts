@@ -93,16 +93,16 @@ suite('Агент Э3: createAgentOperationServiceEntry пробрасывает
     return {
       host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
       visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5,
-      startupTimeoutMs: 21000, authWarmupMs: 45000,
+      startupTimeoutMs: 21000, authWarmupMs: 45000, idleDisconnectMinutes: 0,
       ...overrides,
     };
   }
 
-  // Шов: опции транспорта лежат в приватных полях innerFactory (менеджер сессий) -> options (фабрика).
-  // Публичного геттера нет; если developer его добавит — заменить доступ здесь, имена полей не менять молча.
+  // Н16: опции транспорта читаются через ПУБЛИЧНОЕ поле записи реестра `transportOptions`
+  // (контракт Э4: CachedAgentService.transportOptions — ровно тот объект, что получила фабрика транспорта),
+  // а не через приватные innerFactory.options менеджера сессий.
   function transportOptions(entry: ReturnType<typeof createAgentOperationServiceEntry>): Record<string, unknown> {
-    const manager = entry.sessions as unknown as { innerFactory: { options: Record<string, unknown> } };
-    return manager.innerFactory.options;
+    return entry.transportOptions as unknown as Record<string, unknown>;
   }
 
   const tmpRoot = os.tmpdir();
@@ -126,5 +126,50 @@ suite('Агент Э3: createAgentOperationServiceEntry пробрасывает
   test('процесс ещё не стартовал (getStartedAt() === undefined): agentStartedAt не задан', () => {
     const options = transportOptions(createAgentOperationServiceEntry(tmpRoot, settings(), new DesignerAgentProcess()));
     assert.strictEqual(options.agentStartedAt, undefined);
+  });
+});
+
+suite('Агент Э4: настройка idleDisconnectMinutes и проводка в запись реестра', () => {
+  async function setAgentConfig(key: string, value: unknown): Promise<void> {
+    await vscode.workspace.getConfiguration('v8vscedit.agent').update(key, value, vscode.ConfigurationTarget.Global);
+  }
+  teardown(() => setAgentConfig('idleDisconnectMinutes', undefined));
+
+  test('package.json: ключ объявлен, number, умолчание 0 (выкл.), minimum 0, описание на русском', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf-8')) as {
+      contributes: { configuration: { properties: Record<string, { type?: string; default?: unknown; minimum?: number; description?: string }> } };
+    };
+    const property = manifest.contributes.configuration.properties['v8vscedit.agent.idleDisconnectMinutes'];
+    assert.ok(property, 'нет v8vscedit.agent.idleDisconnectMinutes');
+    assert.strictEqual(property.type, 'number');
+    assert.strictEqual(property.default, 0);
+    assert.strictEqual(property.minimum, 0);
+    assert.match(property.description ?? '', /[А-Яа-яЁё]/);
+  });
+
+  test('readAgentCommandSettings: умолчание 0 и заданное значение', async () => {
+    assert.strictEqual(readAgentCommandSettings({}).idleDisconnectMinutes, 0);
+    await setAgentConfig('idleDisconnectMinutes', 7);
+    assert.strictEqual(readAgentCommandSettings({}).idleDisconnectMinutes, 7);
+  });
+
+  const baseSettings: AgentCommandSettings = {
+    host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
+    visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5,
+    startupTimeoutMs: 21000, authWarmupMs: 45000, idleDisconnectMinutes: 0,
+  };
+
+  for (const [minutes, expectedMs] of [[0, 0], [1, 60_000], [15, 900_000]] as const) {
+    test(`createAgentOperationServiceEntry: ${String(minutes)} мин → idleDisconnectMs = ${String(expectedMs)}`, () => {
+      const entry = createAgentOperationServiceEntry(os.tmpdir(), { ...baseSettings, idleDisconnectMinutes: minutes });
+      assert.strictEqual(entry.idleDisconnectMs, expectedMs);
+    });
+  }
+
+  test('createAgentOperationServiceEntry: transportOptions — те же опции, что получила фабрика (host/port/user)', () => {
+    const entry = createAgentOperationServiceEntry(os.tmpdir(), { ...baseSettings, host: 'h', port: 2000, user: 'adm' });
+    assert.strictEqual(entry.transportOptions.host, 'h');
+    assert.strictEqual(entry.transportOptions.port, 2000);
+    assert.strictEqual(entry.transportOptions.user, 'adm');
   });
 });

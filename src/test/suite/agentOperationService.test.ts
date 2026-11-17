@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   AgentOperationService,
+  AgentWorkspaceService,
   isInfoBaseAlreadyConnectedMessage,
   type DesignerAgentTransport,
   type DesignerAgentTransportFactory,
@@ -11,6 +12,7 @@ import {
   type AgentCommandResult,
 } from '../../infra/agent';
 import { buildHashSnapshot, buildScopeKey, saveHashCache } from '../../infra/cache/HashCache';
+import { FakeTimers, ScriptedFactory, agentError } from './support/agentInfoBaseFakes';
 
 class FakeTransport implements DesignerAgentTransport {
   readonly commands: string[] = [];
@@ -46,15 +48,6 @@ class FakeTransportFactory implements DesignerAgentTransportFactory {
   }
 }
 
-class ResettableFakeTransportFactory extends FakeTransportFactory {
-  resetCount = 0;
-
-  reset(): Promise<void> {
-    this.resetCount += 1;
-    return Promise.resolve();
-  }
-}
-
 suite('AgentOperationService', () => {
   test('распознаёт русское сообщение агента о уже установленном соединении с переносами строк', () => {
     assert.strictEqual(
@@ -63,7 +56,7 @@ suite('AgentOperationService', () => {
     );
   });
 
-  test('считает уже подключенную базу успешным connect-ib и выполняет команду операции', async () => {
+  test('считает уже подключенную базу успешным connect-ib и выполняет команду операции; соединение остаётся', async () => {
     const transport = new FakeTransport(new Error('Соединение с информационной базой уже\nустановлено'));
     const service = new AgentOperationService('/tmp/v8vscedit-test-project', new FakeTransportFactory(transport));
     const messages: string[] = [];
@@ -76,50 +69,135 @@ suite('AgentOperationService', () => {
       onMessage: (message) => messages.push(message),
     });
 
-    assert.strictEqual(service.isInfoBaseConnected(), false);
+    // Э4: после успешной операции базу не отпускаем — следующая операция не платит connect-ib.
+    assert.strictEqual(service.isInfoBaseConnected(), true);
     assert.strictEqual(transport.commands[0], 'common connect-ib');
     assert.match(transport.commands[1], /^config update-db-cfg/);
-    assert.strictEqual(transport.commands[2], 'common disconnect-ib');
+    assert.strictEqual(transport.commands.length, 2);
     assert.ok(messages.some((message) => message.startsWith('выполнено: config update-db-cfg')));
   });
 
-  test('после обновления БД заново подключается перед следующей частичной загрузкой', async () => {
-    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-agent-reconnect-'));
-    try {
-      const configRoot = path.join(tempRoot, 'src', 'cf');
-      const changedModule = path.join(configRoot, 'Catalogs', 'Товары', 'Ext', 'ObjectModule.bsl');
-      fs.mkdirSync(path.dirname(changedModule), { recursive: true });
+  suite('Э4: жизненный цикл подключения', () => {
+    let tempRoot: string;
+    let configRoot: string;
+    const target = () => ({ kind: 'cf' as const, name: 'Основная', rootPath: configRoot });
+
+    setup(() => {
+      tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-agent-lifecycle-'));
+      configRoot = path.join(tempRoot, 'src', 'cf');
+      fs.mkdirSync(path.join(configRoot, 'Catalogs'), { recursive: true });
       fs.writeFileSync(path.join(configRoot, 'Configuration.xml'), '<MetaDataObject/>', 'utf-8');
       fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<xml/>', 'utf-8');
-      fs.writeFileSync(changedModule, 'Процедура ДоИзменения() КонецПроцедуры', 'utf-8');
+    });
+    teardown(() => { fs.rmSync(tempRoot, { recursive: true, force: true }); });
 
-      const scopeKey = buildScopeKey('cf', configRoot);
-      saveHashCache(tempRoot, buildHashSnapshot(scopeKey, configRoot));
-
-      const transport = new FakeTransport();
-      const factory = new ResettableFakeTransportFactory(transport);
+    test('load → update → load → update: один connect-ib, ноль disconnect-ib, ноль сбросов SSH', async () => {
+      const factory = new ScriptedFactory();
       const service = new AgentOperationService(tempRoot, factory);
-      const target = { kind: 'cf' as const, name: 'Основная', rootPath: configRoot };
 
-      await service.updateDatabaseConfiguration(target);
-      assert.strictEqual(factory.resetCount, 1);
+      await service.loadFullAndUpdate(target());
+      await service.loadFullAndUpdate(target());
+
+      assert.strictEqual(factory.count('common connect-ib'), 1);
+      assert.strictEqual(factory.count('common disconnect-ib'), 0);
+      assert.strictEqual(factory.resetCount, 0);
+      assert.strictEqual(factory.log.filter((c) => c.startsWith('config load-config-from-files')).length, 2);
+      assert.strictEqual(factory.log.filter((c) => c.startsWith('config update-db-cfg')).length, 2);
+      assert.strictEqual(service.isInfoBaseConnected(), true);
+    });
+
+    test('цепочка обновление БД + частичная загрузка с обновлением: connect-ib один раз', async () => {
+      const changedModule = path.join(configRoot, 'Catalogs', 'Товары', 'Ext', 'ObjectModule.bsl');
+      fs.mkdirSync(path.dirname(changedModule), { recursive: true });
+      fs.writeFileSync(changedModule, 'Процедура ДоИзменения() КонецПроцедуры', 'utf-8');
+      saveHashCache(tempRoot, buildHashSnapshot(buildScopeKey('cf', configRoot), configRoot));
       fs.writeFileSync(changedModule, 'Процедура ПослеИзменения() КонецПроцедуры', 'utf-8');
-      await service.loadChangedAndUpdate(target);
-      assert.strictEqual(factory.resetCount, 2);
 
-      assert.strictEqual(
-        transport.commands.filter((command) => command === 'common connect-ib').length,
-        2
-      );
-      assert.strictEqual(
-        transport.commands.filter((command) => command === 'common disconnect-ib').length,
-        2
-      );
-      assert.match(transport.commands[4], /^config load-config-from-files/);
-      assert.match(transport.commands[5], /^config update-db-cfg/);
-    } finally {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
-    }
+      const factory = new ScriptedFactory();
+      const service = new AgentOperationService(tempRoot, factory);
+      await service.updateDatabaseConfiguration(target());
+      await service.loadChangedAndUpdate(target());
+
+      assert.strictEqual(factory.count('common connect-ib'), 1);
+      assert.strictEqual(factory.count('common disconnect-ib'), 0);
+      assert.strictEqual(factory.resetCount, 0);
+      assert.match(factory.log[2], /^config load-config-from-files/);
+      assert.match(factory.log[3], /^config update-db-cfg/);
+    });
+
+    test('ошибка операции → disconnect-ib и сброс SSH; следующая операция снова подключает ИБ', async () => {
+      let failUpdate = true;
+      const factory = new ScriptedFactory((command) => (
+        command.startsWith('config update-db-cfg') && failUpdate ? new Error('обновление упало') : undefined
+      ));
+      const service = new AgentOperationService(tempRoot, factory);
+
+      await assert.rejects(service.updateDatabaseConfiguration(target()), /обновление упало/);
+      assert.strictEqual(factory.count('common disconnect-ib'), 1);
+      assert.strictEqual(factory.resetCount, 1);
+      assert.strictEqual(service.isInfoBaseConnected(), false);
+
+      failUpdate = false;
+      await service.updateDatabaseConfiguration(target());
+      assert.strictEqual(factory.count('common connect-ib'), 2);
+    });
+
+    test('«уже подключено» и «не подключено» распознаются по машинному error-type', async () => {
+      const factory = new ScriptedFactory((command) => {
+        if (command === 'common connect-ib') { return agentError('DesignerAlreadyConnectedToInfoBase'); }
+        if (command === 'common disconnect-ib') { return agentError('DesignerNotConnectedToInfoBase'); }
+        return undefined;
+      });
+      const service = new AgentOperationService(tempRoot, factory);
+      await service.updateDatabaseConfiguration(target());
+      assert.strictEqual(service.isInfoBaseConnected(), true);
+      assert.strictEqual(await service.disconnectInfoBase(), true);
+      assert.strictEqual(service.isInfoBaseConnected(), false);
+    });
+
+    test('disconnectInfoBase(force) без кэша шлёт disconnect-ib; без force и без подключения — ничего', async () => {
+      const factory = new ScriptedFactory();
+      const service = new AgentOperationService(tempRoot, factory);
+      assert.strictEqual(await service.disconnectInfoBase(), false);
+      assert.deepStrictEqual(factory.log, []);
+      assert.strictEqual(await service.disconnectInfoBase(undefined, { force: true }), true);
+      assert.deepStrictEqual(factory.log, ['common disconnect-ib']);
+    });
+
+    test('reconnectInfoBase подключает ИБ', async () => {
+      const factory = new ScriptedFactory();
+      const service = new AgentOperationService(tempRoot, factory);
+      await service.reconnectInfoBase();
+      assert.deepStrictEqual(factory.log, ['common connect-ib']);
+      assert.strictEqual(service.isInfoBaseConnected(), true);
+    });
+
+    test('опции idle пробрасываются в сессию: таймер на idleDisconnectMs после операции, срабатывание отпускает базу', async () => {
+      const factory = new ScriptedFactory();
+      const timers = new FakeTimers();
+      const service = new AgentOperationService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
+      await service.updateDatabaseConfiguration(target());
+      assert.deepStrictEqual(timers.setCalls, [60_000]);
+      await timers.fireAll();
+      assert.strictEqual(factory.log.at(-1), 'common disconnect-ib');
+      assert.strictEqual(service.isInfoBaseConnected(), false);
+    });
+
+    test('по умолчанию (опции не заданы) база остаётся подключённой без таймеров', async () => {
+      const factory = new ScriptedFactory();
+      const service = new AgentOperationService(tempRoot, factory);
+      await service.updateDatabaseConfiguration(target());
+      assert.strictEqual(service.isInfoBaseConnected(), true);
+    });
+
+    test('dispose сервиса снимает idle-таймер', async () => {
+      const factory = new ScriptedFactory();
+      const timers = new FakeTimers();
+      const service = new AgentOperationService(tempRoot, factory, { idleDisconnectMs: 60_000, timers });
+      await service.updateDatabaseConfiguration(target());
+      await service.dispose();
+      assert.strictEqual(timers.pending.size, 0);
+    });
   });
 
   test('частичная загрузка зеркалит проект в воркспейс и обновляет изменённый файл', async () => {
@@ -256,4 +334,86 @@ suite('AgentOperationService', () => {
     }
   });
 
+});
+
+suite('AgentOperationService: Э4, все операции идут через сессию (cf/cfe, ветки полной загрузки)', () => {
+  let tempRoot: string;
+  let configRoot: string;
+  const cf = () => ({ kind: 'cf' as const, name: 'Основная', rootPath: configRoot });
+
+  setup(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-agent-ops-'));
+    configRoot = path.join(tempRoot, 'src', 'cf');
+    fs.mkdirSync(path.join(configRoot, 'Catalogs'), { recursive: true });
+    fs.writeFileSync(path.join(configRoot, 'Configuration.xml'), '<MetaDataObject/>', 'utf-8');
+    fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>Товары</Catalog>', 'utf-8');
+  });
+  teardown(() => { fs.rmSync(tempRoot, { recursive: true, force: true }); });
+
+  function saveCurrentHashes(): void {
+    saveHashCache(tempRoot, buildHashSnapshot(buildScopeKey('cf', configRoot), configRoot));
+  }
+
+  test('importFromDatabase: connect-ib и dump-config-to-files через сессию, база остаётся подключённой', async () => {
+    // Фейковый агент «выгружает базу» в каталог воркспейса — так, как это делает настоящий dump.
+    const workspaceDir = new AgentWorkspaceService(tempRoot).ensureWorkspace('cf', cf()).targetDir;
+    const factory = new ScriptedFactory((command) => {
+      if (command.startsWith('config dump-config-to-files')) {
+        fs.cpSync(configRoot, workspaceDir, { recursive: true });
+      }
+      return undefined;
+    });
+    const service = new AgentOperationService(tempRoot, factory);
+    const result = await service.importFromDatabase(cf());
+    assert.strictEqual(factory.log[0], 'common connect-ib');
+    assert.match(factory.log[1], /^config dump-config-to-files /);
+    assert.doesNotMatch(factory.log[1], /--extension/);
+    assert.ok(Array.isArray(result.changedProjectFiles));
+    assert.strictEqual(service.isInfoBaseConnected(), true);
+  });
+
+  test('cfe: имя расширения уходит в команды; без extensionName — имя цели', async () => {
+    const factory = new ScriptedFactory();
+    const service = new AgentOperationService(tempRoot, factory);
+    await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Расш1', rootPath: configRoot });
+    await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Узел', extensionName: 'Расш2', rootPath: configRoot });
+    await service.loadFullAndUpdate({ kind: 'cfe', name: 'Узел', extensionName: 'Расш3', rootPath: configRoot });
+    const updates = factory.log.filter((c) => c.startsWith('config update-db-cfg'));
+    assert.match(updates[0], /--extension=Расш1/);
+    assert.match(updates[1], /--extension=Расш2/);
+    assert.match(updates[2], /--extension=Расш3/);
+    assert.ok(factory.log.some((c) => c.startsWith('config load-config-from-files') && c.includes('--extension=Расш3')));
+    assert.strictEqual(factory.count('common connect-ib'), 1);
+  });
+
+  function messagesOf(run: (hooks: { onMessage: (m: string) => void }) => Promise<unknown>): Promise<string[]> {
+    const messages: string[] = [];
+    return run({ onMessage: (m) => messages.push(m) }).then(() => messages);
+  }
+
+  test('loadChangedAndUpdate без кэша хешей → полная загрузка', async () => {
+    const factory = new ScriptedFactory();
+    const service = new AgentOperationService(tempRoot, factory);
+    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    assert.ok(messages.includes('Кэш изменений не найден, выполняется полная загрузка.'));
+    assert.ok(factory.log.some((c) => c.startsWith('config load-config-from-files') && !c.includes('--partial')));
+  });
+
+  test('loadChangedAndUpdate после удаления файла → полная загрузка с сообщением об удалении', async () => {
+    saveCurrentHashes();
+    fs.rmSync(path.join(configRoot, 'Catalogs', 'Товары.xml'));
+    const factory = new ScriptedFactory();
+    const service = new AgentOperationService(tempRoot, factory);
+    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    assert.ok(messages.includes('Обнаружено удаление файлов, выполняется полная загрузка.'), messages.join('|'));
+  });
+
+  test('loadChangedAndUpdate после переименования объекта → полная загрузка с сообщением о переименовании', async () => {
+    saveCurrentHashes();
+    fs.renameSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), path.join(configRoot, 'Catalogs', 'Номенклатура.xml'));
+    const factory = new ScriptedFactory();
+    const service = new AgentOperationService(tempRoot, factory);
+    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    assert.ok(messages.includes('Обнаружено переименование объектов, выполняется полная загрузка.'), messages.join('|'));
+  });
 });

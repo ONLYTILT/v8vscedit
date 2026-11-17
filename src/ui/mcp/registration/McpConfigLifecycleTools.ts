@@ -14,6 +14,7 @@ import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport } from '../../../infra/cfFi
 import { buildCfApplyTarget } from '../../commands/ext/CfFileTarget';
 import { runApplyDatabaseConfiguration } from '../../commands/ext/ExtensionCommandRunner';
 import {
+  CONFIGURATION_OPERATION_BUSY_MESSAGE,
   endConfigurationOperation,
   tryBeginConfigurationOperation,
 } from '../../commands/ext/configurationOperationLock';
@@ -442,7 +443,7 @@ function assertBatchReport(report: CfeBatchReport | undefined, failureMessage: s
  */
 async function withConfigurationOperationLock<T>(action: () => Promise<T>): Promise<T> {
   if (!await tryBeginConfigurationOperation()) {
-    throw new Error('Операция с конфигурацией уже выполняется. Дождитесь её завершения.');
+    throw new Error(CONFIGURATION_OPERATION_BUSY_MESSAGE);
   }
   try {
     return await action();

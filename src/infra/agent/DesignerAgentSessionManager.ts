@@ -13,6 +13,18 @@ export class DesignerAgentSessionManager implements ResettableDesignerAgentTrans
   ) {}
 
   async create(sessionKey: string): Promise<DesignerAgentTransport> {
+    const cached = this.sessions.get(sessionKey);
+    if (cached) {
+      const transport = await cached;
+      if (!transport.isClosed?.()) {
+        return transport;
+      }
+      // Соединение потеряно между командами: новый транспорт обязан пройти `options set`
+      // (иначе ответы агента не JSON). Запись снимаем, только если её не заменил параллельный вызов.
+      if (this.sessions.get(sessionKey) === cached) {
+        this.sessions.delete(sessionKey);
+      }
+    }
     let session = this.sessions.get(sessionKey);
     if (!session) {
       session = this.createConfiguredSession(sessionKey).catch((error: unknown) => {

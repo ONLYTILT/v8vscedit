@@ -41,3 +41,22 @@ export async function endConfigurationOperation(): Promise<void> {
   operationRunning = false;
   await vscode.commands.executeCommand('setContext', BUSY_CONTEXT_KEY, false);
 }
+
+export const CONFIGURATION_OPERATION_BUSY_MESSAGE = 'Операция с конфигурацией уже выполняется. Дождитесь её завершения.';
+
+/**
+ * Выполняет `operation` под общим замком. При занятом замке — уведомление без `await`
+ * (запрет №18: ожидание закрытия нотификации не должно задерживать вызывающего) и `undefined`;
+ * чужой замок не снимается.
+ */
+export async function runWithConfigurationOperationLock<T>(operation: () => Promise<T>): Promise<T | undefined> {
+  if (!await tryBeginConfigurationOperation()) {
+    void vscode.window.showInformationMessage(CONFIGURATION_OPERATION_BUSY_MESSAGE);
+    return undefined;
+  }
+  try {
+    return await operation();
+  } finally {
+    await endConfigurationOperation();
+  }
+}

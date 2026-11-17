@@ -16,6 +16,8 @@ export interface AgentCommandSettings {
   readonly progressInterval: number;
   readonly startupTimeoutMs: number;
   readonly authWarmupMs: number;
+  /** Простой агента (минуты), после которого база отпускается сама; 0 — держать до явного release. */
+  readonly idleDisconnectMinutes: number;
 }
 
 export function isAgentConfigurationOperationMode(): boolean {
@@ -42,6 +44,7 @@ export function readAgentCommandSettings(connection: ConnectionParams): AgentCom
     progressInterval: config.get<number>('progressInterval', 0.5),
     startupTimeoutMs: config.get<number>('startupTimeoutMs', 15000),
     authWarmupMs: config.get<number>('authWarmupMs', 90000),
+    idleDisconnectMinutes: config.get<number>('idleDisconnectMinutes', 0),
   };
 }
 

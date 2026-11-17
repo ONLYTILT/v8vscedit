@@ -118,6 +118,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
       progressInterval: 0.5,
       startupTimeoutMs: 15000,
       authWarmupMs: 90000,
+      idleDisconnectMinutes: 0,
     });
   });
 

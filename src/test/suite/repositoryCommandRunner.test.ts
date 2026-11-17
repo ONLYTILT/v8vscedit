@@ -11,6 +11,9 @@ import type {
   DesignerBatchRequest,
   DesignerBatchResult,
 } from '../../infra/process/designer/DesignerBatchExecutor';
+import { disposeCachedAgentOperationServices } from '../../ui/commands/ext/agent/AgentServiceRegistry';
+import { agentError } from './support/agentInfoBaseFakes';
+import { seedCachedAgentService } from './support/agentRegistrySeed';
 import {
   disposeRepositoryCommandStatusBar,
   resolveRepositoryTarget,
@@ -462,6 +465,44 @@ suite('RepositoryCommandRunner', () => {
       for (const message of errors) {
         assert.ok(message.includes('Основная'), message);
       }
+    });
+  });
+
+  suite('Э4: база отпускается у агента перед пакетной операцией хранилища', () => {
+    teardown(() => disposeCachedAgentOperationServices());
+
+    test('подключённая база: disconnect-ib уходит ДО запуска исполнителя; connect-ib после не шлётся', async () => {
+      const events: string[] = [];
+      const seeded = await seedCachedAgentService(root, {
+        connected: true,
+        behavior: (command) => { events.push(`agent:${command}`); return undefined; },
+      });
+      // connect-ib подсева (connected: true) проходит через тот же behavior — это не часть сценария.
+      events.length = 0;
+      behavior = () => { events.push('run'); return ok(); };
+
+      assert.strictEqual(await runRepositoryCliCommand(runOptions(), services), true);
+
+      assert.deepStrictEqual(events, ['agent:common disconnect-ib', 'run']);
+      assert.strictEqual(seeded.factory.count('common connect-ib'), 0);
+    });
+
+    test('база не подключена: агенту команд нет, операция выполняется', async () => {
+      const seeded = await seedCachedAgentService(root, { connected: false });
+      assert.strictEqual(await runRepositoryCliCommand(runOptions(), services), true);
+      assert.deepStrictEqual(seeded.factory.log, []);
+      assert.strictEqual(requests.length, 1);
+    });
+
+    test('ошибка disconnect: пакетная операция НЕ запускается, ошибка показана, результат false, исполнитель освобождён', async () => {
+      await seedCachedAgentService(root, {
+        connected: true,
+        behavior: (command) => command === 'common disconnect-ib' ? agentError('UnknownError', 'агент не отвечает') : undefined,
+      });
+      assert.strictEqual(await runRepositoryCliCommand(runOptions(), services), false);
+      assert.strictEqual(requests.length, 0);
+      assert.ok(errors.some((m) => m.includes('агент не отвечает')), errors.join('|'));
+      assert.strictEqual(disposed, 1);
     });
   });
 
