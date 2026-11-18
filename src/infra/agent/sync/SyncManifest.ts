@@ -16,11 +16,20 @@ import { writeFileAtomic } from '../../fs/AtomicFileWriter';
 /** Состояние M: `empty` — зеркала нет (или ему нельзя верить), `stale` — БД новее M, `fresh` — M ≡ БД. */
 export type SyncMirrorState = 'empty' | 'stale' | 'fresh';
 
+/**
+ * Полнота M, ортогональная `SyncMirrorState`: `full` — в M все файлы выгрузки; `sparse` — часть
+ * (посев: файл версий, Configuration.xml и файлы владельцев, изменённых после посева). Каждый
+ * присутствующий в разреженном M файл равен БД, а отсутствующий не означает ничего.
+ */
+export type SyncMirrorCoverage = 'full' | 'sparse';
+
 export interface SyncManifest {
   readonly schemaVersion: 1;
   readonly scopeKey: string;
   readonly mirrorState: SyncMirrorState;
   readonly files: Readonly<Record<string, string>>;
+  /** Нет — `full`: манифесты до появления поля писались только при полном M. */
+  readonly mirrorCoverage?: SyncMirrorCoverage;
 }
 
 export interface SyncFilesDiff {
@@ -31,6 +40,11 @@ export interface SyncFilesDiff {
 
 const SCHEMA_VERSION = 1;
 const MIRROR_STATES: readonly SyncMirrorState[] = ['empty', 'stale', 'fresh'];
+const MIRROR_COVERAGES: readonly SyncMirrorCoverage[] = ['full', 'sparse'];
+
+export function mirrorCoverageOf(manifest: SyncManifest): SyncMirrorCoverage {
+  return manifest.mirrorCoverage ?? 'full';
+}
 
 /**
  * Каталог `.v8vscedit/agent-sync`, а не внутри `.v8vscedit/agent`: последний — `/AgentBaseDir`
@@ -116,12 +130,15 @@ function readStoredManifest(filePath: string, scopeKey: string): SyncManifest | 
   if (!isRecord(parsed)) {
     return undefined;
   }
-  const { schemaVersion, mirrorState, files } = parsed;
+  const { schemaVersion, mirrorState, files, mirrorCoverage } = parsed;
   if (
     schemaVersion !== SCHEMA_VERSION
     || parsed.scopeKey !== scopeKey
     || !MIRROR_STATES.includes(mirrorState as SyncMirrorState)
     || !isRecord(files)
+    // Неизвестная полнота опаснее отсутствующей: принять её за `full` значило бы удалять из P файлы
+    // по отсутствию в разреженном M.
+    || (mirrorCoverage !== undefined && !MIRROR_COVERAGES.includes(mirrorCoverage as SyncMirrorCoverage))
   ) {
     return undefined;
   }
@@ -130,6 +147,7 @@ function readStoredManifest(filePath: string, scopeKey: string): SyncManifest | 
     scopeKey,
     mirrorState: mirrorState as SyncMirrorState,
     files: files as Record<string, string>,
+    ...(mirrorCoverage === undefined ? {} : { mirrorCoverage: mirrorCoverage as SyncMirrorCoverage }),
   };
 }
 

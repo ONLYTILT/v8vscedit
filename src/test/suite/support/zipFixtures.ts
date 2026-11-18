@@ -53,6 +53,11 @@ export interface ZipFixtureOptions {
    * и обычная запись конца со счётчиком 0xFFFF.
    */
   readonly zip64?: boolean;
+  /**
+   * Комментарий архива (в записи конца каталога): до 65 535 байт. С максимальным комментарием запись
+   * конца zip64 оказывается ВНЕ окна хвоста, которое читает файловый источник (22 + 65 535 + 20).
+   */
+  readonly comment?: Buffer;
 }
 
 /** Посторонний extra (метка времени 0x5455): читатель обязан его пропускать. */
@@ -115,8 +120,11 @@ export function buildZip(entries: readonly ZipFixtureEntry[], options: ZipFixtur
     offset += local.length + nameBytes.length + localExtra.length + payload.length;
   }
   const centralDirectory = Buffer.concat(centralParts);
-  const end = Buffer.alloc(22);
+  const comment = options.comment ?? Buffer.alloc(0);
+  const end = Buffer.alloc(22 + comment.length);
   end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(comment.length, 20);
+  comment.copy(end, 22);
   end.writeUInt16LE(zip64 ? 0xffff : entries.length, 8);
   end.writeUInt16LE(zip64 ? 0xffff : entries.length, 10);
   end.writeUInt32LE(zip64 ? 0xffffffff : centralDirectory.length, 12);
@@ -163,12 +171,31 @@ export function readZip(zip: Uint8Array): ReadZipEntry[] {
     const flags = buffer.readUInt16LE(cursor + 8);
     const method = buffer.readUInt16LE(cursor + 10);
     const crc = buffer.readUInt32LE(cursor + 16);
-    const compressedSize = buffer.readUInt32LE(cursor + 20);
+    let compressedSize = buffer.readUInt32LE(cursor + 20);
     const nameLength = buffer.readUInt16LE(cursor + 28);
     const extraLength = buffer.readUInt16LE(cursor + 30);
     const commentLength = buffer.readUInt16LE(cursor + 32);
-    const localOffset = buffer.readUInt32LE(cursor + 42);
+    let localOffset = buffer.readUInt32LE(cursor + 42);
     const nameBytes = buffer.subarray(cursor + 46, cursor + 46 + nameLength);
+    // zip64 «по максимуму» (buildZip({ zip64: true })): настоящие размеры и смещение — в extra 0x0001
+    // (порядок: размер, сжатый размер, смещение — только поля с маркером 0xFFFFFFFF).
+    const extra = buffer.subarray(cursor + 46 + nameLength, cursor + 46 + nameLength + extraLength);
+    for (let at = 0; at + 4 <= extra.length; at += 4 + extra.readUInt16LE(at + 2)) {
+      if (extra.readUInt16LE(at) !== 0x0001) {
+        continue;
+      }
+      let field = at + 4;
+      if (buffer.readUInt32LE(cursor + 24) === 0xffffffff) {
+        field += 8;
+      }
+      if (compressedSize === 0xffffffff) {
+        compressedSize = Number(extra.readBigUInt64LE(field));
+        field += 8;
+      }
+      if (localOffset === 0xffffffff) {
+        localOffset = Number(extra.readBigUInt64LE(field));
+      }
+    }
     const localNameLength = buffer.readUInt16LE(localOffset + 26);
     const localExtraLength = buffer.readUInt16LE(localOffset + 28);
     const dataStart = localOffset + 30 + localNameLength + localExtraLength;

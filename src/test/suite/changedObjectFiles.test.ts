@@ -270,6 +270,14 @@ suite('ChangedObjectFiles: collectOwnerFiles (Э7)', () => {
     }) as unknown as AgentFileStore;
     assert.deepStrictEqual(await collectOwnerFiles(exploding, TARGET, []), { files: [], missingOwners: [] });
   });
+
+  test('каталог цели — сам корень хранилища (пустой targetRel): пути без префикса, от корня', async () => {
+    const rootStore = new LocalAgentFileStore(path.join(tempRoot, ...TARGET.split('/')));
+    const { owners } = resolveChangedOwners([line('modified', 'Role.Админ'), line('modified', 'Catalog.Нет')]);
+    const result = await collectOwnerFiles(rootStore, '', owners);
+    assert.deepStrictEqual([...result.files].sort(), ['Roles/Админ.xml', 'Roles/Админ/Ext/Rights.xml']);
+    assert.deepStrictEqual(result.missingOwners.map((owner) => owner.fullName), ['Catalog.Нет']);
+  });
 });
 
 suite('ChangedObjectFiles: на реальном корпусе example/2.20 (только чтение)', () => {

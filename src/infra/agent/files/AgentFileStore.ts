@@ -1,3 +1,5 @@
+import type { AgentTransferCancellation } from './AgentFileTransfer';
+
 /**
  * Файлы персонального корня пользователя агента конфигуратора.
  *
@@ -12,6 +14,14 @@ export interface AgentFileEntry {
   readonly type: 'file' | 'dir';
   /** Размер в байтах; у каталога — 0. */
   readonly size: number;
+}
+
+/** Параметры потоковой передачи файла: память — O(порция), а не O(файл). */
+export interface AgentStreamOptions {
+  /** Проверяется перед каждой порцией; отмена — `AgentTransferCancelledError`. */
+  readonly cancellation?: AgentTransferCancellation;
+  /** Байт передано / всего (`total` — `undefined`, если сервер не сообщил размер). */
+  readonly onProgress?: (done: number, total: number | undefined) => void;
 }
 
 /**
@@ -32,6 +42,14 @@ export interface AgentFileStore {
   readFile(rel: string): Promise<Buffer>;
   /** Создаёт промежуточные каталоги; подменяет цель целиком (temp+rename на стороне хранилища). */
   writeFile(rel: string, data: Uint8Array | string): Promise<void>;
+  /**
+   * Файл хранилища → НОВЫЙ локальный файл потоком. `localPath` не должен существовать (открытие `wx`):
+   * чужой файл не затирается. При любом отказе или отмене созданный локальный файл удаляется —
+   * неполный архив не должен остаться похожим на готовый.
+   */
+  downloadToFile(rel: string, localPath: string, options?: AgentStreamOptions): Promise<void>;
+  /** Локальный файл → хранилище потоком; подмена цели — как у `writeFile` (при отмене цель прежняя). */
+  uploadFromFile(localPath: string, rel: string, options?: AgentStreamOptions): Promise<void>;
   /**
    * Удаляет файл или каталог; отсутствующий путь — не ошибка. Непустой каталог без
    * `recursive` — отказ (SFTP агента удаляет непустой каталог по `rmdir` рекурсивно,

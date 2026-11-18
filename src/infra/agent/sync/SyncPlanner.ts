@@ -1,6 +1,6 @@
 import type { DumpChangeSet } from '../../../domain/agent/DumpChangesParser';
 import { detectPotentialRename } from '../ConfigLoadFileCollector';
-import { diffSyncFiles, type SyncMirrorState } from './SyncManifest';
+import { diffSyncFiles, type SyncMirrorCoverage, type SyncMirrorState } from './SyncManifest';
 
 /**
  * Чистый планировщик синхронизации цели с агентом (таблицы плана §1.1). Решает только «что делать»
@@ -23,14 +23,34 @@ export interface ImportPlanInput {
   readonly unresolvedObjects: readonly string[];
   /** D — локальные правки P относительно B, которые импорт обязан перетереть. */
   readonly dirtyFiles: readonly string[];
+  /** Полнота M: в разреженном M отсутствие файла ничего не означает. */
+  readonly mirrorCoverage: SyncMirrorCoverage;
+  /** Часть D, которой нет в B (добавлено локально): единственное, что разреженный M позволяет удалять. */
+  readonly dirtyAddedFiles: readonly string[];
+  /** D.modified ∪ D.deleted, отсутствующие в разреженном M: восстановить их дельтой нечем. */
+  readonly unrestorableDirtyFiles: readonly string[];
   readonly archiveThresholdFiles: number;
 }
 
-export type ImportArchiveReason = 'mirror-empty' | 'full-dump' | 'unrecognized' | 'unresolved-objects' | 'over-threshold';
+export type ImportArchiveReason =
+  | 'mirror-empty'
+  | 'full-dump'
+  | 'unrecognized'
+  | 'unresolved-objects'
+  | 'over-threshold'
+  | 'sparse-mirror-dirty';
 
 export type RemoteImportPlan =
   | { readonly action: 'archive'; readonly reason: ImportArchiveReason }
-  | { readonly action: 'delta'; readonly files: string[] };
+  | {
+    readonly action: 'delta';
+    readonly files: string[];
+    /**
+     * Файлы, которые при отсутствии в M после `--update` удаляются из P. У полного M — все `files`;
+     * у разреженного — только добавленные локально: их нет в B, и раз нет в M — нет и в БД.
+     */
+    readonly deletableIfAbsent: string[];
+  };
 
 export type ImportPlan = { readonly action: 'compare' } | RemoteImportPlan;
 
@@ -61,7 +81,14 @@ export function planRemoteImport(input: Omit<ImportPlanInput, 'storeKind'>): Rem
   if (files.length > input.archiveThresholdFiles) {
     return { action: 'archive', reason: 'over-threshold' };
   }
-  return { action: 'delta', files };
+  if (input.unrestorableDirtyFiles.length > 0) {
+    return { action: 'archive', reason: 'sparse-mirror-dirty' };
+  }
+  if (input.mirrorCoverage === 'full') {
+    return { action: 'delta', files, deletableIfAbsent: files };
+  }
+  const added = new Set(input.dirtyAddedFiles);
+  return { action: 'delta', files, deletableIfAbsent: files.filter((file) => added.has(file)) };
 }
 
 export interface LoadPlanInput {

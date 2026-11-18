@@ -23,6 +23,8 @@ export interface SftpLogEntry {
   readonly path?: string;
   /** Для RENAME — новое имя. */
   readonly target?: string;
+  /** Для READ — запрошенная длина, для WRITE — длина записываемой порции (проверка размера порции). */
+  readonly length?: number;
 }
 
 export type SftpFailureCode = 'PERMISSION_DENIED' | 'FAILURE' | 'NO_SUCH_FILE';
@@ -55,6 +57,8 @@ const S_IFLNK = 0o120000;
 interface OpenHandle {
   readonly kind: 'file' | 'dir';
   readonly fd?: number;
+  /** Путь открытого файла: READ/WRITE попадают в журнал с ним, и отказы можно целить по имени файла. */
+  readonly path?: string;
   readonly entries?: FileEntry[];
   served?: boolean;
   offset?: number;
@@ -82,7 +86,14 @@ export class SftpTestBackend {
   readResponseLimit: number | undefined;
   /** FSTAT отвечает без размера (флаг SIZE не выставлен — SFTP v3 это допускает). */
   fstatWithoutSize = false;
+  /**
+   * Наибольшее число одновременно «в полёте» READ/WRITE (получены и ещё не обработаны: в обычном режиме
+   * обработка мгновенна, поэтому накопление видно только под `hold`). Проверка окна конвейера:
+   * в полёте не больше `IO_WINDOW` порций.
+   */
+  readonly maxConcurrent: Record<'READ' | 'WRITE', number> = { READ: 0, WRITE: 0 };
 
+  private readonly inFlight: Record<'READ' | 'WRITE', number> = { READ: 0, WRITE: 0 };
   private readonly failures: FailureState[] = [];
   private readonly dropRules: { op: SftpOp; pathIncludes?: string; drop: () => void }[] = [];
   private gateOp: SftpOp | undefined;
@@ -172,12 +183,21 @@ export class SftpTestBackend {
         drop();
         return;
       }
+      const counted = entry.op === 'READ' || entry.op === 'WRITE' ? entry.op : undefined;
+      if (counted) {
+        this.inFlight[counted] += 1;
+        this.maxConcurrent[counted] = Math.max(this.maxConcurrent[counted], this.inFlight[counted]);
+      }
       const execute = (): void => {
         try {
           run();
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
           status(reqId, code === 'ENOENT' || code === 'ENOTDIR' ? STATUS_CODE.NO_SUCH_FILE : STATUS_CODE.FAILURE);
+        } finally {
+          if (counted) {
+            this.inFlight[counted] -= 1;
+          }
         }
       };
       if (this.gateOp === entry.op) {
@@ -194,12 +214,12 @@ export class SftpTestBackend {
         const mode = utils.sftp.flagsToString(flags) ?? 'r';
         const fd = fs.openSync(this.toAbs(rel), mode);
         this.openFds.add(fd);
-        sftp.handle(reqId, newHandle({ kind: 'file', fd }));
+        sftp.handle(reqId, newHandle({ kind: 'file', fd, path: rel }));
       });
     });
 
     sftp.on('READ', (reqId, h, offset, length) => {
-      handle(reqId, { op: 'READ' }, () => {
+      handle(reqId, { op: 'READ', path: lookup(h)?.path, length }, () => {
         const open = lookup(h);
         if (open?.fd === undefined) {
           status(reqId, STATUS_CODE.FAILURE);
@@ -217,7 +237,7 @@ export class SftpTestBackend {
     });
 
     sftp.on('WRITE', (reqId, h, offset, data) => {
-      handle(reqId, { op: 'WRITE' }, () => {
+      handle(reqId, { op: 'WRITE', path: lookup(h)?.path, length: data.length }, () => {
         const open = lookup(h);
         if (open?.fd === undefined) {
           status(reqId, STATUS_CODE.FAILURE);

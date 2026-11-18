@@ -31,6 +31,10 @@ function importInput(overrides: Partial<ImportPlanInput> = {}): ImportPlanInput 
     changedFiles: ['Catalogs/А.xml'],
     unresolvedObjects: [],
     dirtyFiles: [],
+    // Новые поля плана разреженного зеркала: по умолчанию M полный, как до их появления.
+    mirrorCoverage: 'full',
+    dirtyAddedFiles: [],
+    unrestorableDirtyFiles: [],
     archiveThresholdFiles: 300,
     ...overrides,
   };
@@ -98,7 +102,7 @@ suite('SyncPlanner.planImport (Э7)', () => {
       test(`M ${mirrorState} × objects → дельта по C ∪ D`, () => {
         assert.deepStrictEqual(
           planImport(importInput({ mirrorState, changedFiles: ['Catalogs/А.xml'], dirtyFiles: [] })),
-          { action: 'delta', files: ['Catalogs/А.xml'] }
+          { action: 'delta', files: ['Catalogs/А.xml'], deletableIfAbsent: ['Catalogs/А.xml'] }
         );
       });
     }
@@ -113,7 +117,7 @@ suite('SyncPlanner.planImport (Э7)', () => {
     test('пустой список изменений и чистый P → дельта без файлов (ничего не качаем)', () => {
       assert.deepStrictEqual(
         planImport(importInput({ changeSet: { kind: 'objects', objects: [] }, changedFiles: [], dirtyFiles: [] })),
-        { action: 'delta', files: [] }
+        { action: 'delta', files: [], deletableIfAbsent: [] }
       );
     });
 
@@ -123,14 +127,14 @@ suite('SyncPlanner.planImport (Э7)', () => {
           changedFiles: ['Catalogs/Б.xml', 'Catalogs/А.xml'],
           dirtyFiles: ['Roles/Я.xml', 'Catalogs/А.xml'],
         })),
-        { action: 'delta', files: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'].sort() }
+        { action: 'delta', files: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'].sort(), deletableIfAbsent: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'].sort() }
       );
     });
 
     test('чистый P, но список изменений пуст, при непустом D — дельта из одних локальных правок (перетереть)', () => {
       assert.deepStrictEqual(
         planImport(importInput({ changeSet: { kind: 'objects', objects: [] }, changedFiles: [], dirtyFiles: ['x.bsl'] })),
-        { action: 'delta', files: ['x.bsl'] }
+        { action: 'delta', files: ['x.bsl'], deletableIfAbsent: ['x.bsl'] }
       );
     });
   });
@@ -161,7 +165,7 @@ suite('SyncPlanner.planImport (Э7)', () => {
       assert.strictEqual(planImport(importInput({ changedFiles: files(1), archiveThresholdFiles: 0 })).action, 'archive');
       assert.deepStrictEqual(
         planImport(importInput({ changedFiles: [], archiveThresholdFiles: 0, changeSet: { kind: 'objects', objects: [] } })),
-        { action: 'delta', files: [] }
+        { action: 'delta', files: [], deletableIfAbsent: [] }
       );
     });
   });
@@ -408,5 +412,155 @@ suite('SyncPlanner.planLoad (Э7)', () => {
       }));
       assert.strictEqual(plan.action, 'partial');
     });
+  });
+});
+
+/**
+ * Полнота зеркала M (`mirrorCoverage`): `full` — в M все файлы выгрузки, `sparse` — только часть (посев из
+ * архива/проекта: файл версий, Configuration.xml и файлы изменённых после посева владельцев). Присутствующий
+ * в разреженном M файл равен БД, ОТСУТСТВУЮЩИЙ НИЧЕГО НЕ ОЗНАЧАЕТ: удалять из P по отсутствию в M можно только
+ * файлы, добавленные локально (D.added — их нет и в базовой линии B, и в БД). Правки (D.modified/D.deleted)
+ * файлов неизменённых владельцев в разреженном M не восстановить — только архив `sparse-mirror-dirty`.
+ */
+suite('SyncPlanner.planImport: полнота зеркала M (mirrorCoverage)', () => {
+  const COVERAGES = ['full', 'sparse'] as const;
+
+  suite('full: прежние правила, любое отсутствие в M допускает удаление', () => {
+    test('deletableIfAbsent совпадает с files (C ∪ D, отсортировано), dirtyAddedFiles на него не влияют', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({
+          mirrorCoverage: 'full',
+          changedFiles: ['Catalogs/Б.xml', 'Catalogs/А.xml'],
+          dirtyFiles: ['Roles/Я.xml'],
+          dirtyAddedFiles: ['Roles/Я.xml'],
+        })),
+        {
+          action: 'delta',
+          files: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'],
+          deletableIfAbsent: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'],
+        }
+      );
+    });
+
+    test('полный M, пустой список изменений, локальные правки → дельта по D, всё удаляемо', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({ mirrorCoverage: 'full', changeSet: { kind: 'objects', objects: [] }, changedFiles: [], dirtyFiles: ['x.bsl'] })),
+        { action: 'delta', files: ['x.bsl'], deletableIfAbsent: ['x.bsl'] }
+      );
+    });
+  });
+
+  suite('sparse: удаление только для файлов, добавленных локально', () => {
+    test('deletableIfAbsent = files ∩ dirtyAddedFiles', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({
+          mirrorCoverage: 'sparse',
+          changedFiles: ['Catalogs/А.xml', 'Catalogs/Б.xml'],
+          dirtyFiles: ['Catalogs/Б.xml', 'Roles/Я.xml'],
+          dirtyAddedFiles: ['Roles/Я.xml'],
+        })),
+        {
+          action: 'delta',
+          files: ['Catalogs/А.xml', 'Catalogs/Б.xml', 'Roles/Я.xml'],
+          deletableIfAbsent: ['Roles/Я.xml'],
+        }
+      );
+    });
+
+    test('файл C, который одновременно D.added, удаляем; файл D.added вне files в deletableIfAbsent не попадает', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({
+          mirrorCoverage: 'sparse',
+          changedFiles: ['Catalogs/Z.xml'],
+          dirtyFiles: [],
+          dirtyAddedFiles: ['Catalogs/Z.xml', 'Q.xml'],
+        })),
+        { action: 'delta', files: ['Catalogs/Z.xml'], deletableIfAbsent: ['Catalogs/Z.xml'] }
+      );
+    });
+
+    test('нет локально добавленных файлов → ничего не удаляемо', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({ mirrorCoverage: 'sparse', changedFiles: ['Catalogs/А.xml'], dirtyAddedFiles: [] })),
+        { action: 'delta', files: ['Catalogs/А.xml'], deletableIfAbsent: [] }
+      );
+    });
+
+    test('пустой список изменений и чистый P → дельта без файлов', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({ mirrorCoverage: 'sparse', changeSet: { kind: 'objects', objects: [] }, changedFiles: [] })),
+        { action: 'delta', files: [], deletableIfAbsent: [] }
+      );
+    });
+
+    test('unrestorableDirtyFiles непуст → архив sparse-mirror-dirty (правку неизменённого владельца из разреженного M не восстановить)', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({ mirrorCoverage: 'sparse', dirtyFiles: ['Catalogs/Клиенты.xml'], unrestorableDirtyFiles: ['Catalogs/Клиенты.xml'] })),
+        { action: 'archive', reason: 'sparse-mirror-dirty' }
+      );
+    });
+
+    test('unrestorable при пустом списке изменений тоже ведёт в архив', () => {
+      assert.deepStrictEqual(
+        planImport(importInput({
+          mirrorCoverage: 'sparse',
+          changeSet: { kind: 'objects', objects: [] },
+          changedFiles: [],
+          dirtyFiles: ['x.bsl'],
+          unrestorableDirtyFiles: ['x.bsl'],
+        })),
+        { action: 'archive', reason: 'sparse-mirror-dirty' }
+      );
+    });
+  });
+
+  suite('приоритет: пустой M, fullDump, unrecognized, unresolved и порог важнее unrestorable (при любой полноте)', () => {
+    for (const mirrorCoverage of COVERAGES) {
+      const unrestorable = { dirtyFiles: ['x.bsl'], unrestorableDirtyFiles: ['x.bsl'] };
+
+      test(`[${mirrorCoverage}] M empty → mirror-empty`, () => {
+        assert.deepStrictEqual(
+          planImport(importInput({ mirrorCoverage, mirrorState: 'empty', changeSet: undefined, changedFiles: [], ...unrestorable })),
+          { action: 'archive', reason: 'mirror-empty' }
+        );
+      });
+
+      test(`[${mirrorCoverage}] fullDump → full-dump`, () => {
+        assert.deepStrictEqual(
+          planImport(importInput({ mirrorCoverage, changeSet: { kind: 'fullDump' }, changedFiles: [], ...unrestorable })),
+          { action: 'archive', reason: 'full-dump' }
+        );
+      });
+
+      test(`[${mirrorCoverage}] unrecognized → unrecognized`, () => {
+        assert.deepStrictEqual(
+          planImport(importInput({ mirrorCoverage, changeSet: { kind: 'unrecognized', reason: 'x' }, changedFiles: [], ...unrestorable })),
+          { action: 'archive', reason: 'unrecognized' }
+        );
+      });
+
+      test(`[${mirrorCoverage}] unresolved → unresolved-objects`, () => {
+        assert.deepStrictEqual(
+          planImport(importInput({ mirrorCoverage, unresolvedObjects: ['Foo.Bar'], ...unrestorable })),
+          { action: 'archive', reason: 'unresolved-objects' }
+        );
+      });
+
+      test(`[${mirrorCoverage}] |C ∪ D| больше порога → over-threshold`, () => {
+        assert.deepStrictEqual(
+          planImport(importInput({ mirrorCoverage, changedFiles: ['a', 'b', 'c'], archiveThresholdFiles: 1, ...unrestorable })),
+          { action: 'archive', reason: 'over-threshold' }
+        );
+      });
+    }
+  });
+
+  test('локальное хранилище: compare при любой полноте (полное сравнение M и P, зеркало там всегда полное)', () => {
+    for (const mirrorCoverage of COVERAGES) {
+      assert.deepStrictEqual(
+        planImport(importInput({ storeKind: 'local', mirrorCoverage, unrestorableDirtyFiles: ['x'], dirtyFiles: ['x'] })),
+        { action: 'compare' }
+      );
+    }
   });
 });

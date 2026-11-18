@@ -1,10 +1,20 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { parseAgentBaseDirIndex, resolveAgentUserDir } from '../../../domain/agent/AgentBaseDirIndex';
-import { writeFileAtomic } from '../../fs/AtomicFileWriter';
-import { toAgentPathSegments, type AgentFileEntry, type AgentFileStore } from './AgentFileStore';
+import { writeFileAtomic, writeFileAtomicWith } from '../../fs/AtomicFileWriter';
+import { writeFully } from '../../fs/FileHandleWrite';
+import { toAgentPathSegments, type AgentFileEntry, type AgentFileStore, type AgentStreamOptions } from './AgentFileStore';
+import { AgentTransferCancelledError, throwIfTransferCancellationRequested } from './AgentFileTransfer';
 
 const INDEX_FILE_NAME = 'agentbasedir.json';
+/** Порция локального копирования: память — O(порция), отмена и прогресс — между порциями. */
+const COPY_CHUNK = 256 * 1024;
+
+// вызывается, только если откажет уборка после уже случившегося отказа
+// (close/unlink своего же файла); такой отказ детерминированно не воспроизвести.
+/* c8 ignore start */
+const noop = (): void => undefined;
+/* c8 ignore stop */
 
 interface ResolvedPath {
   readonly rel: string;
@@ -56,6 +66,64 @@ export class LocalAgentFileStore implements AgentFileStore {
     const target = await this.resolveChecked(rel);
     await fs.promises.mkdir(path.dirname(target.abs), { recursive: true });
     writeFileAtomic(target.abs, data);
+  }
+
+  async downloadToFile(rel: string, localPath: string, options: AgentStreamOptions = {}): Promise<void> {
+    const target = await this.resolveChecked(rel);
+    throwIfTransferCancellationRequested(options.cancellation);
+    let source: fs.promises.FileHandle | undefined;
+    let local: fs.promises.FileHandle | undefined;
+    let created = false;
+    try {
+      source = await fs.promises.open(target.abs, 'r');
+      const stats = await source.stat();
+      if (!stats.isFile()) {
+        throw new Error('по этому пути находится не файл');
+      }
+      local = await fs.promises.open(localPath, 'wx');
+      created = true;
+      await copyChunks(source, local, stats.size, options);
+      const finished = local;
+      local = undefined;
+      await finished.close();
+    } catch (error) {
+      await local?.close().catch(noop);
+      if (created) {
+        // Неполный файл не должен остаться похожим на скачанный архив.
+        await fs.promises.unlink(localPath).catch(noop);
+      }
+      throw error instanceof AgentTransferCancelledError ? error : wrapError('скачать файл', target.rel, error);
+    } finally {
+      await source?.close().catch(noop);
+    }
+  }
+
+  async uploadFromFile(localPath: string, rel: string, options: AgentStreamOptions = {}): Promise<void> {
+    const target = await this.resolveChecked(rel);
+    throwIfTransferCancellationRequested(options.cancellation);
+    let source: fs.promises.FileHandle;
+    try {
+      source = await fs.promises.open(localPath, 'r');
+    } catch (error) {
+      throw new Error(`Не удалось открыть локальный файл "${localPath}" для передачи агенту: ${(error as Error).message}`, { cause: error });
+    }
+    try {
+      const { size } = await source.stat();
+      await fs.promises.mkdir(path.dirname(target.abs), { recursive: true });
+      // Та же подмена temp+rename, что у writeFile: отмена посреди копирования цель не портит.
+      await writeFileAtomicWith(target.abs, async (tempPath) => {
+        const temp = await fs.promises.open(tempPath, 'wx');
+        try {
+          await copyChunks(source, temp, size, options);
+        } finally {
+          await temp.close();
+        }
+      });
+    } catch (error) {
+      throw error instanceof AgentTransferCancelledError ? error : wrapError('записать файл', target.rel, error);
+    } finally {
+      await source.close();
+    }
   }
 
   async remove(rel: string, options?: { readonly recursive?: boolean }): Promise<void> {
@@ -217,6 +285,31 @@ async function removeTree(dir: string): Promise<void> {
     }
   }
   await fs.promises.rmdir(dir);
+}
+
+/** Копирует `size` байт порциями; отмена проверяется перед каждой порцией. */
+async function copyChunks(
+  source: fs.promises.FileHandle,
+  target: fs.promises.FileHandle,
+  size: number,
+  options: AgentStreamOptions
+): Promise<void> {
+  const buffer = Buffer.alloc(Math.min(COPY_CHUNK, Math.max(size, 1)));
+  let position = 0;
+  while (position < size) {
+    throwIfTransferCancellationRequested(options.cancellation);
+    const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, size - position), position);
+    // укоротить файл между stat и чтением детерминированно в тесте нечем; без
+    // границы недочитанный хвост молча остался бы нулями.
+    /* c8 ignore start */
+    if (bytesRead === 0) {
+      throw new Error('файл изменился во время чтения (EOF раньше размера)');
+    }
+    /* c8 ignore stop */
+    await writeFully(target, buffer, bytesRead, position);
+    position += bytesRead;
+    options.onProgress?.(position, size);
+  }
 }
 
 function toEntry(rel: string, stats: fs.Stats): AgentFileEntry {

@@ -68,9 +68,21 @@ export function parseAgentCommandLine(raw: string): ParsedAgentCommand {
 
 interface EmulatedObject {
   files: Map<string, Buffer>;
+  /** Версия владельца в ConfigDumpInfo.xml = наибольшая из версий его файлов. */
   version: number;
+  /** Версия КАЖДОГО файла: настоящий агент при `--update` пишет только файлы, изменившиеся после известной версии. */
+  fileVersions: Map<string, number>;
   parts: string[];
 }
+
+/**
+ * Гранулярность `dump --update`: `owner` — переписывается ВЕСЬ владелец с изменившейся версией (прежнее
+ * поведение эмулятора); `changed-files` — только файлы владельца с версией новее известной по
+ * ConfigDumpInfo.xml каталога (поведение настоящего агента, пилот §5b п.9: «только файлы с версиями,
+ * отличающимися от версий в ConfigDumpInfo.xml»). Второй режим нужен проверке разреженного M: файлы
+ * неизменённых частей владельца в такой M не попадают.
+ */
+export type EmulatorUpdateGranularity = 'owner' | 'changed-files';
 
 export interface EmulatedLoad {
   readonly mode: 'dir' | 'partial' | 'archive';
@@ -88,6 +100,9 @@ export class AgentConfigEmulator {
   nextChangesText: string | undefined;
   /** Искажает байты архива, который агент собирается отдать (однократно). */
   nextArchiveTamper: ((zip: Buffer) => Buffer) | undefined;
+  updateGranularity: EmulatorUpdateGranularity = 'owner';
+  /** Версия формата в заголовке ConfigDumpInfo.xml и `MetaDataObject version` Configuration.xml. */
+  formatVersion = '2.20';
   /** Если возвращает Error — команда падает с ним. */
   failWhen: ((command: ParsedAgentCommand) => Error | undefined) | undefined;
 
@@ -101,11 +116,39 @@ export class AgentConfigEmulator {
   /** Добавляет или целиком заменяет владельца верхнего уровня (его файлы и версию). */
   setObject(fullName: string, files: Record<string, string | Buffer>, parts: string[] = []): void {
     this.versionCounter += 1;
+    const version = this.versionCounter;
+    const entries = Object.entries(files);
     this.objects.set(fullName, {
-      files: new Map(Object.entries(files).map(([rel, data]) => [rel, Buffer.from(data)])),
-      version: this.versionCounter,
+      files: new Map(entries.map(([rel, data]) => [rel, Buffer.from(data)])),
+      version,
+      fileVersions: new Map(entries.map(([rel]) => [rel, version])),
       parts,
     });
+  }
+
+  /**
+   * Реалистичный `Configuration.xml` (Name, для cfe — `ConfigurationExtensionPurpose`, версия формата в
+   * `MetaDataObject`): по нему `ConfigXmlReader` и проверки посева узнают вид и имя. Заменяет только этот
+   * файл владельца-конфигурации, остальное (Ext/…) сохраняется.
+   */
+  setConfiguration(name: string, kind: 'cf' | 'cfe'): void {
+    const purpose = kind === 'cfe' ? '<ConfigurationExtensionPurpose>Patch</ConfigurationExtensionPurpose>' : '';
+    this.putFile('Configuration.xml', [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      `<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="${this.formatVersion}">`,
+      '<Configuration uuid="00000000-0000-0000-0000-000000000001">',
+      '<Properties>',
+      `<Name>${name}</Name>${purpose}`,
+      '</Properties>',
+      '</Configuration>',
+      '</MetaDataObject>',
+      '',
+    ].join('\n'));
+  }
+
+  /** Полная выгрузка базы (с ConfigDumpInfo.xml) в каталог проекта: посев «старой выгрузкой». */
+  snapshotToProject(dir: string): void {
+    this.writeFiles(dir, this.dbFiles());
   }
 
   /** Меняет один файл владельца (владелец определяется по пути); версия владельца растёт. */
@@ -114,9 +157,10 @@ export class AgentConfigEmulator {
     if (!owner) {
       throw new Error(`эмулятор: не определён владелец файла ${rel}`);
     }
-    const object = this.objects.get(owner) ?? { files: new Map<string, Buffer>(), version: 0, parts: [] };
+    const object = this.objects.get(owner) ?? { files: new Map<string, Buffer>(), version: 0, fileVersions: new Map<string, number>(), parts: [] };
     this.versionCounter += 1;
     object.files.set(rel, Buffer.from(content));
+    object.fileVersions.set(rel, this.versionCounter);
     object.version = this.versionCounter;
     object.parts = parts;
     this.objects.set(owner, object);
@@ -274,10 +318,17 @@ export class AgentConfigEmulator {
       }
     }
     for (const [name, object] of this.objects) {
-      if (known.get(name) !== object.version) {
-        this.removeOwnerFiles(dirAbs, name);
-        this.writeFiles(dirAbs, Object.fromEntries(object.files));
+      const knownVersion = known.get(name);
+      if (knownVersion === object.version) {
+        continue;
       }
+      if (this.updateGranularity === 'changed-files') {
+        const changed = [...object.files].filter(([rel]) => (object.fileVersions.get(rel) ?? 0) > (knownVersion ?? 0));
+        this.writeFiles(dirAbs, Object.fromEntries(changed));
+        continue;
+      }
+      this.removeOwnerFiles(dirAbs, name);
+      this.writeFiles(dirAbs, Object.fromEntries(object.files));
     }
     fs.writeFileSync(path.join(dirAbs, CDI), this.buildConfigDumpInfo());
   }
@@ -373,6 +424,7 @@ export class AgentConfigEmulator {
     this.versionCounter += 1;
     for (const object of this.objects.values()) {
       object.version = this.versionCounter;
+      object.fileVersions = new Map([...object.files.keys()].map((rel) => [rel, this.versionCounter]));
       object.parts = [];
     }
   }
@@ -383,7 +435,10 @@ export class AgentConfigEmulator {
     const lines = [...this.objects.entries()]
       .sort(([a], [b]) => (a < b ? -1 : 1))
       .map(([name, object]) => `  <Metadata name="${name}" configVersion="${String(object.version)}"/>`);
-    return Buffer.from(`${BOM}<ConfigDumpInfo>\n${lines.join('\n')}\n</ConfigDumpInfo>\n`, 'utf-8');
+    // Заголовок как у платформы: пространство имён, `format="Hierarchical"` и версия формата — по ним
+    // проверяется пригодность файла версий проекта для посева зеркала.
+    const header = `<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" format="Hierarchical" version="${this.formatVersion}">`;
+    return Buffer.from(`${BOM}${header}\n${lines.join('\n')}\n</ConfigDumpInfo>\n`, 'utf-8');
   }
 
   private readConfigDumpInfo(dirAbs: string): Map<string, number> | undefined {

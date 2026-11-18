@@ -12,6 +12,7 @@ import { createLocalAgentFileStore } from './files/LocalAgentFileStore';
 import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
 import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
+import type { MirrorSeedCandidate } from './sync/MirrorSeed';
 import type {
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
@@ -30,12 +31,25 @@ export interface AgentConfigurationOperationTarget {
   readonly extensionName?: string;
 }
 
+/** Ответ на вопрос о посеве зеркала: из выгрузки проекта, полной выгрузкой (самопосев из архива) или отмена. */
+export type AgentMirrorSeedDecision = 'seed' | 'full' | 'cancel';
+
+export interface AgentMirrorSeedRequest extends MirrorSeedCandidate {
+  /** Файлов P, изменённых относительно известной B (`undefined` — B нет): эти правки не будут перезаписаны. */
+  readonly localEditsSinceBaseline: number | undefined;
+}
+
 export interface AgentOperationHooks {
   readonly onMessage?: (message: string) => void;
   readonly onProjectFilesWillChange?: (filePaths: string[]) => void;
   readonly onQuestion?: (message: AgentMessage) => Promise<string | undefined>;
   /** Отмена синхронизации (структурно совместима с `vscode.CancellationToken`). */
   readonly cancellation?: AgentTransferCancellation;
+  /**
+   * Согласие на посев пустого зеркала агента из выгрузки проекта. Нет хука — `'full'`: без
+   * человека скрытое расхождение P и БД (ручные правки после выгрузки) принимать нельзя.
+   */
+  readonly confirmMirrorSeed?: (request: AgentMirrorSeedRequest) => Promise<AgentMirrorSeedDecision>;
 }
 
 export interface AgentOperationResult {

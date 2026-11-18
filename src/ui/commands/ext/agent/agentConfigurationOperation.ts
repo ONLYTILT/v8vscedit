@@ -1,7 +1,8 @@
 // Перенесено из ExtensionCommandRunner.ts (Э2) без изменения поведения; публичный API реэкспортируется оттуда.
 import * as vscode from 'vscode';
 import type { AgentMessage } from '../../../../domain/agent';
-import { AgentCommandError, type AgentOperationService } from '../../../../infra/agent';
+import { AgentCommandError, type AgentOperationHooks, type AgentOperationService } from '../../../../infra/agent';
+import { AgentSyncCancelledError } from '../../../../infra/agent/sync/SyncContext';
 import type { ConfigurationImportHooks, ConfigurationProgressHooks } from '../configurationOperationTypes';
 import {
   beginConfigurationOperationStatus,
@@ -22,6 +23,8 @@ export interface RunAgentOptions {
   readonly rootPath: string;
   readonly hooks?: ConfigurationImportHooks | ConfigurationProgressHooks;
   readonly onProgressMessage?: (message: string) => void;
+  /** Вопрос о посеве пустого зеркала агента; без него импорт идёт без диалога (полная выгрузка). */
+  readonly confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
 }
 
 export async function runAgentConfigurationOperation(
@@ -32,6 +35,7 @@ export async function runAgentConfigurationOperation(
       onMessage: (message: string) => void;
       onProjectFilesWillChange?: (filePaths: string[]) => void;
       onQuestion: (message: AgentMessage) => Promise<string | undefined>;
+      confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
     }
   ) => Promise<void>
 ): Promise<boolean> {
@@ -55,6 +59,7 @@ export async function runAgentConfigurationOperation(
       ? (filePaths: string[]) => importHooks.beforeProjectFilesChanged?.(filePaths)
       : undefined,
     onQuestion: showAgentQuestion,
+    confirmMirrorSeed: options.confirmMirrorSeed,
   });
 
   try {
@@ -68,6 +73,14 @@ export async function runAgentConfigurationOperation(
     }
     return true;
   } catch (error) {
+    if (error instanceof AgentSyncCancelledError) {
+      // Отмена пользователем (Esc в вопросе о посеве, кнопка отмены прогресса) — не ошибка: без тоста
+      // «Ошибка импорта…» и без диагностики агента, только запись в журнал и сообщение.
+      options.outputChannel.appendLine(`[agent] Отменено: ${options.progressTitle}`);
+      endConfigurationOperationStatus(options.progressTitle, 'отменено');
+      void vscode.window.showInformationMessage(`${options.progressTitle}: операция отменена.`);
+      return false;
+    }
     const message = error instanceof Error ? error.message : String(error);
     options.outputChannel.appendLine(`[agent][error] ${message}`);
     if (error instanceof AgentCommandError) {

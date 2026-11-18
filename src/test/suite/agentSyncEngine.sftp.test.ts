@@ -8,26 +8,18 @@ import { buildScopeKey } from '../../infra/cache/HashCache';
 import { agentError } from './support/agentInfoBaseFakes';
 import { createHarness, dbAsText, type SyncHarness } from './support/agentSyncHarness';
 import { readZip, patternBytes } from './support/zipFixtures';
-import type { AgentFileEntry, AgentFileStore } from '../../infra/agent/files/AgentFileStore';
+import { DelegatingAgentFileStore } from './support/delegatingAgentFileStore';
 
 /** Хранилище, у которого удаление служебных файлов обмена (`exchange/…`) отказывает. */
-class FailingExchangeRemoveStore implements AgentFileStore {
+class FailingExchangeRemoveStore extends DelegatingAgentFileStore {
   removeAttempts = 0;
-  constructor(private readonly inner: AgentFileStore) {}
-  get kind(): 'local' | 'sftp' { return this.inner.kind; }
-  stat(rel: string): Promise<AgentFileEntry | undefined> { return this.inner.stat(rel); }
-  readFile(rel: string): Promise<Buffer> { return this.inner.readFile(rel); }
-  writeFile(rel: string, data: Uint8Array | string): Promise<void> { return this.inner.writeFile(rel, data); }
-  remove(rel: string, options?: { readonly recursive?: boolean }): Promise<void> {
+  override remove(rel: string, options?: { readonly recursive?: boolean }): Promise<void> {
     if (rel.startsWith('exchange/')) {
       this.removeAttempts += 1;
       return Promise.reject(new Error('сервер отказал в удалении'));
     }
-    return this.inner.remove(rel, options);
+    return super.remove(rel, options);
   }
-  list(relDir: string, options?: { readonly recursive?: boolean }): Promise<AgentFileEntry[]> { return this.inner.list(relDir, options); }
-  mkdirp(rel: string): Promise<void> { return this.inner.mkdirp(rel); }
-  dispose(): Promise<void> { return this.inner.dispose(); }
 }
 
 /**
@@ -221,6 +213,10 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       // удаление из P; без Ext/ владелец «отсутствует», и импорт уходит в архив (Б2).
       h.emulator.putFile('Ext/SessionModule.bsl', 'Процедура А() КонецПроцедуры', ['SessionModule']);
       await doImport();
+      // После первого импорта M разреженный (только CDI и Configuration.xml), а сценарий Н39 — про ПОЛНЫЙ M
+      // с Ext/ корня: ограничение дельты «владелец найден, Configuration.xml пропал» при разреженном M
+      // невозможно (там удаление разрешено только для D.added).
+      h.makeMirrorFull();
       const before = h.snapshotP();
       fs.unlinkSync(path.join(h.mirrorAbs, 'Configuration.xml'));
       h.emulator.nextChangesText = `${BOM}Modified: Configuration.Конфигурация
@@ -304,22 +300,19 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       assert.strictEqual(h.manifest().mirrorState, 'empty');
     });
 
-    test('M empty: перед полной выгрузкой без --update каталог M очищается (остатки недостоверного M не переживают её)', async () => {
+    // Изменено планом потокового архива/посева: полной выгрузки в M при первом импорте больше нет —
+    // M очищается и засевается только файлом версий и Configuration.xml из архива.
+    test('M empty: недостоверный M очищается ДО посева (остаток не переживает его), в M только CDI и Configuration.xml', async () => {
       await start();
       fs.mkdirSync(path.join(h.mirrorAbs, 'Catalogs'), { recursive: true });
       fs.writeFileSync(path.join(h.mirrorAbs, 'Catalogs', 'Остаток.xml'), '<stale/>');
-      let mirrorExistedAtDump: boolean | undefined;
-      h.emulator.onCommand = (cmd) => {
-        if (cmd.command === 'config dump-config-to-files' && cmd.options.dir === h.mirrorDir && mirrorExistedAtDump === undefined) {
-          mirrorExistedAtDump = fs.existsSync(path.join(h.mirrorAbs, 'Catalogs', 'Остаток.xml'));
-        }
-      };
 
       const result = await doImport();
 
       assert.strictEqual(result.reason, 'mirror-empty');
-      assert.strictEqual(mirrorExistedAtDump, false);
+      assert.deepStrictEqual(h.listM(), ['ConfigDumpInfo.xml', 'Configuration.xml']);
       assert.ok(!fs.existsSync(path.join(h.mirrorAbs, 'Catalogs', 'Остаток.xml')));
+      assert.ok(h.emulator.dumps().every((d) => d.options.dir !== h.mirrorDir), 'выгрузки в M нет');
     });
 
     test('архив без Configuration.xml на первом импорте → отказ, P не создаётся', async () => {
@@ -394,6 +387,19 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
 
       const result = await h.engine.loadTarget(h.target, 'changed', h.exec, { cancellation: { isCancellationRequested: false } });
+
+      assert.strictEqual(result.strategy, 'partial');
+      assert.strictEqual(h.readM('Catalogs/Клиенты.xml'), '<Catalog>v2</Catalog>');
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
+    });
+
+    test('M empty при известном B, хуков нет вовсе: подготовка full-dump проходит с тем же исходом', async () => {
+      await start();
+      await doImport();
+      h.saveManifest('empty', await buildSyncManifestFiles(h.configRoot));
+      h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
+
+      const result = await h.engine.loadTarget(h.target, 'changed', h.exec);
 
       assert.strictEqual(result.strategy, 'partial');
       assert.strictEqual(h.readM('Catalogs/Клиенты.xml'), '<Catalog>v2</Catalog>');
@@ -477,7 +483,9 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       await h.engine.loadTarget(target, 'changed', h.exec);
 
       const agentCommands = h.emulator.commands.filter((c) => c.command.startsWith('config '));
-      assert.ok(agentCommands.length >= 6);
+      // Первый импорт — одна выгрузка архивом (полной выгрузки в M больше нет): архив, список изменений,
+      // --update, частичная и полная загрузка.
+      assert.ok(agentCommands.length >= 5);
       for (const command of agentCommands) {
         assert.strictEqual(command.options.extension, 'Расш', command.raw);
       }

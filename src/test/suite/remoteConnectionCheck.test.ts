@@ -306,6 +306,8 @@ suite('Агент Э8: checkRemoteAgentConnection', function () {
         stat: (rel) => inner.stat(rel),
         readFile: (rel) => (patch.readFile ? patch.readFile(inner, rel) as Promise<Buffer> : inner.readFile(rel)),
         writeFile: (rel, data) => inner.writeFile(rel, data),
+        downloadToFile: (rel, localPath, opts) => inner.downloadToFile(rel, localPath, opts),
+        uploadFromFile: (localPath, rel, opts) => inner.uploadFromFile(localPath, rel, opts),
         remove: (rel, opts) => (patch.remove ? patch.remove(inner, rel) as Promise<void> : inner.remove(rel, opts)),
         list: (dir, opts) => inner.list(dir, opts),
         mkdirp: (rel) => inner.mkdirp(rel),

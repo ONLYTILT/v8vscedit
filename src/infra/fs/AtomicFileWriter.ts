@@ -55,20 +55,10 @@ export function resolveAtomicTempPath(targetPath: string, uniqueSuffix: string):
  */
 export function writeFileAtomic(targetPath: string, data: string | Uint8Array): void {
   const target = resolveWriteTarget(targetPath);
-  writeCounter += 1;
-  const tempPath = resolveAtomicTempPath(
-    target,
-    `${String(process.pid)}.${String(Date.now())}.${String(writeCounter)}`
-  );
+  const tempPath = nextTempPath(target);
   try {
     fs.writeFileSync(tempPath, data, 'utf-8');
-    const mode = existingFileMode(target);
-    if (mode !== undefined) {
-      // `rename` подменяет inode, значит и права: без переноса режима цели
-      // файл после первой же правки получил бы режим по умолчанию.
-      fs.chmodSync(tempPath, mode);
-    }
-    fs.renameSync(tempPath, target);
+    commitTemp(tempPath, target);
   } catch (error) {
     // Мусор убирается безусловно, а исходная причина отказа пробрасывается
     // наружу: тихий откат на прямую запись вернул бы ровно тот дефект, ради
@@ -78,6 +68,42 @@ export function writeFileAtomic(targetPath: string, data: string | Uint8Array): 
     removeTempQuietly(tempPath);
     throw error;
   }
+}
+
+/**
+ * Потоковый вариант {@link writeFileAtomic} для файлов, которые нельзя держать в памяти целиком
+ * (архив выгрузки): `write` сам заполняет временный файл по переданному пути — порциями, с
+ * отменой. Подмена цели и уборка — та же механика temp+rename, что у буферного варианта; отказ
+ * или отмена внутри `write` оставляют цель нетронутой.
+ */
+export async function writeFileAtomicWith(
+  targetPath: string,
+  write: (tempPath: string) => Promise<void>
+): Promise<void> {
+  const target = resolveWriteTarget(targetPath);
+  const tempPath = nextTempPath(target);
+  try {
+    await write(tempPath);
+    commitTemp(tempPath, target);
+  } catch (error) {
+    removeTempQuietly(tempPath);
+    throw error;
+  }
+}
+
+function nextTempPath(target: string): string {
+  writeCounter += 1;
+  return resolveAtomicTempPath(target, `${String(process.pid)}.${String(Date.now())}.${String(writeCounter)}`);
+}
+
+function commitTemp(tempPath: string, target: string): void {
+  const mode = existingFileMode(target);
+  if (mode !== undefined) {
+    // `rename` подменяет inode, значит и права: без переноса режима цели
+    // файл после первой же правки получил бы режим по умолчанию.
+    fs.chmodSync(tempPath, mode);
+  }
+  fs.renameSync(tempPath, target);
 }
 
 /** Временный файл мог так и не появиться (отказ на создании) — его отсутствие не ошибка. */

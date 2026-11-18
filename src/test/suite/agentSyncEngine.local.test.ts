@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildSyncManifestFiles } from '../../infra/agent/sync/SyncManifest';
+import { buildSyncManifestFiles, mirrorCoverageOf } from '../../infra/agent/sync/SyncManifest';
 import { emptyHashStatMemo, loadHashStatMemo, saveHashStatMemo } from '../../infra/cache/HashStatMemo';
 import { createHarness, type SyncHarness } from './support/agentSyncHarness';
 
@@ -139,5 +139,49 @@ suite('AgentSyncEngine (Э7): локальное хранилище', function (
     const memo = await loadHashStatMemo(h.projectRoot, h.configRoot);
     assert.ok(!('Нет/Такого.xml' in memo.entries));
     assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
+  });
+});
+
+/**
+ * Посев зеркала — только для удалённого хранилища (SFTP): локальный агент пишет M на этой же машине, его
+ * импорт сравнивает M и P целиком (`compare`), а зеркало всегда полное. Хук согласия не вызывается даже
+ * при пригодной выгрузке проекта (файл версий и Configuration.xml в P), состав команд и стратегия прежние.
+ */
+suite('AgentSyncEngine (Э7): локальное хранилище не засевает зеркало', function () {
+  this.timeout(60_000);
+  let h: SyncHarness;
+
+  setup(async () => {
+    h = await createHarness('local');
+    h.seedDb();
+    h.emulator.setConfiguration('Основная', 'cf');
+  });
+  teardown(async () => { await h.dispose(); });
+
+  test('пригодная выгрузка проекта в P: хук не вызывается, стратегия compare, полная выгрузка в M без --update/--archive, полнота full', async () => {
+    h.emulator.snapshotToProject(h.configRoot);
+    h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
+    let hookCalls = 0;
+
+    const result = await h.importTarget({
+      confirmMirrorSeed: () => { hookCalls += 1; return Promise.resolve('seed'); },
+    });
+
+    assert.strictEqual(hookCalls, 0);
+    assert.strictEqual(result.strategy, 'compare');
+    assert.strictEqual(result.seededFrom, undefined);
+    const dumps = h.emulator.dumps();
+    assert.strictEqual(dumps.length, 1);
+    assert.strictEqual(dumps[0].options.dir, h.mirrorDir);
+    assert.ok(!dumps[0].options.archive && !dumps[0].options['get-changes']);
+    assert.strictEqual(mirrorCoverageOf(h.manifest()), 'full');
+    assert.strictEqual(h.readP('Catalogs/Клиенты.xml'), '<Catalog>v2</Catalog>');
+    assert.deepStrictEqual(h.localExchangeLeftovers(), [], 'локальный обмен потокового архива локально не создаётся');
+  });
+
+  test('загрузка: полнота остаётся full (локальное хранилище полное и после полной загрузки каталогом)', async () => {
+    await h.importTarget();
+    await h.loadTarget('full');
+    assert.strictEqual(mirrorCoverageOf(h.manifest()), 'full');
   });
 });

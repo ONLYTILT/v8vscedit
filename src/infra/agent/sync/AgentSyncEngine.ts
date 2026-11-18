@@ -1,3 +1,4 @@
+import * as path from 'path';
 import type { AgentCommandExecutor } from '../AgentInfoBaseSession';
 import type { AgentConfigurationOperationTarget, AgentOperationHooks } from '../AgentOperationService';
 import { sanitizePathPart, type AgentWorkspaceService } from '../AgentWorkspaceService';
@@ -6,8 +7,17 @@ import { DEFAULT_AGENT_TRANSFER_CONCURRENCY } from '../files/AgentFileTransfer';
 import { buildScopeKey, saveHashCache } from '../../cache/HashCache';
 import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
+import { createLocalExchange, pruneStaleLocalExchanges } from './LocalExchange';
 import { throwIfCancelled, type SyncOperationContext } from './SyncContext';
-import { buildSyncManifestFiles, loadSyncManifest, saveSyncManifest, type SyncManifest, type SyncMirrorState } from './SyncManifest';
+import {
+  buildSyncManifestFiles,
+  loadSyncManifest,
+  mirrorCoverageOf,
+  saveSyncManifest,
+  type SyncManifest,
+  type SyncMirrorCoverage,
+  type SyncMirrorState,
+} from './SyncManifest';
 
 export { AgentSyncCancelledError } from './SyncContext';
 export type { AgentImportResult } from './AgentImportFlow';
@@ -24,6 +34,17 @@ export interface AgentSyncEngineOptions {
   readonly transferConcurrency?: number;
   /** Источник уникальной части имени операции (по умолчанию — `Date.now`). */
   readonly now?: () => number;
+  /**
+   * Локальный каталог обмена потокового архива (по умолчанию `<projectRoot>/.v8vscedit/agent-exchange`:
+   * тот же диск, что у P, и `.zip` не попадает под watcher `src/**\/*.xml`).
+   */
+  readonly localExchangeRoot?: string;
+}
+
+interface OperationBaseline {
+  files: Record<string, string>;
+  mirrorState: SyncMirrorState;
+  mirrorCoverage: SyncMirrorCoverage;
 }
 
 /**
@@ -49,8 +70,11 @@ export class AgentSyncEngine {
     hooks?: AgentOperationHooks
   ): Promise<AgentImportResult> {
     return this.runOperation(target, exec, hooks, async (context) => {
-      const result = await runImport(context);
-      return { result, baseline: { files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot), mirrorState: 'fresh' } };
+      const { result, mirrorCoverage } = await runImport(context);
+      return {
+        result,
+        baseline: { files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot), mirrorState: 'fresh', mirrorCoverage },
+      };
     });
   }
 
@@ -65,7 +89,10 @@ export class AgentSyncEngine {
       const outcome = await runLoad(context, mode);
       return outcome.result.skipped
         ? { result: outcome.result }
-        : { result: outcome.result, baseline: { files: outcome.files, mirrorState: outcome.mirrorState } };
+        : {
+          result: outcome.result,
+          baseline: { files: outcome.files, mirrorState: outcome.mirrorState, mirrorCoverage: outcome.mirrorCoverage },
+        };
     });
   }
 
@@ -76,7 +103,7 @@ export class AgentSyncEngine {
     run: (context: SyncOperationContext) => Promise<{
       result: T;
       /** Новая B и состояние M; без неё (пропуск загрузки) манифест не трогается. */
-      baseline?: { files: Record<string, string>; mirrorState: SyncMirrorState };
+      baseline?: OperationBaseline;
     }>
   ): Promise<T> {
     throwIfCancelled({ hooks });
@@ -87,7 +114,12 @@ export class AgentSyncEngine {
     const workspace = await workspaceService.ensureWorkspace(
       extensionName === undefined ? { kind: 'cf' } : { kind: 'cfe', extensionName }
     );
-    const operationId = sanitizePathPart(`${extensionName === undefined ? 'cf' : `cfe-${extensionName}`}-${String(this.now())}`);
+    const operationPrefix = sanitizePathPart(`${extensionName === undefined ? 'cf' : `cfe-${extensionName}`}-`);
+    const operationId = sanitizePathPart(`${operationPrefix}${String(this.now())}`);
+    const exchangeRoot = this.options.localExchangeRoot ?? path.join(projectRoot, '.v8vscedit', 'agent-exchange');
+    // Остатки упавших (убитых) операций той же цели: на штатных путях каталог убирает dispose.
+    await pruneStaleLocalExchanges(exchangeRoot, operationPrefix, operationId);
+    const localExchange = createLocalExchange(exchangeRoot, operationId);
     // Объект, а не локальная переменная: флаг меняет колбэк, который вызывают стратегии.
     const mirror = { mutated: false };
     const context: SyncOperationContext = {
@@ -103,6 +135,9 @@ export class AgentSyncEngine {
       operationId,
       archiveThresholdFiles: this.archiveThresholdFiles,
       transferConcurrency: this.transferConcurrency,
+      localExchange,
+      // Локальный M всегда полный: импорт сравнивает его с P целиком, посева там нет.
+      mirror: { coverage: store.kind === 'local' ? 'full' : mirrorCoverageOf(manifest) },
       markMirrorMutated: () => { mirror.mutated = true; },
     };
 
@@ -111,14 +146,17 @@ export class AgentSyncEngine {
     try {
       const outcome = await run(context);
       if (outcome.baseline) {
-        this.saveBaseline(manifest, outcome.baseline.files, outcome.baseline.mirrorState);
+        this.saveBaseline(manifest, outcome.baseline);
       }
       await this.removeExchange(context);
       return outcome.result;
     } catch (error) {
-      if (mirror.mutated && manifest.mirrorState !== 'empty') {
-        // M уже изменён, а P и B — нет: следующий импорт обязан идти полным путём.
-        saveSyncManifest(projectRoot, { ...manifest, mirrorState: 'empty' });
+      if (mirror.mutated) {
+        // M уже изменён, а P и B — нет: следующий импорт обязан идти полным путём. Полнота — текущая,
+        // а не из старого манифеста: начатый посев делает M разреженным, и прежнее `full` позволило бы
+        // следующим операциям удалять из P файлы по их отсутствию в M. Пишется и при уже `empty`:
+        // иначе полнота так и осталась бы прежней.
+        saveSyncManifest(projectRoot, { ...manifest, mirrorState: 'empty', mirrorCoverage: context.mirror.coverage });
       }
       await this.removeExchange(context);
       throw error;
@@ -126,8 +164,8 @@ export class AgentSyncEngine {
   }
 
   /** B и кэш хэшей пишутся вместе: загрузка «по изменениям» и CLI читают одно и то же. */
-  private saveBaseline(manifest: SyncManifest, files: Record<string, string>, mirrorState: SyncMirrorState): void {
-    saveSyncManifest(this.options.projectRoot, { ...manifest, mirrorState, files });
+  private saveBaseline(manifest: SyncManifest, { files, mirrorState, mirrorCoverage }: OperationBaseline): void {
+    saveSyncManifest(this.options.projectRoot, { ...manifest, mirrorState, files, mirrorCoverage });
     saveHashCache(this.options.projectRoot, {
       schemaVersion: 1,
       scopeKey: manifest.scopeKey,
@@ -136,8 +174,9 @@ export class AgentSyncEngine {
     });
   }
 
-  /** Служебные файлы обмена убираются всегда; сбой уборки не должен заслонить исход операции. */
+  /** Служебные файлы обмена (серверные и локальные) убираются всегда; сбой уборки не должен заслонить исход. */
   private async removeExchange(context: SyncOperationContext): Promise<void> {
+    await context.localExchange.dispose();
     const base = `${context.workspace.exchangeRoot}/${context.operationId}`;
     for (const rel of [base, `${base}.changes`]) {
       try {

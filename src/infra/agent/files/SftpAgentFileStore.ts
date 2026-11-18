@@ -1,7 +1,25 @@
 import { randomBytes } from 'crypto';
+import * as fs from 'fs';
 import type { FileEntryWithStats, Stats } from 'ssh2';
+import { writeFully } from '../../fs/FileHandleWrite';
 import type { DesignerAgentConnectionOptions } from '../ProcessDesignerAgentTransport';
-import { toAgentPathSegments, type AgentFileEntry, type AgentFileStore } from './AgentFileStore';
+import { toAgentPathSegments, type AgentFileEntry, type AgentFileStore, type AgentStreamOptions } from './AgentFileStore';
+import {
+  AgentTransferCancelledError,
+  throwIfTransferCancellationRequested,
+  type AgentTransferCancellation,
+} from './AgentFileTransfer';
+import {
+  CHANGED_DURING_READ,
+  IO_CHUNK,
+  IO_WINDOW,
+  bufferChunkSource,
+  fileChunkSource,
+  readRange,
+  runWindowed,
+  type ChunkSource,
+  type SftpReadCall,
+} from './SftpChunkedIo';
 import {
   SFTP_FAILURE,
   SFTP_NO_SUCH_FILE,
@@ -32,14 +50,6 @@ interface ResolvedPath {
   readonly remote: string;
 }
 
-/** Порция одного запроса READ/WRITE: укладывается в один пакет SFTP у любого сервера. */
-const IO_CHUNK = 32 * 1024;
-/**
- * Порций одного файла в полёте одновременно (Н32). Последовательный обмен упирается в задержку:
- * при 80 мс это ≈400 КБ/с, и архив выгрузки так не передать; окно в 16 порций снимает это
- * ограничение (тот же приём, что у `fastGet`/`fastPut` ssh2), не переполняя очередь сервера.
- */
-const IO_WINDOW = 16;
 /** Одновременных листингов при рекурсивном обходе. */
 const LIST_CONCURRENCY = 8;
 // Окончание временных имён: не `.xml`, иначе watcher `src/**/*.xml` принял бы недописанный файл
@@ -106,23 +116,67 @@ export class SftpAgentFileStore implements AgentFileStore {
     const bytes = typeof data === 'string'
       ? Buffer.from(data, 'utf-8')
       : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-    await this.withWriteLock(target.rel, async () => {
-      try {
-        const parent = parentOf(target.rel);
-        const name = target.rel.slice(target.rel.lastIndexOf('/') + 1);
-        await this.ensureDir(parent);
-        if (this.direct) {
-          await this.writeHandle(target.remote, bytes);
-        } else {
-          await this.writeViaTemp(target.remote, parent, name, bytes);
-        }
-      } catch (error) {
-        // Каталоги могли исчезнуть помимо хранилища (агент пересоздаёт выгрузку): после любого
-        // отказа записи кэш больше не доверенный, следующая запись проверит путь заново.
-        this.knownDirs.clear();
-        throw wrapError('записать файл', target, error);
+    await this.writeSource(target, bufferChunkSource(bytes), {});
+  }
+
+  /**
+   * Локальный файл читается порциями по своим смещениям прямо в окно WRITE: в памяти — не больше
+   * окна, а не весь архив выгрузки.
+   */
+  async uploadFromFile(localPath: string, rel: string, options: AgentStreamOptions = {}): Promise<void> {
+    const target = this.resolve(rel);
+    throwIfTransferCancellationRequested(options.cancellation);
+    let handle: fs.promises.FileHandle;
+    try {
+      handle = await fs.promises.open(localPath, 'r');
+    } catch (error) {
+      throw new Error(`Не удалось открыть локальный файл "${localPath}" для передачи агенту: ${(error as Error).message}`, { cause: error });
+    }
+    try {
+      const { size } = await handle.stat();
+      await this.writeSource(target, fileChunkSource(handle, size), options);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Порции READ окном пишутся в новый локальный файл позиционно, каждая из своего буфера: порядок
+   * ответов не важен, память — окно порций, а не размер файла.
+   */
+  async downloadToFile(rel: string, localPath: string, options: AgentStreamOptions = {}): Promise<void> {
+    const target = this.resolve(rel);
+    throwIfTransferCancellationRequested(options.cancellation);
+    let remote: Buffer | undefined;
+    let local: fs.promises.FileHandle | undefined;
+    let created = false;
+    try {
+      remote = await this.open(target.remote, 'r');
+      const opened = remote;
+      const stats = await this.connection.request<Stats>((sftp, done) => sftp.fstat(opened, done));
+      if (stats.isDirectory()) {
+        // Часть серверов открывает каталог на чтение без ошибки; пустой «файл» вместо отказа хуже.
+        throw new Error('по этому пути находится каталог');
       }
-    });
+      local = await fs.promises.open(localPath, 'wx');
+      created = true;
+      await this.downloadInto(opened, local, stats.size, options);
+      const finished = local;
+      local = undefined;
+      await finished.close();
+      remote = undefined;
+      await this.close(opened);
+    } catch (error) {
+      if (remote) {
+        await this.closeQuietly(remote);
+      }
+      await local?.close().catch(noop);
+      if (created) {
+        // Неполный файл не должен остаться похожим на скачанный архив.
+        await fs.promises.unlink(localPath).catch(noop);
+      }
+      throw error instanceof AgentTransferCancelledError ? error : wrapError('скачать файл', target, error);
+    }
   }
 
   async remove(rel: string, options?: { readonly recursive?: boolean }): Promise<void> {
@@ -189,16 +243,43 @@ export class SftpAgentFileStore implements AgentFileStore {
 
   // --- запись ---
 
+  private async writeSource(target: ResolvedPath, source: ChunkSource, options: AgentStreamOptions): Promise<void> {
+    await this.withWriteLock(target.rel, async () => {
+      try {
+        const parent = parentOf(target.rel);
+        const name = target.rel.slice(target.rel.lastIndexOf('/') + 1);
+        await this.ensureDir(parent);
+        if (this.direct) {
+          await this.writeHandle(target.remote, source, options);
+        } else {
+          await this.writeViaTemp(target.remote, parent, name, source, options);
+        }
+      } catch (error) {
+        // Каталоги могли исчезнуть помимо хранилища (агент пересоздаёт выгрузку): после любого
+        // отказа записи кэш больше не доверенный, следующая запись проверит путь заново.
+        this.knownDirs.clear();
+        throw error instanceof AgentTransferCancelledError ? error : wrapError('записать файл', target, error);
+      }
+    });
+  }
+
   /**
    * Временный файл в каталоге цели и RENAME в цель. Цель до RENAME не открывается и заранее не
    * проверяется: RENAME агента перезаписывает существующий файл (факт пилота §5b п.12), и на
    * агенте перезапись — ровно один запрос без окна, когда цели нет.
    */
-  private async writeViaTemp(remote: string, parent: string, name: string, bytes: Buffer): Promise<void> {
+  private async writeViaTemp(
+    remote: string,
+    parent: string,
+    name: string,
+    source: ChunkSource,
+    options: AgentStreamOptions
+  ): Promise<void> {
     const tag = randomBytes(6).toString('hex');
     const temp = joinRel(parent, `.${name}.${tag}${TEMP_SUFFIX}`);
     try {
-      await this.writeHandle(temp, bytes);
+      // Отмена посреди записи оставляет цель прежней: недописан только временный файл.
+      await this.writeHandle(temp, source, options);
     } catch (error) {
       await this.removeQuietly(temp);
       throw error;
@@ -209,7 +290,7 @@ export class SftpAgentFileStore implements AgentFileStore {
       await this.removeQuietly(temp);
       if (this.writeMode === 'auto' && sftpStatusCode(error) === SFTP_OP_UNSUPPORTED) {
         this.direct = true;
-        await this.writeHandle(remote, bytes);
+        await this.writeHandle(remote, source, options);
         return;
       }
       throw error;
@@ -264,17 +345,21 @@ export class SftpAgentFileStore implements AgentFileStore {
     await this.removeQuietly(backup);
   }
 
-  private async writeHandle(remote: string, bytes: Buffer): Promise<void> {
+  private async writeHandle(remote: string, source: ChunkSource, options: AgentStreamOptions): Promise<void> {
     const handle = await this.open(remote, 'w');
+    let written = 0;
     try {
       // Порции пишутся по своим смещениям независимо друг от друга, поэтому их можно держать в
       // полёте окном: порядок прихода ответов на результат не влияет.
-      await runWindowed(Math.ceil(bytes.length / IO_CHUNK), IO_WINDOW, (index) => {
+      await runWindowed(Math.ceil(source.size / IO_CHUNK), IO_WINDOW, async (index) => {
         const offset = index * IO_CHUNK;
-        const length = Math.min(IO_CHUNK, bytes.length - offset);
-        return this.connection.request<undefined>((sftp, done) =>
-          sftp.write(handle, bytes, offset, length, offset, (error) => done(error, undefined)));
-      });
+        const length = Math.min(IO_CHUNK, source.size - offset);
+        const chunk = await source.read(offset, length);
+        await this.connection.request<undefined>((sftp, done) =>
+          sftp.write(handle, chunk, 0, length, offset, (error) => done(error, undefined)));
+        written += length;
+        options.onProgress?.(written, source.size);
+      }, options.cancellation);
     } catch (error) {
       await this.closeQuietly(handle);
       throw error;
@@ -442,11 +527,12 @@ export class SftpAgentFileStore implements AgentFileStore {
       return this.readToEof(handle);
     }
     const buffer = Buffer.alloc(stats.size);
+    const read = this.reader(handle);
     await runWindowed(Math.ceil(stats.size / IO_CHUNK), IO_WINDOW, async (index) => {
       const start = index * IO_CHUNK;
       const length = Math.min(IO_CHUNK, stats.size - start);
-      if ((await this.readRange(handle, buffer, start, length)) < length) {
-        throw new Error('файл изменился во время чтения (EOF раньше размера из FSTAT)');
+      if ((await readRange(read, buffer, start, start, length)) < length) {
+        throw new Error(CHANGED_DURING_READ);
       }
     });
     return buffer;
@@ -454,35 +540,68 @@ export class SftpAgentFileStore implements AgentFileStore {
 
   private async readToEof(handle: Buffer): Promise<Buffer> {
     const chunks: Buffer[] = [];
+    await this.streamToEof(handle, (chunk) => {
+      chunks.push(chunk);
+      return Promise.resolve();
+    });
+    return Buffer.concat(chunks);
+  }
+
+  /** Последовательные порции до EOF (сервер без размера в FSTAT); каждая — в свой буфер. */
+  private async streamToEof(
+    handle: Buffer,
+    consume: (chunk: Buffer, position: number) => Promise<void>,
+    cancellation?: AgentTransferCancellation
+  ): Promise<void> {
+    const read = this.reader(handle);
     let position = 0;
     for (;;) {
+      throwIfTransferCancellationRequested(cancellation);
       const chunk = Buffer.alloc(IO_CHUNK);
-      const count = await this.connection.request<number>((sftp, done) =>
-        sftp.read(handle, chunk, 0, IO_CHUNK, position, (error, bytesRead) => done(error, bytesRead)));
+      const count = await read(chunk, 0, IO_CHUNK, position);
       if (count === 0) {
-        return Buffer.concat(chunks);
+        return;
       }
-      chunks.push(chunk.subarray(0, count));
+      await consume(chunk.subarray(0, count), position);
       position += count;
     }
   }
 
-  /**
-   * Читает до `length` байт файла с позиции `offset` в то же место `target`; сервер вправе ответить
-   * короче запрошенного, тогда остаток дочитывается. Меньше `length` — только при EOF.
-   */
-  private async readRange(handle: Buffer, target: Buffer, offset: number, length: number): Promise<number> {
-    let done = 0;
-    while (done < length) {
-      const count = await this.connection.request<number>((sftp, callback) =>
-        sftp.read(handle, target, offset + done, length - done, offset + done, (error, bytesRead) => callback(error, bytesRead)));
-      // ssh2 отдаёт EOF как прочитанные 0 байт.
-      if (count === 0) {
-        break;
-      }
-      done += count;
+  /** Скачивание в открытый локальный файл: окном по размеру из FSTAT или до EOF без размера. */
+  private async downloadInto(
+    remote: Buffer,
+    local: fs.promises.FileHandle,
+    size: number,
+    options: AgentStreamOptions
+  ): Promise<void> {
+    if (!Number.isSafeInteger(size)) {
+      // SFTP v3 позволяет серверу не сообщать размер: тогда — последовательное чтение до EOF.
+      await this.streamToEof(remote, async (chunk, position) => {
+        await writeFully(local, chunk, chunk.length, position);
+        options.onProgress?.(position + chunk.length, undefined);
+      }, options.cancellation);
+      return;
     }
-    return done;
+    const read = this.reader(remote);
+    let done = 0;
+    await runWindowed(Math.ceil(size / IO_CHUNK), IO_WINDOW, async (index) => {
+      const position = index * IO_CHUNK;
+      const length = Math.min(IO_CHUNK, size - position);
+      const chunk = Buffer.alloc(length);
+      if ((await readRange(read, chunk, 0, position, length)) < length) {
+        // Агент пишет выгрузку temp+rename: укороченный файл — чужая запись поверх, а не повод
+        // отдать обрезанный архив.
+        throw new Error(CHANGED_DURING_READ);
+      }
+      await writeFully(local, chunk, length, position);
+      done += length;
+      options.onProgress?.(done, size);
+    }, options.cancellation);
+  }
+
+  private reader(handle: Buffer): SftpReadCall {
+    return (target, targetOffset, length, position) => this.connection.request<number>((sftp, done) =>
+      sftp.read(handle, target, targetOffset, length, position, (error, bytesRead) => done(error, bytesRead)));
   }
 
   private readdir(remote: string): Promise<FileEntryWithStats[]> {
@@ -535,30 +654,6 @@ export async function connectSftpAgentFileStore(
 /** Родитель относительного пути; у пути первого уровня — корень (пустая строка). */
 function parentOf(rel: string): string {
   return rel.slice(0, Math.max(rel.lastIndexOf('/'), 0));
-}
-
-/**
- * Задачи `0…count-1`, не более `window` одновременно. После первого отказа новые не стартуют, но
- * уже начатые дожидаются: дескриптор файла закрывается только когда по нему не осталось запросов.
- */
-async function runWindowed(count: number, window: number, run: (index: number) => Promise<unknown>): Promise<void> {
-  let next = 0;
-  let failure: { error: unknown } | undefined;
-  const worker = async (): Promise<void> => {
-    while (next < count && failure === undefined) {
-      const index = next;
-      next += 1;
-      try {
-        await run(index);
-      } catch (error) {
-        failure ??= { error };
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(window, count) }, worker));
-  if (failure !== undefined) {
-    throw failure.error;
-  }
 }
 
 /** Не более `limit` одновременных вызовов `run`; порядок запуска — порядок `items`. */

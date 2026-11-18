@@ -1,7 +1,11 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { AgentFileStore } from '../../../infra/agent/files/AgentFileStore';
+import { AgentTransferCancelledError } from '../../../infra/agent/files/AgentFileTransfer';
+import { IO_CHUNK, IO_WINDOW } from '../../../infra/agent/files/SftpChunkedIo';
+import { patternBytes } from './zipFixtures';
 
 /**
  * Контрактный набор AgentFileStore: один и тот же код проверяет локальную и SFTP-реализацию, чтобы
@@ -295,6 +299,197 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
       test('сегменты "." и пустые схлопываются', async () => {
         await store.writeFile('./a//b/./f.txt', '1');
         assert.ok(fs.existsSync(path.join(root, 'a', 'b', 'f.txt')));
+      });
+    });
+
+    suite('потоковые downloadToFile / uploadFromFile', function () {
+      this.timeout(120_000);
+      let localDir: string;
+
+      setup(() => { localDir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-store-stream-')); });
+      teardown(() => { fs.rmSync(localDir, { recursive: true, force: true }); });
+
+      const local = (name: string): string => path.join(localDir, name);
+      const bytesOf = (length: number, seed = 1): Buffer => patternBytes(length, seed);
+      /** Границы порции и окна: пустой, 1 байт, вокруг IO_CHUNK, окно целиком, многопорционный с нечётным хвостом. */
+      const SIZES = [0, 1, IO_CHUNK - 1, IO_CHUNK, IO_CHUNK + 1, IO_CHUNK * IO_WINDOW, 2 * 1024 * 1024 + 7];
+      const MULTI = 2 * 1024 * 1024 + 7;
+      const requests = (): number => fixture.requestCount?.() ?? 0;
+
+      suite('downloadToFile', () => {
+        for (const size of SIZES) {
+          test(`${String(size)} байт: локальный файл байт-в-байт; прогресс монотонен и доходит до размера`, async () => {
+            const data = bytesOf(size, size + 3);
+            fs.writeFileSync(path.join(root, 'src.bin'), data);
+            const progress: [number, number | undefined][] = [];
+
+            await store.downloadToFile('src.bin', local('dst.bin'), { onProgress: (done, total) => { progress.push([done, total]); } });
+
+            assert.ok(data.equals(fs.readFileSync(local('dst.bin'))));
+            for (let i = 1; i < progress.length; i += 1) {
+              assert.ok(progress[i][0] >= progress[i - 1][0], 'прогресс не убывает');
+            }
+            if (size > 0) {
+              assert.strictEqual(progress.at(-1)?.[0], size);
+              assert.ok(progress.every(([, total]) => total === size), 'размер известен и не меняется');
+            }
+          });
+        }
+
+        test('кириллица и пробелы в удалённом и локальном путях', async () => {
+          await store.writeFile('Каталог с пробелом/Выгрузка №1.zip', 'содержимое');
+          const target = local('Локальный каталог');
+          fs.mkdirSync(target);
+          await store.downloadToFile('Каталог с пробелом/Выгрузка №1.zip', path.join(target, 'Архив (копия).zip'));
+          assert.strictEqual(fs.readFileSync(path.join(target, 'Архив (копия).zip'), 'utf-8'), 'содержимое');
+        });
+
+        test('отсутствующий источник → отказ с путём, локального файла нет', async () => {
+          await assert.rejects(store.downloadToFile('no/such.bin', local('dst.bin')), /no\/such\.bin/);
+          assert.strictEqual(fs.existsSync(local('dst.bin')), false);
+        });
+
+        test('каталог вместо файла-источника → отказ, локального файла нет', async () => {
+          await store.mkdirp('dir');
+          await assert.rejects(store.downloadToFile('dir', local('dst.bin')), /dir/);
+          assert.strictEqual(fs.existsSync(local('dst.bin')), false);
+        });
+
+        test('локальный файл уже существует → отказ (открытие wx), прежнее содержимое не тронуто', async () => {
+          await store.writeFile('src.bin', 'новое');
+          fs.writeFileSync(local('dst.bin'), 'прежнее');
+          await assert.rejects(store.downloadToFile('src.bin', local('dst.bin')));
+          assert.strictEqual(fs.readFileSync(local('dst.bin'), 'utf-8'), 'прежнее');
+        });
+
+        test('отмена до старта: AgentTransferCancelledError, локального файла нет', async () => {
+          await store.writeFile('src.bin', bytesOf(100_000));
+          await assert.rejects(
+            store.downloadToFile('src.bin', local('dst.bin'), { cancellation: { isCancellationRequested: true } }),
+            AgentTransferCancelledError
+          );
+          assert.strictEqual(fs.existsSync(local('dst.bin')), false);
+        });
+
+        test('отмена посреди передачи (после первой порции): AgentTransferCancelledError, неполного локального файла нет', async () => {
+          fs.writeFileSync(path.join(root, 'big.bin'), bytesOf(MULTI));
+          const cancellation = { isCancellationRequested: false };
+          await assert.rejects(
+            store.downloadToFile('big.bin', local('dst.bin'), {
+              cancellation,
+              onProgress: () => { cancellation.isCancellationRequested = true; },
+            }),
+            AgentTransferCancelledError
+          );
+          assert.strictEqual(fs.existsSync(local('dst.bin')), false);
+          assert.deepStrictEqual(fs.readdirSync(localDir), []);
+        });
+
+        test('".." и абсолютный путь отвергаются ДО обращения к серверу; локальный файл не создаётся', async () => {
+          const before = requests();
+          for (const rel of ['..', '../x.bin', 'a/../../x.bin']) {
+            await assert.rejects(store.downloadToFile(rel, local('dst.bin')), /за пределы корня агента/, rel);
+          }
+          for (const rel of ['/etc/passwd', 'C:/x.bin', 'C:\\x.bin']) {
+            await assert.rejects(store.downloadToFile(rel, local('dst.bin')), /относительным/, rel);
+          }
+          assert.strictEqual(requests(), before);
+          assert.strictEqual(fs.existsSync(local('dst.bin')), false);
+        });
+      });
+
+      suite('uploadFromFile', () => {
+        for (const size of SIZES) {
+          test(`${String(size)} байт: файл хранилища байт-в-байт, остатков временных файлов нет`, async () => {
+            const data = bytesOf(size, size + 5);
+            fs.writeFileSync(local('src.bin'), data);
+
+            await store.uploadFromFile(local('src.bin'), 'up/dst.bin');
+
+            assert.ok(data.equals(fs.readFileSync(path.join(root, 'up', 'dst.bin'))));
+            assert.deepStrictEqual(fs.readdirSync(path.join(root, 'up')), ['dst.bin']);
+            assert.ok(data.equals(fs.readFileSync(local('src.bin'))), 'локальный источник не изменён');
+          });
+        }
+
+        test('прогресс монотонен и доходит до размера файла', async () => {
+          fs.writeFileSync(local('src.bin'), bytesOf(MULTI));
+          const progress: number[] = [];
+          await store.uploadFromFile(local('src.bin'), 'dst.bin', { onProgress: (done) => { progress.push(done); } });
+          for (let i = 1; i < progress.length; i += 1) {
+            assert.ok(progress[i] >= progress[i - 1]);
+          }
+          assert.strictEqual(progress.at(-1), MULTI);
+        });
+
+        test('перезапись существующего файла: цель заменена целиком, остатков нет', async () => {
+          await store.writeFile('x/f.bin', 'длинное старое содержимое');
+          fs.writeFileSync(local('src.bin'), 'new');
+          await store.uploadFromFile(local('src.bin'), 'x/f.bin');
+          assert.strictEqual(fs.readFileSync(path.join(root, 'x', 'f.bin'), 'utf-8'), 'new');
+          assert.deepStrictEqual(fs.readdirSync(path.join(root, 'x')), ['f.bin']);
+        });
+
+        test('промежуточные каталоги создаются; кириллица в путях', async () => {
+          fs.writeFileSync(local('Файл (копия).zip'), 'данные');
+          await store.uploadFromFile(local('Файл (копия).zip'), 'Каталог с пробелом/Вложенный/Архив №1.zip');
+          assert.strictEqual(fs.readFileSync(path.join(root, 'Каталог с пробелом', 'Вложенный', 'Архив №1.zip'), 'utf-8'), 'данные');
+        });
+
+        test('локального файла нет → отказ, цель не создана, остатков нет', async () => {
+          await assert.rejects(store.uploadFromFile(local('нет.bin'), 'dst/f.bin'), /нет\.bin/);
+          assert.strictEqual(fs.existsSync(path.join(root, 'dst', 'f.bin')), false);
+          assert.deepStrictEqual(fs.existsSync(path.join(root, 'dst')) ? fs.readdirSync(path.join(root, 'dst')) : [], []);
+        });
+
+        test('отмена до старта: AgentTransferCancelledError, прежняя цель цела, остатков нет', async () => {
+          await store.writeFile('keep/f.bin', 'прежнее');
+          fs.writeFileSync(local('src.bin'), bytesOf(100_000));
+          await assert.rejects(
+            store.uploadFromFile(local('src.bin'), 'keep/f.bin', { cancellation: { isCancellationRequested: true } }),
+            AgentTransferCancelledError
+          );
+          assert.strictEqual(fs.readFileSync(path.join(root, 'keep', 'f.bin'), 'utf-8'), 'прежнее');
+          assert.deepStrictEqual(fs.readdirSync(path.join(root, 'keep')), ['f.bin']);
+        });
+
+        test('отмена посреди передачи: прежняя цель цела (атомарность), временный файл удалён', async () => {
+          await store.writeFile('keep/f.bin', 'прежнее');
+          fs.writeFileSync(local('src.bin'), bytesOf(MULTI));
+          const cancellation = { isCancellationRequested: false };
+          await assert.rejects(
+            store.uploadFromFile(local('src.bin'), 'keep/f.bin', {
+              cancellation,
+              onProgress: () => { cancellation.isCancellationRequested = true; },
+            }),
+            AgentTransferCancelledError
+          );
+          assert.strictEqual(fs.readFileSync(path.join(root, 'keep', 'f.bin'), 'utf-8'), 'прежнее');
+          assert.deepStrictEqual(fs.readdirSync(path.join(root, 'keep')), ['f.bin']);
+        });
+
+        test('цель — каталог или под файлом-«каталогом» → отказ с путём', async () => {
+          await store.mkdirp('dirhere');
+          await store.writeFile('plain', '1');
+          fs.writeFileSync(local('src.bin'), 'x');
+          await assert.rejects(store.uploadFromFile(local('src.bin'), 'dirhere'), /dirhere/);
+          await assert.rejects(store.uploadFromFile(local('src.bin'), 'plain/child.bin'), /plain/);
+          assert.strictEqual(fs.readFileSync(path.join(root, 'plain'), 'utf-8'), '1');
+        });
+
+        test('".." и абсолютный путь отвергаются ДО обращения к серверу; ничего не создаётся', async () => {
+          fs.writeFileSync(local('src.bin'), 'x');
+          const before = requests();
+          for (const rel of ['..', '../x.bin', 'a/../../x.bin']) {
+            await assert.rejects(store.uploadFromFile(local('src.bin'), rel), /за пределы корня агента/, rel);
+          }
+          for (const rel of ['/etc/x.bin', 'C:/x.bin', 'C:\\x.bin']) {
+            await assert.rejects(store.uploadFromFile(local('src.bin'), rel), /относительным/, rel);
+          }
+          assert.strictEqual(requests(), before);
+          assert.deepStrictEqual(fs.readdirSync(fixture.parent), [path.basename(root)]);
+          assert.deepStrictEqual(fs.readdirSync(root), []);
+        });
       });
     });
   });

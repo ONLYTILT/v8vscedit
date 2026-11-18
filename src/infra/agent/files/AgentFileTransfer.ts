@@ -36,6 +36,24 @@ export interface AgentTransferFailure {
   readonly error: Error;
 }
 
+/**
+ * Потоковая передача (или упаковка/распаковка архива) прервана по запросу пользователя. Свой класс,
+ * а не `AgentSyncCancelledError`: слой `files/` не зависит от `sync/`, перевод — `withTransferCancellation`.
+ */
+export class AgentTransferCancelledError extends Error {
+  constructor() {
+    super('Передача файлов агента отменена.');
+    this.name = 'AgentTransferCancelledError';
+  }
+}
+
+/** Бросает {@link AgentTransferCancelledError}, если отмена уже запрошена. */
+export function throwIfTransferCancellationRequested(cancellation: AgentTransferCancellation | undefined): void {
+  if (cancellation?.isCancellationRequested) {
+    throw new AgentTransferCancelledError();
+  }
+}
+
 /** Отказ передачи: перечень всех файлов, на которых она упала (одновременно идущие тоже). */
 export class AgentTransferError extends Error {
   constructor(readonly failures: readonly AgentTransferFailure[]) {

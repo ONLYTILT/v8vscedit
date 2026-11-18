@@ -8,6 +8,7 @@ import {
   buildSyncManifestFiles,
   diffSyncFiles,
   loadSyncManifest,
+  mirrorCoverageOf,
   resolveSyncManifestPath,
   saveSyncManifest,
   type SyncManifest,
@@ -195,4 +196,73 @@ suite('SyncManifest (Э7)', () => {
       assert.deepStrictEqual(diffSyncFiles({ a: '1' }, {}).deleted, ['a']);
     });
   });
+});
+
+/**
+ * Полнота зеркала M в манифесте (`mirrorCoverage`): ось, ортогональная `empty | stale | fresh`. Поле
+ * необязательное — манифесты, записанные до его появления, описывали только полный M, поэтому отсутствие
+ * значит `full`; значение вне множества `full | sparse` делает манифест непригодным (как неверный
+ * `mirrorState`): откат к HashCache и `empty`.
+ */
+suite('SyncManifest: mirrorCoverage', () => {
+  let projectRoot: string;
+  let configRoot: string;
+  const scope = (): string => buildScopeKey('cf', configRoot);
+
+  setup(() => {
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-sync-coverage-'));
+    configRoot = path.join(projectRoot, 'src', 'cf');
+    fs.mkdirSync(configRoot, { recursive: true });
+    fs.writeFileSync(path.join(configRoot, 'Configuration.xml'), '<Configuration/>');
+  });
+  teardown(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
+
+  function writeRaw(value: Record<string, unknown>): void {
+    const file = resolveSyncManifestPath(projectRoot, scope());
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, scopeKey: scope(), mirrorState: 'fresh', files: { 'a.xml': 'h' }, ...value }));
+  }
+
+  for (const coverage of ['full', 'sparse'] as const) {
+    test(`round-trip: ${coverage} сохраняется и читается; поле лежит в файле манифеста`, () => {
+      const manifest: SyncManifest = { schemaVersion: 1, scopeKey: scope(), mirrorState: 'fresh', files: { 'a.xml': 'h' }, mirrorCoverage: coverage };
+      saveSyncManifest(projectRoot, manifest);
+      const loaded = loadSyncManifest(projectRoot, scope());
+      assert.strictEqual(loaded.mirrorCoverage, coverage);
+      assert.strictEqual(mirrorCoverageOf(loaded), coverage);
+      assert.strictEqual(loaded.mirrorState, 'fresh');
+      const raw = JSON.parse(fs.readFileSync(resolveSyncManifestPath(projectRoot, scope()), 'utf-8')) as Record<string, unknown>;
+      assert.strictEqual(raw.mirrorCoverage, coverage);
+    });
+  }
+
+  test('поле отсутствует (манифест прежней версии) → full; остальное читается как раньше', () => {
+    writeRaw({});
+    const loaded = loadSyncManifest(projectRoot, scope());
+    assert.strictEqual(mirrorCoverageOf(loaded), 'full');
+    assert.strictEqual(loaded.mirrorState, 'fresh');
+    assert.deepStrictEqual(loaded.files, { 'a.xml': 'h' });
+  });
+
+  test('манифест, которого нет вовсе (миграция с HashCache): полнота full, M empty', () => {
+    const loaded = loadSyncManifest(projectRoot, scope());
+    assert.strictEqual(loaded.mirrorState, 'empty');
+    assert.strictEqual(mirrorCoverageOf(loaded), 'full');
+  });
+
+  for (const bad of ['partial', 'FULL', '', 42, true, [], {}]) {
+    test(`значение вне множества (${JSON.stringify(bad)}) → манифест отвергнут: откат к HashCache, M empty, файлы из кэша хэшей`, () => {
+      writeRaw({ mirrorCoverage: bad });
+      saveHashCache(projectRoot, {
+        schemaVersion: 1,
+        scopeKey: scope(),
+        generatedAt: new Date(0).toISOString(),
+        files: { 'cache.xml': 'c' },
+      });
+      const loaded = loadSyncManifest(projectRoot, scope());
+      assert.strictEqual(loaded.mirrorState, 'empty');
+      assert.deepStrictEqual(loaded.files, { 'cache.xml': 'c' });
+      assert.strictEqual(mirrorCoverageOf(loaded), 'full');
+    });
+  }
 });

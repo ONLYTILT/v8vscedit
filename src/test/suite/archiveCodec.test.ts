@@ -7,7 +7,7 @@ import {
   ArchiveFormatError,
   extractArchive,
   packArchive,
-  packDirectoryFiles,
+  packDirectoryFilesToFile,
   type ArchiveEntry,
 } from '../../infra/agent/sync/ArchiveCodec';
 import { EXAMPLE_GENERATIONS, skipWithoutCorpus } from './support/corpus';
@@ -21,6 +21,22 @@ import { buildZip, patternBytes, readZip, readZipAsMap } from './support/zipFixt
  * запись: повреждённый архив не должен оставить приёмник с частью файлов (движок пишет в проект из
  * приёмника).
  */
+
+/**
+ * Упаковка каталога потоком в файл и чтение его обратно: прежний `packDirectoryFiles` (архив целиком в
+ * памяти) удалён планом потокового архива, а его проверки (ровно перечисленные файлы, имена POSIX,
+ * отказ на отсутствующем файле) переносятся на `packDirectoryFilesToFile` без изменения ожиданий.
+ */
+async function packDirectoryFiles(rootDir: string, rels: readonly string[]): Promise<Uint8Array> {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-archive-out-'));
+  try {
+    const outFile = path.join(outDir, 'out.zip');
+    await packDirectoryFilesToFile(rootDir, rels, outFile);
+    return fs.readFileSync(outFile);
+  } finally {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+}
 
 async function collect(zip: Uint8Array): Promise<Map<string, Buffer>> {
   const result = new Map<string, Buffer>();
@@ -253,23 +269,23 @@ suite('ArchiveCodec.packArchive / packDirectoryFiles (Э7)', () => {
       fs.writeFileSync(abs, data);
     }
 
-    test('пакует ровно перечисленные файлы каталога, имена — POSIX от корня каталога', () => {
+    test('пакует ровно перечисленные файлы каталога, имена — POSIX от корня каталога', async () => {
       put('Configuration.xml', '<c/>');
       put('Catalogs/Товары.xml', '<t/>');
       put('Catalogs/Товары/Ext/ObjectModule.bsl', 'Процедура А() КонецПроцедуры');
       put('Лишний.xml', '<no/>');
-      const map = readZipAsMap(packDirectoryFiles(tempRoot, ['Configuration.xml', 'Catalogs/Товары.xml', 'Catalogs/Товары/Ext/ObjectModule.bsl']));
+      const map = readZipAsMap(await packDirectoryFiles(tempRoot, ['Configuration.xml', 'Catalogs/Товары.xml', 'Catalogs/Товары/Ext/ObjectModule.bsl']));
       assert.deepStrictEqual([...map.keys()], ['Configuration.xml', 'Catalogs/Товары.xml', 'Catalogs/Товары/Ext/ObjectModule.bsl']);
       assert.strictEqual(map.get('Catalogs/Товары.xml')?.toString('utf-8'), '<t/>');
     });
 
-    test('файла нет → ошибка с именем файла (архив с дырой в загрузку не уйдёт)', () => {
+    test('файла нет → ошибка с именем файла (архив с дырой в загрузку не уйдёт)', async () => {
       put('a.xml', '1');
-      assert.throws(() => packDirectoryFiles(tempRoot, ['a.xml', 'Catalogs/Нет.xml']), /Нет\.xml/);
+      await assert.rejects(packDirectoryFiles(tempRoot, ['a.xml', 'Catalogs/Нет.xml']), /Нет\.xml/);
     });
 
-    test('пустой список → пустой архив', () => {
-      assert.strictEqual(readZip(packDirectoryFiles(tempRoot, [])).length, 0);
+    test('пустой список → пустой архив', async () => {
+      assert.strictEqual(readZip(await packDirectoryFiles(tempRoot, [])).length, 0);
     });
   });
 
@@ -303,7 +319,7 @@ suite('ArchiveCodec.packArchive / packDirectoryFiles (Э7)', () => {
       }
       assert.ok(rels.length > 100, `файлов в выборке: ${String(rels.length)}`);
 
-      const zip = packDirectoryFiles(root, rels);
+      const zip = await packDirectoryFiles(root, rels);
       const outRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-archive-corpus-'));
       try {
         const count = await extractArchive(zip, (entry) => {
@@ -375,7 +391,10 @@ suite('ArchiveCodec: повреждённые заголовки zip (Н39)', ()
 
   test('данные записи за пределами архива: размер больше буфера и маркер zip64', async () => {
     const big = sample();
+    // Запись без сжатия: оба размера сдвинуты согласованно (иначе отказ раньше — «размеры не совпадают»),
+    // чтобы проверялась именно граница данных записи.
     big.zip.writeUInt32LE(big.zip.length, big.central + 20);
+    big.zip.writeUInt32LE(big.zip.length, big.central + 24);
     await rejectsFormat(big.zip, /за пределами архива/);
     const zip64 = sample();
     zip64.zip.writeUInt32LE(0xffffffff, zip64.central + 20);
@@ -391,7 +410,8 @@ suite('ArchiveCodec: повреждённые заголовки zip (Н39)', ()
   test('размер распакованных данных не совпадает с заголовком (запись без сжатия)', async () => {
     const { zip, central } = sample();
     zip.writeUInt32LE(zip.readUInt32LE(central + 24) + 1, central + 24);
-    await rejectsFormat(zip, /контрольная сумма/);
+    // У записи без сжатия размеры обязаны совпадать — расхождение ловится уже при разборе каталога.
+    await rejectsFormat(zip, /размеры не совпадают/);
   });
 
   test('длинный буфер без записи конца каталога: поиск ограничен окном комментария и даёт отказ', async () => {

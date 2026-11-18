@@ -3,15 +3,16 @@ import * as path from 'path';
 import { buildDumpConfigToFilesCommand, buildLoadConfigFromFilesCommand } from '../../../domain/agent/AgentCommand';
 import { collectConfigFilesForLoad } from '../ConfigLoadFileCollector';
 import { uploadFiles } from '../files/AgentFileTransfer';
-import { packDirectoryFiles } from './ArchiveCodec';
+import { packDirectoryFilesToFile } from './ArchiveCodec';
 import { CONFIG_DUMP_INFO_XML, CONFIGURATION_XML, listProjectFiles, toProjectPath } from './ProjectFiles';
 import {
   EXCHANGE_ARCHIVE,
   exchangeDirOf,
   throwIfCancelled,
+  withTransferCancellation,
   type SyncOperationContext,
 } from './SyncContext';
-import { buildSyncManifestFiles, type SyncMirrorState } from './SyncManifest';
+import { buildSyncManifestFiles, type SyncMirrorCoverage, type SyncMirrorState } from './SyncManifest';
 import { planLoad, type LoadFullReason } from './SyncPlanner';
 
 /**
@@ -35,6 +36,11 @@ export interface AgentLoadOutcome {
   readonly files: Record<string, string>;
   /** Состояние M после операции. */
   readonly mirrorState: SyncMirrorState;
+  /**
+   * Полнота M после операции: разреженность снимает только полная выгрузка в M без `--update`
+   * (`full-dump`); `refresh-dump` после полной загрузки консервативно её сохраняет.
+   */
+  readonly mirrorCoverage: SyncMirrorCoverage;
 }
 
 /** Сообщения прежнего AgentOperationService сохраняются дословно: на них опираются пользователи и тесты. */
@@ -46,6 +52,11 @@ const FULL_REASON_MESSAGES: Readonly<Record<LoadFullReason, string>> = {
 };
 
 export async function runLoad(context: SyncOperationContext, mode: AgentLoadMode): Promise<AgentLoadOutcome> {
+  const outcome = await loadWithPlan(context, mode);
+  return { ...outcome, mirrorCoverage: context.mirror.coverage };
+}
+
+async function loadWithPlan(context: SyncOperationContext, mode: AgentLoadMode): Promise<Omit<AgentLoadOutcome, 'mirrorCoverage'>> {
   const projectDir = context.target.rootPath;
   if (!fs.existsSync(projectDir)) {
     throw new Error(`${mode === 'full' ? 'Каталог источника не найден' : 'Каталог исходников не найден'}: ${projectDir}`);
@@ -84,8 +95,9 @@ export async function runLoad(context: SyncOperationContext, mode: AgentLoadMode
   const mirror = context.workspace.targetAgentDir;
   switch (plan.prepareMirror) {
     case 'full-copy':
-      // Конфигуратору на `--partial` нужен целостный каркас выгрузки в `--dir` (Configuration.xml,
-      // родительские XML модулей форм и т.д.); без него агент валится в пустой UnknownError.
+      // Без каркаса в `--dir` агент на `--partial` валится в пустой UnknownError. Достаточно файла
+      // версий, Configuration.xml и файлов списка (пилот, эксперименты 9/10), но локальный M
+      // копируется из P целиком: так он остаётся полным, и локальный импорт сравнивает его с P.
       context.markMirrorMutated();
       await mirrorProjectToAgent(context);
       break;
@@ -101,6 +113,7 @@ export async function runLoad(context: SyncOperationContext, mode: AgentLoadMode
       context.markMirrorMutated();
       await context.store.remove(mirror, { recursive: true });
       await context.exec.execute(buildDumpConfigToFilesCommand(mirror, { extensionName: context.extensionName, force: true }));
+      context.mirror.coverage = 'full';
       break;
     case 'none':
       break;
@@ -163,7 +176,15 @@ async function loadFullByArchive(context: SyncOperationContext): Promise<SyncMir
   // Файл версий проекта может быть устаревшим, а загрузке он не нужен.
   const files = listProjectFiles(projectDir).filter((rel) => rel !== CONFIG_DUMP_INFO_XML);
   const exchangeDir = exchangeDirOf(context);
-  await context.store.writeFile(`${exchangeDir}/${EXCHANGE_ARCHIVE}`, packDirectoryFiles(projectDir, files));
+  const cancellation = context.hooks?.cancellation;
+  // Архив собирается потоком в локальный файл и закачивается потоком: P большой конфигурации —
+  // гигабайты XML, и ни архив, ни его содержимое целиком в памяти не держатся.
+  const zipPath = await context.localExchange.file(EXCHANGE_ARCHIVE);
+  await withTransferCancellation(async () => {
+    await packDirectoryFilesToFile(projectDir, files, zipPath, cancellation);
+    throwIfCancelled(context);
+    await context.store.uploadFromFile(zipPath, `${exchangeDir}/${EXCHANGE_ARCHIVE}`, { cancellation });
+  });
   throwIfCancelled(context);
   context.hooks?.onMessage?.('Полная загрузка конфигурации из архива.');
   await context.exec.execute(buildLoadConfigFromFilesCommand(exchangeDir, {

@@ -2,13 +2,18 @@ import { deflateSync, inflateSync } from 'fflate';
 import * as fs from 'fs';
 import { decode } from 'iconv-lite';
 import * as path from 'path';
+import { throwIfTransferCancellationRequested, type AgentTransferCancellation } from '../files/AgentFileTransfer';
+import { writeZipToFile } from './ArchiveFile';
 import {
   ArchiveFormatError,
+  bufferByteSource,
   crc32,
   localDataStart,
   readCentralRecords,
   writeZip,
+  type ZipByteSource,
   type ZipCentralRecord,
+  type ZipWriteRecord,
 } from './ZipContainer';
 
 export { ArchiveFormatError } from './ZipContainer';
@@ -20,10 +25,10 @@ export { ArchiveFormatError } from './ZipContainer';
  * `zipSync`/`unzipSync` fflate не отдают флаг UTF-8 записи (а без него имя — cp866, которое fflate
  * прочёл бы как latin1) и не дают выставить флаг всем записям, как это делает платформа (пилот §5b п.7).
  *
- * Распаковка — «всё или ничего»: сначала каждая запись инфлируется и сверяется по CRC32, и только
- * потом приёмнику отдаётся первая. Движок пишет из приёмника прямо в проект, и повреждённый архив
- * иначе оставил бы выгрузку с частью новых файлов. Повторная инфляция на втором проходе дешевле,
- * чем держать в памяти всю распакованную выгрузку.
+ * Архив читается с произвольным доступом ({@link openArchive}) и пишется потоком
+ * ({@link packDirectoryFilesToFile}): в памяти — одна запись (сжатая и распакованная) и центральный
+ * каталог, а не весь архив. Запись в проект — «всё или ничего»: `scan` инфлирует и сверяет по CRC32
+ * каждую запись до первой записи в проект, а `read` отдаёт только нужные, перепроверяя CRC.
  */
 
 export interface ArchiveEntry {
@@ -33,6 +38,18 @@ export interface ArchiveEntry {
 }
 
 export type ArchiveSink = (entry: ArchiveEntry) => void | Promise<void>;
+
+export interface ArchiveReader {
+  /** Файлы архива в порядке центрального каталога (без записей-каталогов). */
+  readonly paths: readonly string[];
+  /**
+   * Один валидирующий проход (inflate + CRC каждой записи); `visitor` получает путь и данные каждого
+   * файла. Писать в проект отсюда нельзя: валидность всего архива известна только после прохода.
+   */
+  scan(visitor: ArchiveSink, cancellation?: AgentTransferCancellation): Promise<number>;
+  /** Только перечисленные записи (в порядке каталога), CRC перепроверяется; неизвестный путь — отказ до приёмника. */
+  read(paths: ReadonlySet<string>, sink: ArchiveSink): Promise<void>;
+}
 
 const UTF8_FLAG = 0x0800;
 const METHOD_STORE = 0;
@@ -55,74 +72,137 @@ interface ArchiveRecord {
   readonly path: string;
   readonly isDirectory: boolean;
   readonly central: ZipCentralRecord;
-  readonly dataStart: number;
 }
 
-export async function extractArchive(zip: Uint8Array, sink: ArchiveSink): Promise<number> {
-  const buffer = Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength);
-  const records = readCentralRecords(buffer).map((central): ArchiveRecord => {
+/**
+ * Читатель архива поверх источника: центральный каталог читается и проверяется сразу (имена,
+ * размеры, zip-slip), данные записей — по требованию.
+ */
+export async function openArchive(source: ZipByteSource): Promise<ArchiveReader> {
+  const records = (await readCentralRecords(source)).map((central): ArchiveRecord => {
     const rawName = (central.flags & UTF8_FLAG) !== 0 ? central.nameBytes.toString('utf-8') : decode(central.nameBytes, 'cp866');
     assertSafeSize(central, rawName);
-    return {
-      path: normalizeEntryPath(rawName),
-      isDirectory: /[/\\]$/.test(rawName),
-      central,
-      dataStart: localDataStart(buffer, central, rawName),
-    };
+    return { path: normalizeEntryPath(rawName), isDirectory: /[/\\]$/.test(rawName), central };
   });
-  for (const record of records) {
-    inflateRecord(buffer, record);
+  return new SourceArchiveReader(source, records);
+}
+
+class SourceArchiveReader implements ArchiveReader {
+  readonly paths: readonly string[];
+
+  constructor(private readonly source: ZipByteSource, private readonly records: readonly ArchiveRecord[]) {
+    this.paths = records.filter((record) => !record.isDirectory).map((record) => record.path);
   }
-  let count = 0;
-  for (const record of records) {
-    if (record.isDirectory) {
-      continue;
+
+  async scan(visitor: ArchiveSink, cancellation?: AgentTransferCancellation): Promise<number> {
+    let count = 0;
+    for (const record of this.records) {
+      throwIfTransferCancellationRequested(cancellation);
+      // Записи-каталоги тоже проверяются: битая запись любого вида означает испорченный архив.
+      const data = await this.inflate(record);
+      if (record.isDirectory) {
+        continue;
+      }
+      await visitor({ path: record.path, data });
+      count += 1;
     }
-    await sink({ path: record.path, data: inflateRecord(buffer, record) });
-    count += 1;
+    return count;
   }
+
+  async read(paths: ReadonlySet<string>, sink: ArchiveSink): Promise<void> {
+    const known = new Set(this.paths);
+    const missing = [...paths].filter((rel) => !known.has(rel));
+    if (missing.length > 0) {
+      throw new ArchiveFormatError(`В архиве нет запрошенных записей: ${missing.join(', ')}.`);
+    }
+    for (const record of this.records) {
+      if (!record.isDirectory && paths.has(record.path)) {
+        await sink({ path: record.path, data: await this.inflate(record) });
+      }
+    }
+  }
+
+  private async inflate(record: ArchiveRecord): Promise<Uint8Array> {
+    const { central } = record;
+    const start = await localDataStart(this.source, central, record.path);
+    return decodeRecord(record, await this.source.read(start, central.compressedSize));
+  }
+}
+
+/** Архив в памяти целиком (небольшие архивы, тесты): прежняя семантика «всё или ничего». */
+export async function extractArchive(zip: Uint8Array, sink: ArchiveSink): Promise<number> {
+  const reader = await openArchive(bufferByteSource(Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength)));
+  await reader.scan(() => undefined);
+  let count = 0;
+  await reader.read(new Set(reader.paths), async (entry) => {
+    count += 1;
+    await sink(entry);
+  });
   return count;
 }
 
 export function packArchive(entries: readonly ArchiveEntry[]): Uint8Array {
-  return writeZip(entries.map((entry) => {
-    const deflated = deflateSync(entry.data);
-    const method = deflated.length < entry.data.length ? METHOD_DEFLATE : METHOD_STORE;
-    return {
-      nameBytes: Buffer.from(normalizeEntryPath(entry.path), 'utf-8'),
-      flags: UTF8_FLAG,
-      method,
-      crc: crc32(entry.data),
-      size: entry.data.length,
-      payload: method === METHOD_DEFLATE ? deflated : entry.data,
-    };
-  }));
+  return writeZip(entries.map(toWriteRecord));
 }
 
-/** Архив из перечисленных файлов каталога; отсутствующий файл — отказ (архив с дырой не загружается). */
-export function packDirectoryFiles(rootDir: string, relativePaths: readonly string[]): Uint8Array {
-  const entries = relativePaths.map((rel) => {
-    try {
-      return { path: rel, data: fs.readFileSync(path.join(rootDir, ...rel.split('/'))) };
-    } catch (error) {
-      throw new Error(`Не удалось прочитать файл "${rel}" для архива: ${(error as Error).message}`, { cause: error });
+/**
+ * Архив из перечисленных файлов каталога прямо в новый файл, по одному файлу (чтение → сжатие →
+ * запись). Отсутствующий файл или отмена — отказ, недописанный архив удаляется: архив с дырой не
+ * должен уйти в загрузку. Байты те же, что у {@link packArchive}.
+ */
+export async function packDirectoryFilesToFile(
+  rootDir: string,
+  relativePaths: readonly string[],
+  outFile: string,
+  cancellation?: AgentTransferCancellation
+): Promise<void> {
+  throwIfTransferCancellationRequested(cancellation);
+  await writeZipToFile(outFile, async (writer) => {
+    for (const rel of relativePaths) {
+      throwIfTransferCancellationRequested(cancellation);
+      let data: Buffer;
+      try {
+        data = await fs.promises.readFile(path.join(rootDir, ...rel.split('/')));
+      } catch (error) {
+        throw new Error(`Не удалось прочитать файл "${rel}" для архива: ${(error as Error).message}`, { cause: error });
+      }
+      await writer.add(toWriteRecord({ path: rel, data }));
     }
   });
-  return packArchive(entries);
+}
+
+function toWriteRecord(entry: ArchiveEntry): ZipWriteRecord {
+  const deflated = deflateSync(entry.data);
+  const method = deflated.length < entry.data.length ? METHOD_DEFLATE : METHOD_STORE;
+  return {
+    nameBytes: Buffer.from(normalizeEntryPath(entry.path), 'utf-8'),
+    flags: UTF8_FLAG,
+    method,
+    crc: crc32(entry.data),
+    size: entry.data.length,
+    payload: method === METHOD_DEFLATE ? deflated : entry.data,
+  };
 }
 
 function assertSafeSize(central: ZipCentralRecord, name: string): void {
   if (central.size > MAX_ENTRY_SIZE) {
     throw new ArchiveFormatError(`Запись архива "${name}" больше допустимого размера (${String(central.size)} байт).`);
   }
+  // Сжатые данные читаются в память целиком: без предела битый заголовок заставил бы выделить
+  // буфер размером с архив.
+  if (central.compressedSize > MAX_ENTRY_SIZE) {
+    throw new ArchiveFormatError(`Сжатые данные записи архива "${name}" больше допустимого размера (${String(central.compressedSize)} байт).`);
+  }
+  if (central.method === METHOD_STORE && central.compressedSize !== central.size) {
+    throw new ArchiveFormatError(`Повреждённый zip: у записи без сжатия "${name}" размеры не совпадают.`);
+  }
   if (central.size > RATIO_CHECK_FROM && central.size > central.compressedSize * MAX_COMPRESSION_RATIO) {
     throw new ArchiveFormatError(`Запись архива "${name}" сжата подозрительно сильно (zip-бомба?).`);
   }
 }
 
-function inflateRecord(buffer: Buffer, record: ArchiveRecord): Uint8Array {
+function decodeRecord(record: ArchiveRecord, payload: Uint8Array): Uint8Array {
   const { central } = record;
-  const payload = buffer.subarray(record.dataStart, record.dataStart + central.compressedSize);
   let data: Uint8Array;
   if (central.method === METHOD_STORE) {
     data = payload;

@@ -2,7 +2,9 @@ import type { AgentCommandExecutor } from '../AgentInfoBaseSession';
 import type { AgentConfigurationOperationTarget, AgentOperationHooks } from '../AgentOperationService';
 import type { AgentWorkspacePaths, AgentWorkspaceService } from '../AgentWorkspaceService';
 import type { AgentFileStore } from '../files/AgentFileStore';
-import type { SyncManifest } from './SyncManifest';
+import { AgentTransferCancelledError } from '../files/AgentFileTransfer';
+import type { LocalExchange } from './LocalExchange';
+import type { SyncManifest, SyncMirrorCoverage } from './SyncManifest';
 
 /** Операция синхронизации прервана по запросу пользователя. */
 export class AgentSyncCancelledError extends Error {
@@ -29,6 +31,10 @@ export interface SyncOperationContext {
   readonly operationId: string;
   readonly archiveThresholdFiles: number;
   readonly transferConcurrency: number;
+  /** Локальный каталог обмена операции (архив выгрузки на этой машине); убирает движок. */
+  readonly localExchange: LocalExchange;
+  /** Полнота M; меняют стратегии (посев — `sparse`, полная выгрузка в M — `full`). */
+  readonly mirror: { coverage: SyncMirrorCoverage };
   /**
    * Ставится ПЕРЕД командой или записью, меняющей M: при сбое после неё M уже не соответствует
    * B, и следующий импорт обязан идти полным путём (`mirrorState: 'empty'`).
@@ -39,6 +45,18 @@ export interface SyncOperationContext {
 export function throwIfCancelled(context: Pick<SyncOperationContext, 'hooks'>): void {
   if (context.hooks?.cancellation?.isCancellationRequested) {
     throw new AgentSyncCancelledError();
+  }
+}
+
+/**
+ * Отмена потоковой передачи или распаковки (слой `files/`, свой класс ошибки) — это отмена операции
+ * синхронизации: наружу уходит `AgentSyncCancelledError`, прочие отказы — как есть.
+ */
+export async function withTransferCancellation<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    throw error instanceof AgentTransferCancelledError ? new AgentSyncCancelledError() : error;
   }
 }
 

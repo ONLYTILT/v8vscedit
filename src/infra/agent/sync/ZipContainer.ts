@@ -5,6 +5,10 @@
  * zip64 обязателен на чтение и на запись: выгрузка реальной конфигурации — больше 65 535 файлов
  * (корпус example/2.20 — 104 238), а 16-битный счётчик записей обычного zip на ней переполняется.
  * Пишется zip64 только когда без него нельзя, иначе — обычный формат.
+ *
+ * Чтение идёт через {@link ZipByteSource} (случайный доступ), запись — через {@link ZipStreamWriter}
+ * (сразу в приёмник): архив выгрузки большой конфигурации — сотни мегабайт, и буфер размером с
+ * архив упирался в «Array buffer allocation failed». В памяти держится только центральный каталог.
  */
 
 export class ArchiveFormatError extends Error {
@@ -35,6 +39,18 @@ export interface ZipWriteRecord {
   readonly payload: Uint8Array;
 }
 
+/** Байты архива с произвольным доступом: буфер или файл на диске. */
+export interface ZipByteSource {
+  readonly size: number;
+  /** Ровно `length` байт с `offset`; диапазон за пределами источника — `ArchiveFormatError`. */
+  read(offset: number, length: number): Promise<Buffer>;
+}
+
+/** Приёмник байтов архива: следующий `write` — после завершения предыдущего. */
+export interface ZipByteSink {
+  write(chunk: Uint8Array): Promise<void>;
+}
+
 const LOCAL_SIGNATURE = 0x04034b50;
 const CENTRAL_SIGNATURE = 0x02014b50;
 const END_SIGNATURE = 0x06054b50;
@@ -46,6 +62,14 @@ const LOCATOR64_SIZE = 20;
 const CENTRAL_HEADER_SIZE = 46;
 const LOCAL_HEADER_SIZE = 30;
 const MAX_COMMENT = 0xffff;
+/** Хвост, в котором обязана лежать запись конца каталога (с комментарием) и локатор zip64. */
+const TAIL_WINDOW = END_RECORD_SIZE + MAX_COMMENT + LOCATOR64_SIZE;
+/**
+ * Предел центрального каталога, который читается в память целиком. Каталог пропорционален числу
+ * записей, а не объёму данных (104 тыс. записей ≈ 15–20 МБ); больше — порча или чужой файл, под
+ * который иначе выделился бы буфер заявленного размера.
+ */
+const MAX_CENTRAL_DIRECTORY = 256 * 1024 * 1024;
 const ZIP64_EXTRA_ID = 0x0001;
 const MARKER32 = 0xffffffff;
 const MARKER16 = 0xffff;
@@ -54,13 +78,36 @@ const DOS_DATE = 0x21;
 const VERSION = 20;
 const VERSION_ZIP64 = 45;
 
+// --- источники ---------------------------------------------------------------------------
+
+export function bufferByteSource(buffer: Buffer): ZipByteSource {
+  return {
+    size: buffer.length,
+    // Исключение исполнителя Promise становится отказом: проверка диапазона — тем же каналом, что у файла.
+    read: (offset, length) => new Promise((resolve) => {
+      assertWithinSource(offset, length, buffer.length);
+      resolve(buffer.subarray(offset, offset + length));
+    }),
+  };
+}
+
+/** Общая проверка диапазона чтения для всех источников. */
+export function assertWithinSource(offset: number, length: number, size: number): void {
+  if (offset < 0 || length < 0 || offset + length > size) {
+    throw new ArchiveFormatError(
+      `Повреждённый zip: чтение ${String(length)} байт с позиции ${String(offset)} за пределами архива (${String(size)} байт).`
+    );
+  }
+}
+
 // --- чтение ------------------------------------------------------------------------------
 
-export function readCentralRecords(buffer: Buffer): ZipCentralRecord[] {
-  const directory = locateCentralDirectory(buffer);
+export async function readCentralRecords(source: ZipByteSource): Promise<ZipCentralRecord[]> {
+  const directory = await locateCentralDirectory(source);
+  const buffer = await source.read(directory.offset, directory.size);
   const records: ZipCentralRecord[] = [];
-  let cursor = directory.offset;
-  const end = directory.offset + directory.size;
+  let cursor = 0;
+  const end = directory.size;
   for (let index = 0; index < directory.count; index += 1) {
     if (cursor + CENTRAL_HEADER_SIZE > end || buffer.readUInt32LE(cursor) !== CENTRAL_SIGNATURE) {
       throw new ArchiveFormatError(`Повреждённый zip: запись центрального каталога №${String(index + 1)}.`);
@@ -90,20 +137,24 @@ export function readCentralRecords(buffer: Buffer): ZipCentralRecord[] {
   if (cursor !== end) {
     throw new ArchiveFormatError(
       `Повреждённый zip: центральный каталог прочитан не целиком (записей ${String(directory.count)}, ` +
-      `прочитано ${String(cursor - directory.offset)} из ${String(directory.size)} байт).`
+      `прочитано ${String(cursor)} из ${String(directory.size)} байт).`
     );
   }
   return records;
 }
 
 /** Начало данных записи: локальный заголовок может нести свои name/extra, отличные от центральных. */
-export function localDataStart(buffer: Buffer, record: ZipCentralRecord, name: string): number {
+export async function localDataStart(source: ZipByteSource, record: ZipCentralRecord, name: string): Promise<number> {
   const { localOffset, compressedSize } = record;
-  if (localOffset + LOCAL_HEADER_SIZE > buffer.length || buffer.readUInt32LE(localOffset) !== LOCAL_SIGNATURE) {
+  if (localOffset + LOCAL_HEADER_SIZE > source.size) {
     throw new ArchiveFormatError(`Повреждённый zip: локальный заголовок записи "${name}".`);
   }
-  const start = localOffset + LOCAL_HEADER_SIZE + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
-  if (start + compressedSize > buffer.length) {
+  const header = await source.read(localOffset, LOCAL_HEADER_SIZE);
+  if (header.readUInt32LE(0) !== LOCAL_SIGNATURE) {
+    throw new ArchiveFormatError(`Повреждённый zip: локальный заголовок записи "${name}".`);
+  }
+  const start = localOffset + LOCAL_HEADER_SIZE + header.readUInt16LE(26) + header.readUInt16LE(28);
+  if (start + compressedSize > source.size) {
     throw new ArchiveFormatError(`Повреждённый zip: данные записи "${name}" за пределами архива.`);
   }
   return start;
@@ -115,43 +166,63 @@ interface DirectoryLocation {
   readonly offset: number;
 }
 
-function locateCentralDirectory(buffer: Buffer): DirectoryLocation {
-  const end = findEndRecord(buffer);
+/**
+ * Хвост читается одним запросом: запись конца с комментарием и локатор zip64 обязаны в нём лежать.
+ * Запись конца zip64 при максимальном комментарии оказывается ниже окна — тогда её отдельное чтение.
+ */
+async function locateCentralDirectory(source: ZipByteSource): Promise<DirectoryLocation> {
+  if (source.size < END_RECORD_SIZE) {
+    throw new ArchiveFormatError('Не zip-архив: нет записи конца центрального каталога.');
+  }
+  const tailStart = Math.max(0, source.size - TAIL_WINDOW);
+  const tail = await source.read(tailStart, source.size - tailStart);
+  const end = findEndRecord(tail);
   const locator = end - LOCATOR64_SIZE;
   let location: DirectoryLocation;
   let limit: number;
-  if (locator >= 0 && buffer.readUInt32LE(locator) === LOCATOR64_SIGNATURE) {
-    const end64 = readUInt64(buffer, locator + 8, 'смещение записи конца каталога zip64');
-    if (end64 + END64_RECORD_SIZE > locator || buffer.readUInt32LE(end64) !== END64_SIGNATURE) {
+  if (locator >= 0 && tail.readUInt32LE(locator) === LOCATOR64_SIGNATURE) {
+    const end64 = readUInt64(tail, locator + 8, 'смещение записи конца каталога zip64');
+    if (end64 + END64_RECORD_SIZE > tailStart + locator) {
+      throw new ArchiveFormatError('Повреждённый zip: запись конца центрального каталога zip64.');
+    }
+    const record = end64 >= tailStart
+      ? tail.subarray(end64 - tailStart, end64 - tailStart + END64_RECORD_SIZE)
+      : await source.read(end64, END64_RECORD_SIZE);
+    if (record.readUInt32LE(0) !== END64_SIGNATURE) {
       throw new ArchiveFormatError('Повреждённый zip: запись конца центрального каталога zip64.');
     }
     location = {
-      count: readUInt64(buffer, end64 + 32, 'число записей'),
-      size: readUInt64(buffer, end64 + 40, 'размер центрального каталога'),
-      offset: readUInt64(buffer, end64 + 48, 'смещение центрального каталога'),
+      count: readUInt64(record, 32, 'число записей'),
+      size: readUInt64(record, 40, 'размер центрального каталога'),
+      offset: readUInt64(record, 48, 'смещение центрального каталога'),
     };
     limit = end64;
   } else {
     location = {
-      count: buffer.readUInt16LE(end + 10),
-      size: buffer.readUInt32LE(end + 12),
-      offset: buffer.readUInt32LE(end + 16),
+      count: tail.readUInt16LE(end + 10),
+      size: tail.readUInt32LE(end + 12),
+      offset: tail.readUInt32LE(end + 16),
     };
     if (location.count === MARKER16 || location.size === MARKER32 || location.offset === MARKER32) {
       throw new ArchiveFormatError('Повреждённый zip: поля zip64 без записи конца каталога zip64.');
     }
-    limit = end;
+    limit = tailStart + end;
   }
   if (location.offset + location.size > limit) {
     throw new ArchiveFormatError('Повреждённый zip: центральный каталог вне архива.');
   }
+  if (location.size > MAX_CENTRAL_DIRECTORY) {
+    throw new ArchiveFormatError(
+      `Повреждённый zip: центральный каталог ${String(location.size)} байт больше допустимого (${String(MAX_CENTRAL_DIRECTORY)}).`
+    );
+  }
   return location;
 }
 
-function findEndRecord(buffer: Buffer): number {
-  const lowest = Math.max(0, buffer.length - END_RECORD_SIZE - MAX_COMMENT);
-  for (let at = buffer.length - END_RECORD_SIZE; at >= lowest; at -= 1) {
-    if (buffer.readUInt32LE(at) === END_SIGNATURE) {
+function findEndRecord(tail: Buffer): number {
+  const lowest = Math.max(0, tail.length - END_RECORD_SIZE - MAX_COMMENT);
+  for (let at = tail.length - END_RECORD_SIZE; at >= lowest; at -= 1) {
+    if (tail.readUInt32LE(at) === END_SIGNATURE) {
       return at;
     }
   }
@@ -198,49 +269,89 @@ function readUInt64(buffer: Buffer, at: number, what: string): number {
 // --- запись ------------------------------------------------------------------------------
 
 /**
- * Архив из подготовленных записей. Отдельные записи и смещения больше 4 ГБ не поддерживаются:
- * архив целиком собирается в памяти, и такой размер упрётся в память раньше, чем в формат.
+ * Потоковый писатель: локальный заголовок и данные записи уходят в приёмник сразу, в памяти
+ * остаются только записи центрального каталога (46 байт + имя на запись). Отдельные записи и
+ * смещения больше 4 ГБ не поддерживаются (zip64-смещения при записи — бэклог).
  */
+export class ZipStreamWriter {
+  private readonly central: Buffer[] = [];
+  private count = 0;
+  private offset = 0;
+
+  constructor(private readonly sink: ZipByteSink) {}
+
+  async add(record: ZipWriteRecord): Promise<void> {
+    const local = encodeLocalHeader(record);
+    this.central.push(encodeCentralHeader(record, this.offset));
+    this.count += 1;
+    this.offset += local.length + record.payload.length;
+    assertBelow4GiB(this.offset);
+    await this.sink.write(local);
+    await this.sink.write(record.payload);
+  }
+
+  async finish(): Promise<void> {
+    await this.sink.write(encodeDirectoryAndTail(this.central, this.count, this.offset));
+  }
+}
+
+/** Архив целиком в памяти — для небольших архивов и тестов; байты те же, что у {@link ZipStreamWriter}. */
 export function writeZip(records: readonly ZipWriteRecord[]): Buffer {
-  const localParts: Uint8Array[] = [];
-  const centralParts: Buffer[] = [];
+  const parts: Uint8Array[] = [];
+  const central: Buffer[] = [];
   let offset = 0;
   for (const record of records) {
-    const local = Buffer.alloc(LOCAL_HEADER_SIZE);
-    local.writeUInt32LE(LOCAL_SIGNATURE, 0);
-    local.writeUInt16LE(VERSION, 4);
-    local.writeUInt16LE(record.flags, 6);
-    local.writeUInt16LE(record.method, 8);
-    local.writeUInt16LE(DOS_DATE, 12);
-    local.writeUInt32LE(record.crc, 14);
-    local.writeUInt32LE(record.payload.length, 18);
-    local.writeUInt32LE(record.size, 22);
-    local.writeUInt16LE(record.nameBytes.length, 26);
-    localParts.push(local, record.nameBytes, record.payload);
-
-    const central = Buffer.alloc(CENTRAL_HEADER_SIZE);
-    central.writeUInt32LE(CENTRAL_SIGNATURE, 0);
-    central.writeUInt16LE(VERSION, 4);
-    central.writeUInt16LE(VERSION, 6);
-    central.writeUInt16LE(record.flags, 8);
-    central.writeUInt16LE(record.method, 10);
-    central.writeUInt16LE(DOS_DATE, 14);
-    central.writeUInt32LE(record.crc, 16);
-    central.writeUInt32LE(record.payload.length, 20);
-    central.writeUInt32LE(record.size, 24);
-    central.writeUInt16LE(record.nameBytes.length, 28);
-    central.writeUInt32LE(offset, 42);
-    centralParts.push(central, record.nameBytes);
-
-    offset += LOCAL_HEADER_SIZE + record.nameBytes.length + record.payload.length;
+    const local = encodeLocalHeader(record);
+    central.push(encodeCentralHeader(record, offset));
+    parts.push(local, record.payload);
+    offset += local.length + record.payload.length;
     assertBelow4GiB(offset);
   }
-  const centralDirectory = Buffer.concat(centralParts);
-  assertBelow4GiB(offset + centralDirectory.length);
-  const tail = records.length > MARKER16 - 1
-    ? [writeEnd64(records.length, centralDirectory.length, offset), writeEnd(MARKER16, centralDirectory.length, offset)]
-    : [writeEnd(records.length, centralDirectory.length, offset)];
-  return Buffer.concat([...localParts, centralDirectory, ...tail]);
+  parts.push(encodeDirectoryAndTail(central, records.length, offset));
+  return Buffer.concat(parts);
+}
+
+/** Локальный заголовок вместе с именем записи. */
+function encodeLocalHeader(record: ZipWriteRecord): Buffer {
+  const local = Buffer.alloc(LOCAL_HEADER_SIZE + record.nameBytes.length);
+  local.writeUInt32LE(LOCAL_SIGNATURE, 0);
+  local.writeUInt16LE(VERSION, 4);
+  local.writeUInt16LE(record.flags, 6);
+  local.writeUInt16LE(record.method, 8);
+  local.writeUInt16LE(DOS_DATE, 12);
+  local.writeUInt32LE(record.crc, 14);
+  local.writeUInt32LE(record.payload.length, 18);
+  local.writeUInt32LE(record.size, 22);
+  local.writeUInt16LE(record.nameBytes.length, 26);
+  record.nameBytes.copy(local, LOCAL_HEADER_SIZE);
+  return local;
+}
+
+/** Запись центрального каталога вместе с именем. */
+function encodeCentralHeader(record: ZipWriteRecord, localOffset: number): Buffer {
+  const central = Buffer.alloc(CENTRAL_HEADER_SIZE + record.nameBytes.length);
+  central.writeUInt32LE(CENTRAL_SIGNATURE, 0);
+  central.writeUInt16LE(VERSION, 4);
+  central.writeUInt16LE(VERSION, 6);
+  central.writeUInt16LE(record.flags, 8);
+  central.writeUInt16LE(record.method, 10);
+  central.writeUInt16LE(DOS_DATE, 14);
+  central.writeUInt32LE(record.crc, 16);
+  central.writeUInt32LE(record.payload.length, 20);
+  central.writeUInt32LE(record.size, 24);
+  central.writeUInt16LE(record.nameBytes.length, 28);
+  central.writeUInt32LE(localOffset, 42);
+  record.nameBytes.copy(central, CENTRAL_HEADER_SIZE);
+  return central;
+}
+
+function encodeDirectoryAndTail(central: readonly Buffer[], count: number, offset: number): Buffer {
+  const directory = Buffer.concat(central);
+  assertBelow4GiB(offset + directory.length);
+  const tail = count > MARKER16 - 1
+    ? [writeEnd64(count, directory.length, offset), writeEnd(MARKER16, directory.length, offset)]
+    : [writeEnd(count, directory.length, offset)];
+  return Buffer.concat([directory, ...tail]);
 }
 
 function writeEnd(count: number, centralSize: number, centralOffset: number): Buffer {
@@ -271,14 +382,15 @@ function writeEnd64(count: number, centralSize: number, centralOffset: number): 
   return record;
 }
 
-/* c8 ignore start -- честная проверка требует архива больше 4 ГБ в памяти теста; граница нужна,
-   чтобы смещения не переполнили 32-битные поля заголовков молча. */
 function assertBelow4GiB(position: number): void {
+  // Честная проверка требует архива больше 4 ГБ в тесте; граница нужна, чтобы смещения не
+  // переполнили 32-битные поля заголовков молча.
+  /* c8 ignore start */
   if (position > MARKER32) {
     throw new ArchiveFormatError('Архив больше 4 ГБ не поддерживается.');
   }
+  /* c8 ignore stop */
 }
-/* c8 ignore stop */
 
 // --- CRC32 -------------------------------------------------------------------------------
 

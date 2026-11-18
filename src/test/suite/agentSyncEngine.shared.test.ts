@@ -1,7 +1,8 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentFileEntry, AgentFileStore } from '../../infra/agent/files/AgentFileStore';
+import type { AgentFileStore } from '../../infra/agent/files/AgentFileStore';
+import { DelegatingAgentFileStore } from './support/delegatingAgentFileStore';
 import { AgentSyncCancelledError } from '../../infra/agent/sync/AgentSyncEngine';
 import { buildSyncManifestFiles } from '../../infra/agent/sync/SyncManifest';
 import { createHash } from 'crypto';
@@ -54,27 +55,20 @@ function touchedFiles(dir: string, base = dir): string[] {
 }
 
 /** Хранилище, которое после N-го чтения (счёт с момента `arm`) поднимает флаг отмены — детерминированная отмена посреди передачи. */
-class CancelAfterReads implements AgentFileStore {
+class CancelAfterReads extends DelegatingAgentFileStore {
   private reads = 0;
   private threshold = Number.POSITIVE_INFINITY;
-  constructor(private readonly inner: AgentFileStore, private readonly cancel: { isCancellationRequested: boolean }) {}
+  constructor(inner: AgentFileStore, private readonly cancel: { isCancellationRequested: boolean }) { super(inner); }
   arm(after: number): void { this.reads = 0; this.threshold = after; }
   disarm(): void { this.threshold = Number.POSITIVE_INFINITY; }
-  get kind(): 'local' | 'sftp' { return this.inner.kind; }
-  stat(rel: string): Promise<AgentFileEntry | undefined> { return this.inner.stat(rel); }
-  async readFile(rel: string): Promise<Buffer> {
-    const data = await this.inner.readFile(rel);
+  override async readFile(rel: string): Promise<Buffer> {
+    const data = await super.readFile(rel);
     this.reads += 1;
     if (this.reads >= this.threshold) {
       this.cancel.isCancellationRequested = true;
     }
     return data;
   }
-  writeFile(rel: string, data: Uint8Array | string): Promise<void> { return this.inner.writeFile(rel, data); }
-  remove(rel: string, options?: { readonly recursive?: boolean }): Promise<void> { return this.inner.remove(rel, options); }
-  list(relDir: string, options?: { readonly recursive?: boolean }): Promise<AgentFileEntry[]> { return this.inner.list(relDir, options); }
-  mkdirp(rel: string): Promise<void> { return this.inner.mkdirp(rel); }
-  dispose(): Promise<void> { return this.inner.dispose(); }
 }
 
 function relativeSorted(h: SyncHarness, absPaths: readonly string[]): string[] {
@@ -114,7 +108,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
     teardown(async () => { await h.dispose(); });
 
     suite('импорт БД → P', () => {
-      test('первый импорт (P нет): P = база; B = hash(P); хранилище: ' + (kind === 'sftp' ? 'архив после полной выгрузки в M' : 'полное сравнение M и P'), async () => {
+      test('первый импорт (P нет): P = база; B = hash(P); хранилище: ' + (kind === 'sftp' ? 'ОДНА выгрузка архивом, M засеивается из архива' : 'полное сравнение M и P'), async () => {
         await start();
         const result = await doImport();
 
@@ -125,16 +119,16 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
 
         const dumps = h.emulator.dumps();
-        assert.strictEqual(dumps[0].options.dir, h.mirrorDir);
-        assert.ok(!dumps[0].options.update && !dumps[0].options.archive && !dumps[0].options['get-changes']);
+        assert.strictEqual(dumps.length, 1);
         if (kind === 'sftp') {
-          assert.strictEqual(dumps.length, 2);
-          assert.ok(String(dumps[1].options.dir).startsWith('exchange/'), String(dumps[1].options.dir));
-          assert.strictEqual(dumps[1].options.archive, 'full.zip');
-          assert.ok(!dumps[1].options.update, '--update и --archive вместе не работают');
+          // Изменено планом посева: прежние ДВЕ выгрузки (полная в M + архив) заменены одной, архивом.
+          assert.ok(String(dumps[0].options.dir).startsWith('exchange/'), String(dumps[0].options.dir));
+          assert.strictEqual(dumps[0].options.archive, 'full.zip');
+          assert.ok(!dumps[0].options.update, '--update и --archive вместе не работают');
           assert.strictEqual(h.manifest().mirrorState, 'fresh');
         } else {
-          assert.strictEqual(dumps.length, 1);
+          assert.strictEqual(dumps[0].options.dir, h.mirrorDir);
+          assert.ok(!dumps[0].options.update && !dumps[0].options.archive && !dumps[0].options['get-changes']);
         }
         assert.deepStrictEqual(exchangeLeftovers(h), [], 'служебные файлы обмена убраны');
       });
@@ -247,14 +241,19 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
         const result = await doImport();
 
-        expectPMatchesDb(h, kind === 'local');
+        expectPMatchesDb(h, true);
         assert.ok(!h.existsP('Catalogs/Лишний.xml'));
         assert.deepStrictEqual(
           relativeSorted(h, result.changedProjectFiles).filter((rel) => rel !== 'ConfigDumpInfo.xml'),
           ['Catalogs/Клиенты.xml', 'Catalogs/Лишний.xml', 'Roles/Админ/Ext/Rights.xml']
         );
         assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
-        assert.strictEqual(result.strategy, kind === 'sftp' ? 'delta' : 'compare');
+        // Изменено планом посева: M после первого импорта разреженный, а правки (D.modified/D.deleted)
+        // файлов неизменённых владельцев в нём не восстановить — архив `sparse-mirror-dirty`, а не дельта.
+        assert.strictEqual(result.strategy, kind === 'sftp' ? 'archive' : 'compare');
+        if (kind === 'sftp') {
+          assert.strictEqual(result.reason, 'sparse-mirror-dirty');
+        }
       });
 
       suite('onProjectFilesWillChange: инварианты записи в проект', () => {
