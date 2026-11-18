@@ -130,7 +130,7 @@ src/
 │   └── Ownership.ts                  # «свой/заимствованный» по namePrefix для CFE
 │
 ├── infra/                            # ФС, XML, окружение, git, хранилище, CFE, роли; vscode не импортировать
-│   ├── xml/                          # ридеры/эдиторы XML
+│   ├── xml/                          # ридеры/эдиторы XML (dumpInfo/ — заголовок ConfigDumpInfo.xml для посева M)
 │   │   ├── ConfigXmlReader.ts        # парсер Configuration.xml
 │   │   ├── ObjectXmlReader.ts        # парсер XML объекта + updateType/updateProperty
 │   │   ├── PropertySchema.ts         # декларативные схемы свойств по MetaKind
@@ -152,6 +152,7 @@ src/
 │   ├── fs/
 │   │   ├── ConfigLocator.ts          # рекурсивный поиск Configuration.xml
 │   │   ├── MetaPathResolver.ts       # единый resolver: XML + все модули по ModuleSlot
+│   │   ├── FileHandleWrite.ts        # writeFully: цикл дозаписи по bytesWritten (НЕ замена AtomicFileWriter)
 │   │   ├── AtomicFileWriter.ts       # writeFileAtomic/resolveAtomicTempPath: ЕДИНСТВЕННАЯ
 │   │   │                              # реализация temp+rename; через неё идёт любая запись файла
 │   │   │                              # выгрузки (docs/architecture.md, «Атомарная запись»)
@@ -195,9 +196,12 @@ src/
 │   │                                  # RemoteConnectionCheck (диагностика) — docs/architecture.md,
 │   │                                  # «Удалённый сервер 1С»; пользовательская часть — docs/remote-designer.md
 │   │   ├── files/                    # AgentFileStore: Local (каталог агента) и Sftp (отдельное SSH-соединение),
-│   │   │                              # AgentFileTransfer (конкурентная передача с отменой)
-│   │   └── sync/                     # движок синхронизации M/P/B: SyncPlanner (чистый), SyncManifest,
-│   │                                  # AgentImportFlow/AgentLoadFlow, ArchiveCodec/ZipContainer (zip/zip64)
+│   │   │                              # AgentFileTransfer (конкурентная передача с отменой),
+│   │   │                              # SftpChunkedIo (потоковый обмен, IO_CHUNK 31 КиБ)
+│   │   └── sync/                     # движок синхронизации M/P/B: SyncPlanner (чистый), SyncManifest (+ mirrorCoverage full/sparse),
+│   │                                  # AgentImportFlow/AgentLoadFlow, ArchiveCodec/ZipContainer (zip/zip64, ZipByteSource/ZipStreamWriter),
+│   │                                  # ArchiveFile/ArchiveImport (потоковый архив без буфера целиком), MirrorSeed (посев
+│   │                                  # разреженного зеркала M), LocalExchange (.v8vscedit/agent-exchange)
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
 │   │   │                              # SensitiveArgs (маскирование -Password в логах),
 │   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)
@@ -488,6 +492,13 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   корпуса, а не снимается с вывода генератора (иначе фикстура закрепит ошибку). Не заявлять «снятым
   правилом» то, что в корпусе неоднородно. См.
   [xml-format-rulesets.md](./docs/xml-format-rulesets.md#графическая-схема-flowchartxml-и-макет-графическая-схема).
+- **Архив выгрузки агента (zip/zip64) и посев зеркала M:** любой новый писатель/читатель архива — только через
+  `ZipByteSource`/`ZipStreamWriter` и файловые потоки (`downloadToFile`/`uploadFromFile`), БЕЗ буфера размером
+  с архив (на БП КОРП это «Array buffer allocation failed»). Полнота M (`mirrorCoverage`) и посев живут в
+  `SyncManifest`/`MirrorSeed`/`SyncPlanner`: при `sparse` отсутствие файла в M ничего не значит;
+  согласие на посев из проекта даёт только человек (хук `confirmMirrorSeed`, у MCP его нет). Порция
+  SFTP — 31 КиБ, не 32 (лимит ssh2 для libssh-агента). Подробности —
+  [architecture.md](./docs/architecture.md#модель-синхронизации-m--p--b).
 - **Любой писатель файла выгрузки (и служебного кэша):** только через `infra/fs/AtomicFileWriter`
   (`writeFileAtomic`) либо `writeTextFilePreservingBomAndEol`, который делегирует туда. Собственный
   `fs.writeFileSync`/`rename` для файла выгрузки заводить нельзя — третьей копии temp+rename быть не
