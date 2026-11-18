@@ -97,6 +97,7 @@ function settings(overrides: Partial<AgentCommandSettings> = {}): AgentCommandSe
   return {
     host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
     visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5, startupTimeoutMs: 15000, authWarmupMs: 90000, idleDisconnectMinutes: 0,
+    location: 'local', transferConcurrency: 16, archiveThresholdFiles: 300,
     ...overrides,
   };
 }

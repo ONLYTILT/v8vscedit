@@ -41,8 +41,8 @@ export const SYSTEM_TIMERS: TimerApi = {
 };
 
 const SESSION_KEY = 'default';
-const CONNECT_COMMAND = 'common connect-ib';
-const DISCONNECT_COMMAND = 'common disconnect-ib';
+export const AGENT_CONNECT_IB_COMMAND = 'common connect-ib';
+export const AGENT_DISCONNECT_IB_COMMAND = 'common disconnect-ib';
 const DISCONNECT_MESSAGE = 'Отключение информационной базы от агента конфигуратора.';
 
 /**
@@ -106,7 +106,7 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
       hooks?.onMessage?.(DISCONNECT_MESSAGE);
       try {
         const transport = await this.transports.create(SESSION_KEY);
-        await transport.execute(DISCONNECT_COMMAND, toCommandHooks(hooks));
+        await transport.execute(AGENT_DISCONNECT_IB_COMMAND, toCommandHooks(hooks));
       } catch (error) {
         if (!isInfoBaseNotConnectedError(error)) {
           // Агент не ответил на отключение: сбрасываем SSH (это само отпускает базу) и
@@ -168,7 +168,7 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
     }
     commandHooks.onMessage?.({ type: 'log', message: 'Подключение информационной базы к агенту конфигуратора.' });
     try {
-      await transport.execute(CONNECT_COMMAND, commandHooks);
+      await transport.execute(AGENT_CONNECT_IB_COMMAND, commandHooks);
     } catch (error) {
       if (!isInfoBaseAlreadyConnectedError(error)) {
         throw error;
@@ -190,7 +190,7 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
   ): Promise<void> {
     hooks?.onMessage?.(DISCONNECT_MESSAGE);
     try {
-      await transport.execute(DISCONNECT_COMMAND, commandHooks);
+      await transport.execute(AGENT_DISCONNECT_IB_COMMAND, commandHooks);
     } catch (error) {
       if (!isInfoBaseNotConnectedError(error)) {
         hooks?.onMessage?.(`Не удалось отключить информационную базу после ошибки операции: ${describeError(error)}`);
@@ -280,7 +280,7 @@ function agentErrorType(error: unknown): string | undefined {
  * «Уже подключено». Машинный код агента авторитетен; текст — только фолбэк для ответа без
  * `error-type` (транспорт, не разобравший JSON, или иная версия платформы).
  */
-function isInfoBaseAlreadyConnectedError(error: unknown): boolean {
+export function isInfoBaseAlreadyConnectedError(error: unknown): boolean {
   const errorType = agentErrorType(error);
   if (errorType !== undefined) {
     return errorType === 'DesignerAlreadyConnectedToInfoBase';
@@ -288,7 +288,7 @@ function isInfoBaseAlreadyConnectedError(error: unknown): boolean {
   return isInfoBaseAlreadyConnectedMessage(describeError(error));
 }
 
-function isInfoBaseNotConnectedError(error: unknown): boolean {
+export function isInfoBaseNotConnectedError(error: unknown): boolean {
   const errorType = agentErrorType(error);
   if (errorType !== undefined) {
     return errorType === 'DesignerNotConnectedToInfoBase';

@@ -352,14 +352,30 @@ suite('SyncPlanner.planLoad (Э7)', () => {
       assert.strictEqual(plan.prepareMirror, 'refresh-dump');
     });
 
-    test('M empty → полная загрузка архивом (mirror-empty)', () => {
-      assert.deepStrictEqual(
-        planLoad(loadInput({ mirrorState: 'empty', current: changedCurrent })),
-        { action: 'full', reason: 'mirror-empty', via: 'archive' }
-      );
-    });
+    // Н47 (Э8): при известной B база ≡ B, поэтому пустой M восстанавливается полной выгрузкой БД на
+    // сервере без скачивания, и правка одного файла не гонит по сети весь P архивом.
+    const emptyMirrorTable: { threshold: number; current: Record<string, string>; expected: 'full-dump' | 'over-threshold' }[] = [
+      { threshold: 300, current: changedCurrent, expected: 'full-dump' },
+      { threshold: 1, current: changedCurrent, expected: 'full-dump' },
+      { threshold: 1, current: { 'Catalogs/А.xml': '2', 'Catalogs/Б.xml': '2', 'Configuration.xml': '1' }, expected: 'over-threshold' },
+      { threshold: 2, current: { 'Catalogs/А.xml': '2', 'Catalogs/Б.xml': '2', 'Configuration.xml': '1' }, expected: 'full-dump' },
+      { threshold: 2, current: { 'Catalogs/А.xml': '2', 'Catalogs/Б.xml': '2', 'Catalogs/В.xml': '1', 'Configuration.xml': '1' }, expected: 'over-threshold' },
+    ];
+    for (const { threshold, current, expected } of emptyMirrorTable) {
+      const changed = Object.keys(current).filter((rel) => current[rel] !== loadInput().base[rel]).length;
+      test(`M empty при известной B: ${String(changed)} изм. при пороге ${String(threshold)} → ${expected}`, () => {
+        const plan = planLoad(loadInput({ mirrorState: 'empty', current, archiveThresholdFiles: threshold }));
+        if (expected === 'full-dump') {
+          assert.ok(plan.action === 'partial', JSON.stringify(plan));
+          assert.strictEqual(plan.prepareMirror, 'full-dump');
+          assert.deepStrictEqual(plan.files, plan.changed);
+        } else {
+          assert.deepStrictEqual(plan, { action: 'full', reason: 'over-threshold', via: 'archive' });
+        }
+      });
+    }
 
-    test('deletion приоритетнее mirror-empty; no-baseline приоритетнее обоих', () => {
+    test('при пустом M deletion и no-baseline по-прежнему дают полную загрузку архивом', () => {
       assert.deepStrictEqual(
         planLoad(loadInput({ mirrorState: 'empty', current: { 'Configuration.xml': '1' } })),
         { action: 'full', reason: 'deletion', via: 'archive' }

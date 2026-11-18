@@ -76,14 +76,23 @@ export interface LoadPlanInput {
   readonly selectLoadFiles?: (changed: readonly string[]) => string[];
 }
 
-export type LoadFullReason = 'no-baseline' | 'deletion' | 'rename' | 'mirror-empty' | 'over-threshold';
+export type LoadFullReason = 'no-baseline' | 'deletion' | 'rename' | 'over-threshold';
 
 /**
  * Подготовка M перед частичной загрузкой: `full-copy` — каркаса нет, P копируется целиком (прежнее
  * поведение локального агента); `refresh-dump` — после загрузки архивом M отстал от БД, но БД ≡ P,
- * поэтому достаточно `dump --update` без скачивания.
+ * поэтому достаточно `dump --update` без скачивания; `full-dump` — удалённого M нет (проект ни разу
+ * не импортировался, M потерян), но при известной B база ≡ B: M очищается и выгружается из базы
+ * целиком на сервере, без скачивания (Н47) — иначе правка одного файла гнала бы весь P архивом.
  */
-export type LoadMirrorPreparation = 'none' | 'full-copy' | 'refresh-dump';
+export type LoadMirrorPreparation = 'none' | 'full-copy' | 'refresh-dump' | 'full-dump';
+
+/** Удалённый агент: подготовка M по его состоянию (без базовой линии сюда не доходит — там полная загрузка). */
+const REMOTE_MIRROR_PREPARATION: Readonly<Record<SyncMirrorState, LoadMirrorPreparation>> = {
+  fresh: 'none',
+  stale: 'refresh-dump',
+  empty: 'full-dump',
+};
 
 export type LoadPlan =
   | { readonly action: 'skip'; readonly reason: 'no-changes' | 'no-loadable-files' }
@@ -125,11 +134,8 @@ export function planLoad(input: LoadPlanInput): LoadPlan {
   if (input.storeKind === 'local') {
     return { action: 'partial', changed, files, prepareMirror: input.mirrorState === 'empty' ? 'full-copy' : 'none' };
   }
-  if (input.mirrorState === 'empty') {
-    return { action: 'full', reason: 'mirror-empty', via };
-  }
   if (files.length > input.archiveThresholdFiles) {
     return { action: 'full', reason: 'over-threshold', via };
   }
-  return { action: 'partial', changed, files, prepareMirror: input.mirrorState === 'stale' ? 'refresh-dump' : 'none' };
+  return { action: 'partial', changed, files, prepareMirror: REMOTE_MIRROR_PREPARATION[input.mirrorState] };
 }

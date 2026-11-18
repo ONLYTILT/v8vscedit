@@ -61,7 +61,7 @@ export class AgentConnectRetryLoop {
           lastRefusedAt: this.lastRefusedAt,
         }, this.options.policy);
         if (decision.action === 'fail') {
-          throw new Error(describeConnectFailure(decision.reason, this.options, error), { cause: error });
+          throw new AgentConnectFailedError(decision.reason, describeConnectFailure(decision.reason, this.options, error), error);
         }
         await this.sleep(decision.delayMs);
       }
@@ -72,9 +72,23 @@ export class AgentConnectRetryLoop {
   /* c8 ignore stop */
 }
 
+/** Причина окончательного отказа подключения — та же классификация, что у политики повторов. */
+export type AgentConnectFailureReason = 'credentials' | 'unreachable' | 'timeout' | 'other';
+
+/**
+ * Окончательный отказ подключения. Причина вынесена полем, чтобы диагностика (проверка подключения
+ * к удалённому агенту) не разбирала текст сообщения.
+ */
+export class AgentConnectFailedError extends Error {
+  constructor(readonly reason: AgentConnectFailureReason, message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = 'AgentConnectFailedError';
+  }
+}
+
 /** Текст отказа подключения: пароль сюда не попадает никогда — только хост, порт и имя пользователя. */
 export function describeConnectFailure(
-  reason: 'credentials' | 'unreachable' | 'timeout' | 'other',
+  reason: AgentConnectFailureReason,
   options: AgentConnectEndpoint,
   error: unknown
 ): string {

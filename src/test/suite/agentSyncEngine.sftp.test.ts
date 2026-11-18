@@ -355,20 +355,49 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       assert.deepStrictEqual((h.sftp?.ops('OPEN') ?? []).filter((e) => (e.path ?? '').startsWith(h.mirrorDir) && !(e.path ?? '').endsWith('.v8tmp')), []);
     });
 
-    test('M empty при известном B → полная загрузка архивом (mirror-empty)', async () => {
+    // Н47 (Э8): при известной B база ≡ B — пустой M восстанавливается полной выгрузкой на сервере
+    // (без --update и без скачивания), затем частичная загрузка; архив P по сети не передаётся.
+    test('M empty при известном B → очистка M, полная выгрузка в M без скачивания, затем частичная загрузка', async () => {
+      await start();
+      await doImport();
+      h.saveManifest('empty', buildSyncManifestFiles(h.configRoot));
+      fs.writeFileSync(path.join(h.mirrorAbs, 'Остаток.xml'), '<stale/>');
+      h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
+      const from = h.emulator.commands.length;
+      let leftoverAtDump: boolean | undefined;
+      h.emulator.onCommand = (cmd) => {
+        if (cmd.command === 'config dump-config-to-files' && leftoverAtDump === undefined) {
+          leftoverAtDump = fs.existsSync(path.join(h.mirrorAbs, 'Остаток.xml'));
+        }
+      };
+      h.sftp?.log.splice(0);
+
+      const result = await doLoad('changed');
+
+      assert.strictEqual(result.strategy, 'partial');
+      const tail = h.emulator.commands.slice(from).filter((c) => c.command !== 'common connect-ib');
+      assert.deepStrictEqual(tail.map((c) => c.command), ['config dump-config-to-files', 'config load-config-from-files']);
+      assert.strictEqual(tail[0].options.dir, h.mirrorDir);
+      assert.ok(!tail[0].options.update && !tail[0].options.archive && !tail[0].options['get-changes']);
+      assert.strictEqual(tail[1].options.partial, true);
+      assert.ok(!loadCommands(from).some((c) => c.options.archive), 'архива P нет');
+      assert.strictEqual(leftoverAtDump, false, 'M очищен до выгрузки');
+      assert.strictEqual(h.readM('Catalogs/Клиенты.xml'), '<Catalog>v2</Catalog>');
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
+      assert.deepStrictEqual((h.sftp?.ops('OPEN') ?? []).filter((e) => (e.path ?? '').startsWith(h.mirrorDir) && !(e.path ?? '').endsWith('.v8tmp') && !(e.path ?? '').endsWith('Клиенты.xml')), []);
+    });
+
+    test('M empty при известном B, хуки без onMessage: подготовка full-dump проходит с тем же исходом', async () => {
       await start();
       await doImport();
       h.saveManifest('empty', buildSyncManifestFiles(h.configRoot));
       h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
-      const from = h.emulator.commands.length;
 
-      const result = await doLoad('changed');
+      const result = await h.engine.loadTarget(h.target, 'changed', h.exec, { cancellation: { isCancellationRequested: false } });
 
-      assert.strictEqual(result.strategy, 'full');
-      assert.strictEqual(result.reason, 'mirror-empty');
-      assert.strictEqual(result.via, 'archive');
-      assert.strictEqual(loadCommands(from)[0].options.archive, 'full.zip');
-      assert.strictEqual(h.manifest().mirrorState, 'stale');
+      assert.strictEqual(result.strategy, 'partial');
+      assert.strictEqual(h.readM('Catalogs/Клиенты.xml'), '<Catalog>v2</Catalog>');
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
 
     test('порог частичной загрузки: больше файлов → полная архивом over-threshold', async () => {

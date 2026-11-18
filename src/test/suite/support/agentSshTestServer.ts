@@ -23,6 +23,26 @@ export interface AgentSshTestServerOptions {
   readonly sftpRoot?: string;
 }
 
+/** Сообщение агента в проводном формате (`type`, `message`, `error-type`, …). */
+export type AgentWireMessage = Readonly<Record<string, unknown>>;
+export type ShellResponder = (line: string) => Promise<readonly AgentWireMessage[]>;
+
+async function respondWith(
+  responder: ShellResponder,
+  line: string,
+  stream: { write(data: string): unknown }
+): Promise<void> {
+  let messages: readonly AgentWireMessage[];
+  try {
+    const answered = await responder(line);
+    messages = answered.length > 0 ? answered : [{ type: 'success' }];
+  } catch (error) {
+    const finalMessage = (error as { finalMessage?: AgentWireMessage }).finalMessage;
+    messages = [finalMessage ?? { type: 'error', message: (error as Error).message }];
+  }
+  stream.write(`${JSON.stringify(messages)}\n`);
+}
+
 export class AgentSshTestServer {
   private passwordAttemptCount = 0;
   private rejectedSoFar = 0;
@@ -84,6 +104,9 @@ export class AgentSshTestServer {
 
   private readonly inputWaiters: ((text: string) => void)[] = [];
   private jsonReplies = false;
+  private shellResponder: ShellResponder | undefined;
+  /** Пароли всех парольных попыток входа, в порядке прихода: так проверяется, ЧТО именно клиент отправил агенту. */
+  readonly passwordsSeen: string[] = [];
   /** Строки команд, принятые каждым shell-каналом (по каналу на SSH-сессию), в порядке прихода. */
   readonly shellLog: string[][] = [];
 
@@ -93,6 +116,15 @@ export class AgentSshTestServer {
    */
   enableJsonReplies(): void {
     this.jsonReplies = true;
+  }
+
+  /**
+   * Э8: ответы агента на строки команд даёт обработчик (например, эмулятор команд конфигуратора).
+   * Он возвращает сообщения агента; отклонённый промис превращается в `error`-сообщение
+   * (у ошибки с `finalMessage` — оно само). Ответы идут строго по очереди, как у однопоточного агента.
+   */
+  setShellResponder(responder: ShellResponder): void {
+    this.shellResponder = responder;
   }
 
   /** Неожиданный обрыв со стороны агента: сервер закрывает все SSH-соединения, сам продолжая слушать порт. */
@@ -158,6 +190,7 @@ export class AgentSshTestServer {
         return;
       }
       this.passwordAttemptCount += 1;
+      this.passwordsSeen.push(ctx.password);
       if (this.shouldReject()) {
         ctx.reject(['password']);
         return;
@@ -179,6 +212,7 @@ export class AgentSshTestServer {
           const log: string[] = [];
           this.shellLog.push(log);
           let pending = '';
+          let replyQueue: Promise<void> = Promise.resolve();
           // Строки команд транспорта: тесты ждут их, чтобы действовать в момент «команда ушла, ответа нет».
           stream.on('data', (chunk: Buffer) => {
             const text = chunk.toString('utf-8');
@@ -191,7 +225,10 @@ export class AgentSshTestServer {
             pending = lines.pop() ?? '';
             for (const line of lines) {
               log.push(line);
-              if (this.jsonReplies) {
+              const responder = this.shellResponder;
+              if (responder) {
+                replyQueue = replyQueue.then(() => respondWith(responder, line, stream));
+              } else if (this.jsonReplies) {
                 stream.write(`${JSON.stringify([{ type: 'success', message: line }])}\n`);
               }
             }

@@ -27,6 +27,12 @@ export const SFTP_NO_SUCH_FILE = 2;
 /** Код статуса SFTP v3 «операция не поддерживается». */
 export const SFTP_OP_UNSUPPORTED = 8;
 
+/**
+ * Признак «SSH вошёл, но подсистема SFTP не открылась»: по нему диагностика отличает агент без SFTP
+ * от прочих отказов, не разбирая текст сообщения.
+ */
+export const SFTP_SUBSYSTEM_UNAVAILABLE_CODE = 'ERR_AGENT_SFTP_SUBSYSTEM_UNAVAILABLE';
+
 /** Числовой код статуса SFTP из ошибки ssh2 (`err.code`); у прочих ошибок — `undefined`. */
 export function sftpStatusCode(error: unknown): number | undefined {
   const code = (error as { code?: unknown }).code;
@@ -170,7 +176,12 @@ function openSftpAttempt(
     client.on('ready', () => {
       client.sftp((error, sftp) => {
         settle(error
-          ? { error: new Error(`Агент конфигуратора не открыл подсистему SFTP: ${error.message}`, { cause: error }) }
+          ? {
+            error: Object.assign(
+              new Error(`Агент конфигуратора не открыл подсистему SFTP: ${error.message}`, { cause: error }),
+              { code: SFTP_SUBSYSTEM_UNAVAILABLE_CODE }
+            ),
+          }
           : { sftp });
       });
     });

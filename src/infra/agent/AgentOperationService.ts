@@ -9,6 +9,8 @@ import { resolveDefaultAgentBaseDir } from './DesignerAgentProcess';
 import type { AgentFileStore } from './files/AgentFileStore';
 import type { AgentTransferCancellation } from './files/AgentFileTransfer';
 import { createLocalAgentFileStore } from './files/LocalAgentFileStore';
+import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
+import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type {
   DesignerAgentTransportFactory,
@@ -49,6 +51,17 @@ export interface AgentOperationFilesOptions {
   readonly userName: string;
   /** `/AgentBaseDir` агента; по умолчанию — служебный каталог агента проекта. */
   readonly agentBaseDir?: string;
+  /**
+   * Удалённый агент: файлы — по SFTP отдельным SSH-соединением с этими параметрами. Корень SFTP
+   * агента уже персональный, поэтому `agentBaseDir` и agentbasedir.json тогда не нужны.
+   */
+  readonly sftp?: DesignerAgentConnectionOptions;
+}
+
+/** Параметры движка синхронизации, задаваемые настройками (умолчания — у {@link AgentSyncEngine}). */
+export interface AgentOperationSyncOptions {
+  readonly archiveThresholdFiles?: number;
+  readonly transferConcurrency?: number;
 }
 
 interface AgentFiles {
@@ -75,7 +88,8 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     private readonly projectRoot: string,
     transportFactory: DesignerAgentTransportFactory | ResettableDesignerAgentTransportFactory,
     sessionOptions: Partial<AgentInfoBaseSessionOptions> = {},
-    private readonly filesOptions?: AgentOperationFilesOptions
+    private readonly filesOptions?: AgentOperationFilesOptions,
+    private readonly syncOptions: AgentOperationSyncOptions = {}
   ) {
     this.session = new AgentInfoBaseSession(transportFactory, {
       // По умолчанию база держится до явного release (план: idleDisconnectMinutes = 0).
@@ -97,7 +111,10 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     return this.session.reconnectInfoBase(hooks);
   }
 
-  /** Снимает idle-таймер; SSH-сессии закрывает владелец фабрики транспорта (реестр сервисов). */
+  /**
+   * Снимает idle-таймер и закрывает хранилище (у удалённого агента — его SFTP-соединение);
+   * shell-сессии закрывает владелец фабрики транспорта (реестр сервисов).
+   */
   async dispose(): Promise<void> {
     const files = this.files;
     this.files = undefined;
@@ -182,13 +199,27 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
    */
   private async getFiles(options: AgentOperationFilesOptions): Promise<AgentFiles> {
     if (!this.files) {
-      const store = await createLocalAgentFileStore(
-        options.agentBaseDir ?? resolveDefaultAgentBaseDir(this.projectRoot),
-        options.userName
-      );
+      const store = await this.openStore(options);
       const workspace = new AgentWorkspaceService(store, buildAgentProjectId(this.projectRoot));
-      this.files = { store, engine: new AgentSyncEngine({ projectRoot: this.projectRoot, store, workspace }) };
+      const engine = new AgentSyncEngine({
+        projectRoot: this.projectRoot,
+        store,
+        workspace,
+        archiveThresholdFiles: this.syncOptions.archiveThresholdFiles,
+        transferConcurrency: this.syncOptions.transferConcurrency,
+      });
+      this.files = { store, engine };
     }
     return this.files;
+  }
+
+  private openStore(options: AgentOperationFilesOptions): Promise<AgentFileStore> {
+    if (options.sftp) {
+      return connectSftpAgentFileStore(options.sftp);
+    }
+    return createLocalAgentFileStore(
+      options.agentBaseDir ?? resolveDefaultAgentBaseDir(this.projectRoot),
+      options.userName
+    );
   }
 }

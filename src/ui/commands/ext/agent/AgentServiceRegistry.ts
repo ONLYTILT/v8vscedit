@@ -14,15 +14,17 @@ import {
   resolveDefaultAgentBaseDir,
   waitForTcpPort,
   type AgentOperationFilesOptions,
+  type AgentOperationSyncOptions,
   type DesignerAgentInfoBaseConnection,
   type DesignerAgentConnectionOptions,
 } from '../../../../infra/agent';
 import { getOrCreate } from '../../../../infra/process';
-import { nonEmptyString, resolveConnectionFromSettings, resolveSettingsPath } from '../connectionSettings';
+import { resolveConnectionFromSettings, resolveSettingsPath } from '../connectionSettings';
 import { resetConfigurationOperationStatus } from '../configurationOperationStatus';
 import {
   isAgentConfigurationOperationMode,
   readAgentCommandSettings,
+  toAgentEndpointOptions,
   toDesignerAgentConnection,
   type AgentCommandSettings,
 } from './agentSettings';
@@ -35,8 +37,13 @@ export interface CachedAgentService {
   readonly transportOptions: DesignerAgentConnectionOptions;
   /** Порог idle-отключения базы, переданный сессии; 0 — выключено. */
   readonly idleDisconnectMs: number;
-  /** Пользователь и `/AgentBaseDir`, по которым сервис находит персональный корень агента. */
+  /**
+   * Где сервис берёт файлы агента: локально — пользователь и `/AgentBaseDir` (персональный корень
+   * по agentbasedir.json), удалённо — пользователь и параметры SFTP-соединения.
+   */
   readonly files: AgentOperationFilesOptions;
+  /** Параметры движка синхронизации из настроек (`transferConcurrency`, `archiveThresholdFiles`). */
+  readonly sync: Required<AgentOperationSyncOptions>;
 }
 
 export type CreateAgentServiceEntry = (workspaceRoot: string, settings: AgentCommandSettings) => CachedAgentService;
@@ -236,6 +243,14 @@ export async function startAgentOperationService(
   const settingsPath = resolveSettingsPath(workspaceRoot, rootPath);
   const connection = await resolveConnectionFromSettings(settingsPath);
   const agentSettings = readAgentCommandSettings(connection);
+  if (agentSettings.location === 'remote') {
+    // Удалённый агент запущен вне расширения: ни процесса, ни ожидания порта, ни локального
+    // каталога агента. Недоступность сервера выяснит политика подключения первой операции.
+    outputChannel.appendLine(
+      `[agent] Удалённый агент конфигуратора: ${agentSettings.host}:${String(agentSettings.port)}, пользователь «${agentSettings.user}».`
+    );
+    return createAgentOperationServiceEntry(workspaceRoot, agentSettings);
+  }
   let agentProcess: DesignerAgentProcess | undefined;
   if (agentSettings.autoStart) {
     // Отдельная неизменяемая ссылка: замыкание isAborted видит процесс без проверки на undefined.
@@ -285,37 +300,44 @@ export function createAgentOperationServiceEntry(
   agentSettings: AgentCommandSettings,
   agentProcess?: DesignerAgentProcess
 ): CachedAgentService {
+  const remote = agentSettings.location === 'remote';
+  // Процесс относится только к локальному агенту: у удалённого нет опорной точки старта, и
+  // auth-отказ сразу означает неверный пароль (политика Э3), а не прогрев.
+  const ownProcess = remote ? undefined : agentProcess;
   const transportOptions: DesignerAgentConnectionOptions = {
-    host: agentSettings.host,
-    port: agentSettings.port,
-    user: agentSettings.user,
-    password: agentSettings.password,
-    privateKeyPath: nonEmptyString(agentSettings.privateKeyPath),
+    ...toAgentEndpointOptions(agentSettings),
     policy: {
       startupTimeoutMs: agentSettings.startupTimeoutMs,
       authWarmupMs: agentSettings.authWarmupMs,
       retryDelayMs: 1000,
     },
-    agentStartedAt: agentProcess?.getStartedAt(),
+    agentStartedAt: ownProcess?.getStartedAt(),
+    // Агент на сервере запущен пользователем: закрытие SSH расширением не должно его гасить.
+    ...(remote ? { shutdownOnDispose: false } : {}),
   };
   const sessions = new DesignerAgentSessionManager(
     new ProcessDesignerAgentTransportFactory(transportOptions),
     { notifyProgressInterval: agentSettings.progressInterval }
   );
   const idleDisconnectMs = agentSettings.idleDisconnectMinutes * 60_000;
-  // Каталог тот же, что получает агент при автозапуске (`/AgentBaseDir` из agentModeArgs
+  // Удалённо корень SFTP агента уже персональный (agentbasedir.json не нужен, Н24). Локально
+  // каталог тот же, что получает агент при автозапуске (`/AgentBaseDir` из agentModeArgs
   // побеждает умолчание): иначе agentbasedir.json искался бы не там, где его пишет агент.
-  const files: AgentOperationFilesOptions = {
-    userName: agentSettings.user,
-    agentBaseDir: resolveAgentBaseDir(workspaceRoot, agentSettings.agentModeArgs),
+  const files: AgentOperationFilesOptions = remote
+    ? { userName: agentSettings.user, sftp: transportOptions }
+    : { userName: agentSettings.user, agentBaseDir: resolveAgentBaseDir(workspaceRoot, agentSettings.agentModeArgs) };
+  const sync = {
+    archiveThresholdFiles: agentSettings.archiveThresholdFiles,
+    transferConcurrency: agentSettings.transferConcurrency,
   };
   return {
-    service: new AgentOperationService(workspaceRoot, sessions, { idleDisconnectMs }, files),
+    service: new AgentOperationService(workspaceRoot, sessions, { idleDisconnectMs }, files, sync),
     sessions,
-    process: agentProcess,
+    process: ownProcess,
     transportOptions,
     idleDisconnectMs,
     files,
+    sync,
   };
 }
 

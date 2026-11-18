@@ -184,7 +184,10 @@ export async function resolveLocalAgentUserRoot(agentBaseDir: string, userName: 
   } catch (error) {
     throw new Error(
       `Не удалось прочитать индекс пользователей агента конфигуратора ${indexFile}: ${(error as Error).message}. ` +
-      'Агент создаёт его при первом входе пользователя по SSH.',
+      'Агент создаёт его при первом входе пользователя по SSH. ' +
+      // Частая причина (Н24): агент запущен вне расширения со своим каталогом — тогда индекс лежит не здесь.
+      'Если агент запущен вручную с другим каталогом, укажите его ключом /AgentBaseDir ' +
+      'в настройке v8vscedit.agent.agentModeArgs.',
       { cause: error }
     );
   }

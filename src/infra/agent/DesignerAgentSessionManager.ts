@@ -60,15 +60,21 @@ export class DesignerAgentSessionManager implements ResettableDesignerAgentTrans
 
   private async createConfiguredSession(sessionKey: string): Promise<DesignerAgentTransport> {
     const transport = await this.innerFactory.create(sessionKey);
-    await transport.execute(
-      [
-        'options set',
-        '--output-format=json',
-        '--show-prompt=no',
-        '--notify-progress=yes',
-        `--notify-progress-interval=${String(this.options.notifyProgressInterval ?? 0.5)}`,
-      ].join(' ')
-    );
+    await transport.execute(buildAgentSessionOptionsCommand(this.options.notifyProgressInterval ?? 0.5));
     return transport;
   }
+}
+
+/**
+ * Настройка свежей SSH-сессии агента: без `--output-format=json` ответы агента не разбираются.
+ * Общая для менеджера сессий и разовой проверки подключения.
+ */
+export function buildAgentSessionOptionsCommand(notifyProgressInterval: number): string {
+  return [
+    'options set',
+    '--output-format=json',
+    '--show-prompt=no',
+    '--notify-progress=yes',
+    `--notify-progress-interval=${String(notifyProgressInterval)}`,
+  ].join(' ');
 }

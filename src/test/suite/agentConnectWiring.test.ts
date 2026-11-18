@@ -94,6 +94,7 @@ suite('Агент Э3: createAgentOperationServiceEntry пробрасывает
       host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
       visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5,
       startupTimeoutMs: 21000, authWarmupMs: 45000, idleDisconnectMinutes: 0,
+      location: 'local', transferConcurrency: 16, archiveThresholdFiles: 300,
       ...overrides,
     };
   }
@@ -157,6 +158,7 @@ suite('Агент Э4: настройка idleDisconnectMinutes и провод�
     host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
     visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5,
     startupTimeoutMs: 21000, authWarmupMs: 45000, idleDisconnectMinutes: 0,
+    location: 'local', transferConcurrency: 16, archiveThresholdFiles: 300,
   };
 
   for (const [minutes, expectedMs] of [[0, 0], [1, 60_000], [15, 900_000]] as const) {

@@ -25,6 +25,12 @@ export interface DesignerAgentEndpointOptions {
   readonly password?: string;
   readonly privateKeyPath?: string;
   readonly connectTimeoutSeconds?: number;
+  /**
+   * `false` — `dispose()` закрывает канал и SSH, не отправляя `common shutdown`. Нужно для агента,
+   * которого запустил не расширение (удалённый сервер): смена настроек или выход из VS Code не
+   * должны гасить чужой процесс. По умолчанию `true` — свой локальный агент останавливается.
+   */
+  readonly shutdownOnDispose?: boolean;
 }
 
 /** Параметры фабрики: конечная точка плюс политика повторов — повторы решает только фабрика. */
@@ -169,7 +175,9 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     if (!this.client) {
       return Promise.resolve();
     }
-    this.channel?.write('common shutdown\n');
+    if (this.options.shutdownOnDispose !== false) {
+      this.channel?.write('common shutdown\n');
+    }
     this.channel?.end();
     this.client.end();
     this.channel = undefined;

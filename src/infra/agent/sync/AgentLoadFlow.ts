@@ -42,7 +42,6 @@ const FULL_REASON_MESSAGES: Readonly<Record<LoadFullReason, string>> = {
   'no-baseline': 'Кэш изменений не найден, выполняется полная загрузка.',
   rename: 'Обнаружено переименование объектов, выполняется полная загрузка.',
   deletion: 'Обнаружено удаление файлов, выполняется полная загрузка.',
-  'mirror-empty': 'Зеркало выгрузки на стороне агента не подготовлено, выполняется полная загрузка.',
   'over-threshold': 'Изменённых файлов больше порога, выполняется полная загрузка архивом.',
 };
 
@@ -83,15 +82,28 @@ export async function runLoad(context: SyncOperationContext, mode: AgentLoadMode
 
   context.hooks?.onMessage?.(`Подготовка частичной загрузки: ${String(plan.files.length)} файл(ов).`);
   const mirror = context.workspace.targetAgentDir;
-  if (plan.prepareMirror === 'full-copy') {
-    // Конфигуратору на `--partial` нужен целостный каркас выгрузки в `--dir` (Configuration.xml,
-    // родительские XML модулей форм и т.д.); без него агент валится в пустой UnknownError.
-    context.markMirrorMutated();
-    await mirrorProjectToAgent(context);
-  } else if (plan.prepareMirror === 'refresh-dump') {
-    // После загрузки архивом БД ≡ P, поэтому каркасу M достаточно `--update` без скачивания.
-    context.markMirrorMutated();
-    await context.exec.execute(buildDumpConfigToFilesCommand(mirror, { extensionName: context.extensionName, update: true, force: true }));
+  switch (plan.prepareMirror) {
+    case 'full-copy':
+      // Конфигуратору на `--partial` нужен целостный каркас выгрузки в `--dir` (Configuration.xml,
+      // родительские XML модулей форм и т.д.); без него агент валится в пустой UnknownError.
+      context.markMirrorMutated();
+      await mirrorProjectToAgent(context);
+      break;
+    case 'refresh-dump':
+      // После загрузки архивом БД ≡ P, поэтому каркасу M достаточно `--update` без скачивания.
+      context.markMirrorMutated();
+      await context.exec.execute(buildDumpConfigToFilesCommand(mirror, { extensionName: context.extensionName, update: true, force: true }));
+      break;
+    case 'full-dump':
+      // M на сервере нет, но БД ≡ B: полная выгрузка базы в M — на сервере, без скачивания (Н47).
+      // M очищается заранее, как в первом импорте: остаток недостоверного M не должен пережить выгрузку.
+      context.hooks?.onMessage?.('Зеркало выгрузки на стороне агента не подготовлено: выгрузка конфигурации в него на сервере.');
+      context.markMirrorMutated();
+      await context.store.remove(mirror, { recursive: true });
+      await context.exec.execute(buildDumpConfigToFilesCommand(mirror, { extensionName: context.extensionName, force: true }));
+      break;
+    case 'none':
+      break;
   }
   context.markMirrorMutated();
   await uploadProjectFiles(context, plan.files);

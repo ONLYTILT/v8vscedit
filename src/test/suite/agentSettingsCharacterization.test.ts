@@ -25,6 +25,7 @@ import {
 const AGENT_KEYS = [
   'host', 'listenAddress', 'port', 'user', 'privateKeyPath',
   'autoStart', 'visible', 'agentModeArgs', 'progressInterval', 'startupTimeoutMs', 'authWarmupMs',
+  'location', 'transferConcurrency', 'archiveThresholdFiles',
 ] as const;
 
 async function setAgentConfig(key: string, value: unknown): Promise<void> {
@@ -119,6 +120,9 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
       startupTimeoutMs: 15000,
       authWarmupMs: 90000,
       idleDisconnectMinutes: 0,
+      location: 'local',
+      transferConcurrency: 16,
+      archiveThresholdFiles: 300,
     });
   });
 

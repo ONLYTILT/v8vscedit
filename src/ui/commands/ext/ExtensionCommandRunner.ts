@@ -22,7 +22,8 @@ import {
   trimStatusMessage,
   updateConfigurationOperationStatus,
 } from './configurationOperationStatus';
-import { isAgentConfigurationOperationMode } from './agent/agentSettings';
+// Режим, а не булев флаг: remote без агентского режима — отказ, а не тихий откат на пакетный.
+import { getAgentExecutionMode } from './agent/agentSettings';
 import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
 import { releaseAgentInfoBaseForBatch } from './agent/AgentServiceRegistry';
 
@@ -44,8 +45,10 @@ export {
   updateConfigurationOperationStatus,
 } from './configurationOperationStatus';
 export {
+  getAgentExecutionMode,
   isAgentConfigurationOperationMode,
   readAgentCommandSettings,
+  resolveAgentExecutionMode,
   splitAgentModeArgs,
 } from './agent/agentSettings';
 export {
@@ -97,7 +100,7 @@ export async function runDecompileExtension(
   outputChannel: vscode.OutputChannel,
   hooks?: ConfigurationImportHooks
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchDecompileExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, hooks);
   }
 
@@ -129,7 +132,7 @@ export async function runDecompileMainConfiguration(
   outputChannel: vscode.OutputChannel,
   hooks?: ConfigurationImportHooks
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchDecompileMainConfiguration(configName, configRoot, workspaceFolder, outputChannel, hooks);
   }
 
@@ -165,7 +168,7 @@ export async function runApplyDatabaseConfiguration(
   outputChannel: vscode.OutputChannel,
   showSuccessMessage = false
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchApplyDatabaseConfiguration(target, workspaceFolder, outputChannel, showSuccessMessage);
   }
 
@@ -197,7 +200,7 @@ export async function runCompileExtension(
   outputChannel: vscode.OutputChannel,
   showSuccessMessage = true
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchCompileExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, showSuccessMessage);
   }
 
@@ -229,7 +232,7 @@ export async function runUpdateExtension(
   showSuccessMessage = true,
   hooks?: ConfigurationProgressHooks
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchUpdateExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, showSuccessMessage, hooks);
   }
 
@@ -262,7 +265,7 @@ export async function runUpdateMainConfiguration(
   showSuccessMessage = true,
   hooks?: ConfigurationProgressHooks
 ): Promise<boolean> {
-  if (!isAgentConfigurationOperationMode()) {
+  if (getAgentExecutionMode() === 'batch') {
     return runBatchUpdateMainConfiguration(configName, configRoot, workspaceFolder, outputChannel, showSuccessMessage, hooks);
   }
 

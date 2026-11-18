@@ -68,6 +68,7 @@ import { BslAnalyzerMcpService } from './ui/mcp/BslAnalyzerMcpService';
 import { AiMcpViewProvider } from './ui/views/ai/AiMcpViewProvider';
 import { AiSecretStorage } from './infra/ai/AiSecretStorage';
 import { disposeCachedAgentOperationServices, setProjectSecretStorage } from './ui/commands/ext/ExtensionCommandRunner';
+import { registerAgentSettingsWatcher } from './ui/commands/ext/agent/agentSettingsWatcher';
 import { disposeRepositoryCommandStatusBar } from './ui/commands/repository/RepositoryCommandRunner';
 import { GitStateObserver } from './ui/git/GitStateObserver';
 import type { GitApiLike, GitExtensionLike } from './ui/git/gitExtensionApi';
@@ -359,6 +360,8 @@ export class Container {
     c.wireReadonlyGuard();
     c.reloadEntries();
     c.wireMcpConfigurationWatcher();
+    // Смена настроек агента пересоздаёт его подключения (после идущей операции, не под ней).
+    registerAgentSettingsWatcher(c.context, c.outputChannel);
     c.startMcpServer();
     c.wireLsp();
     c.startBslAnalyzerMcpServers();

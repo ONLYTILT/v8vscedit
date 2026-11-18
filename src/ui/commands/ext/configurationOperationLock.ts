@@ -17,6 +17,7 @@ import * as vscode from 'vscode';
 const BUSY_CONTEXT_KEY = 'v8vscedit.isUpdatingConfigurations';
 
 let operationRunning = false;
+const idleActions: (() => void)[] = [];
 
 /** Идёт ли сейчас эксклюзивная операция над конфигурацией. */
 export function isConfigurationOperationRunning(): boolean {
@@ -39,7 +40,29 @@ export async function tryBeginConfigurationOperation(): Promise<boolean> {
 /** Освобождает замок. Вызывается только тем, кто его занял (обычно в `finally`). */
 export async function endConfigurationOperation(): Promise<void> {
   operationRunning = false;
+  // Синхронно, до первого await: следующая операция не успеет занять замок раньше отложенных действий.
+  for (const action of idleActions.splice(0)) {
+    try {
+      action();
+    } catch {
+      // Отказ одного действия не должен отменить остальные и оставить ключ занятости выставленным;
+      // сообщать о своём сбое — забота самого действия (у него есть журнал, у замка — нет).
+    }
+  }
   await vscode.commands.executeCommand('setContext', BUSY_CONTEXT_KEY, false);
+}
+
+/**
+ * Выполняет `action` сразу, если операция не идёт, иначе — при освобождении замка. Нужен тем, кто
+ * меняет общее состояние операций (сброс кэша сервисов агента при смене настроек): закрыть SSH под
+ * идущей операцией значит оборвать её на середине.
+ */
+export function runWhenConfigurationOperationIdle(action: () => void): void {
+  if (operationRunning) {
+    idleActions.push(action);
+    return;
+  }
+  action();
 }
 
 export const CONFIGURATION_OPERATION_BUSY_MESSAGE = 'Операция с конфигурацией уже выполняется. Дождитесь её завершения.';
