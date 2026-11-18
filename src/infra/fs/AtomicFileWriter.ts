@@ -70,12 +70,22 @@ export function writeFileAtomic(targetPath: string, data: string | Uint8Array): 
     }
     fs.renameSync(tempPath, target);
   } catch (error) {
-    // Мусор убирается безусловно (`force` гасит ENOENT, если временный файл так
-    // и не создался), а исходная причина отказа пробрасывается наружу: тихий
-    // откат на прямую запись вернул бы ровно тот дефект, ради которого написан
-    // этот модуль.
-    fs.rmSync(tempPath, { force: true });
+    // Мусор убирается безусловно, а исходная причина отказа пробрасывается
+    // наружу: тихий откат на прямую запись вернул бы ровно тот дефект, ради
+    // которого написан этот модуль. Именно unlink, а не `fs.rmSync`: на Windows
+    // rmSync системного Node 24 молча не удаляет файл с кириллицей в имени, а имя
+    // временного файла содержит имя цели.
+    removeTempQuietly(tempPath);
     throw error;
+  }
+}
+
+/** Временный файл мог так и не появиться (отказ на создании) — его отсутствие не ошибка. */
+function removeTempQuietly(tempPath: string): void {
+  try {
+    fs.unlinkSync(tempPath);
+  } catch {
+    // исходная причина отказа важнее
   }
 }
 

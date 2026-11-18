@@ -82,7 +82,8 @@ function requireExtensionName(target: AgentConfigurationTarget): string {
   return name;
 }
 
-function sanitizePathPart(value: string): string {
+/** Безопасный сегмент пути агента: всё, кроме букв, цифр и `._-`, заменяется на `_`. */
+export function sanitizePathPart(value: string): string {
   const result = value.trim().replace(/[^\p{L}\p{N}._-]+/gu, '_');
   if (!result || result === '.' || result === '..') {
     throw new Error(`Некорректный сегмент пути агента: ${value}`);

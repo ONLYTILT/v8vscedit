@@ -78,6 +78,10 @@ export class SftpTestBackend {
   renameOverwrites = true;
   /** `rmdir` непустого каталога рекурсивен (поведение агента); иначе — отказ, как у обычного SFTP. */
   recursiveRmdir = true;
+  /** Ответ READ не длиннее этого числа байт (SFTP разрешает серверу отвечать короче запроса). */
+  readResponseLimit: number | undefined;
+  /** FSTAT отвечает без размера (флаг SIZE не выставлен — SFTP v3 это допускает). */
+  fstatWithoutSize = false;
 
   private readonly failures: FailureState[] = [];
   private readonly dropRules: { op: SftpOp; pathIncludes?: string; drop: () => void }[] = [];
@@ -201,8 +205,9 @@ export class SftpTestBackend {
           status(reqId, STATUS_CODE.FAILURE);
           return;
         }
-        const buffer = Buffer.alloc(length);
-        const bytes = fs.readSync(open.fd, buffer, 0, length, offset);
+        const want = this.readResponseLimit === undefined ? length : Math.min(length, this.readResponseLimit);
+        const buffer = Buffer.alloc(want);
+        const bytes = fs.readSync(open.fd, buffer, 0, want, offset);
         if (bytes === 0) {
           status(reqId, STATUS_CODE.EOF);
           return;
@@ -242,7 +247,10 @@ export class SftpTestBackend {
           status(reqId, STATUS_CODE.FAILURE);
           return;
         }
-        sftp.attrs(reqId, toAttributes(fs.fstatSync(open.fd)));
+        const attrs = toAttributes(fs.fstatSync(open.fd));
+        // Тип ssh2 требует size, но кодировщик ответа выставляет флаг SIZE только для числа —
+        // так эмулируется сервер, не сообщающий размер.
+        sftp.attrs(reqId, this.fstatWithoutSize ? { ...attrs, size: undefined as unknown as number } : attrs);
       });
     });
 

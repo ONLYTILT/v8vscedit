@@ -32,7 +32,14 @@ interface ResolvedPath {
   readonly remote: string;
 }
 
-const READ_CHUNK = 32 * 1024;
+/** Порция одного запроса READ/WRITE: укладывается в один пакет SFTP у любого сервера. */
+const IO_CHUNK = 32 * 1024;
+/**
+ * Порций одного файла в полёте одновременно (Н32). Последовательный обмен упирается в задержку:
+ * при 80 мс это ≈400 КБ/с, и архив выгрузки так не передать; окно в 16 порций снимает это
+ * ограничение (тот же приём, что у `fastGet`/`fastPut` ssh2), не переполняя очередь сервера.
+ */
+const IO_WINDOW = 16;
 /** Одновременных листингов при рекурсивном обходе. */
 const LIST_CONCURRENCY = 8;
 // Окончание временных имён: не `.xml`, иначе watcher `src/**/*.xml` принял бы недописанный файл
@@ -260,8 +267,14 @@ export class SftpAgentFileStore implements AgentFileStore {
   private async writeHandle(remote: string, bytes: Buffer): Promise<void> {
     const handle = await this.open(remote, 'w');
     try {
-      // ssh2 сам режет запись на пакеты по лимиту сервера и шлёт их последовательно.
-      await this.connection.request<undefined>((sftp, done) => sftp.write(handle, bytes, 0, bytes.length, 0, (error) => done(error, undefined)));
+      // Порции пишутся по своим смещениям независимо друг от друга, поэтому их можно держать в
+      // полёте окном: порядок прихода ответов на результат не влияет.
+      await runWindowed(Math.ceil(bytes.length / IO_CHUNK), IO_WINDOW, (index) => {
+        const offset = index * IO_CHUNK;
+        const length = Math.min(IO_CHUNK, bytes.length - offset);
+        return this.connection.request<undefined>((sftp, done) =>
+          sftp.write(handle, bytes, offset, length, offset, (error) => done(error, undefined)));
+      });
     } catch (error) {
       await this.closeQuietly(handle);
       throw error;
@@ -417,20 +430,59 @@ export class SftpAgentFileStore implements AgentFileStore {
     return this.connection.request<undefined>((sftp, done) => sftp.close(handle, (error) => done(error, undefined)));
   }
 
+  /**
+   * Размер берётся из FSTAT, и порции читаются окном по своим смещениям (Н32); лишний READ ради
+   * EOF не нужен. Файл, укороченный во время чтения, — отказ: выгрузку агент пишет temp+rename,
+   * и такой исход означает чужую запись поверх, а не повод вернуть обрезанное содержимое.
+   */
   private async readAll(handle: Buffer): Promise<Buffer> {
+    const stats = await this.connection.request<Stats>((sftp, done) => sftp.fstat(handle, done));
+    // SFTP v3 позволяет серверу не сообщать размер: тогда — последовательное чтение до EOF.
+    if (!Number.isSafeInteger(stats.size)) {
+      return this.readToEof(handle);
+    }
+    const buffer = Buffer.alloc(stats.size);
+    await runWindowed(Math.ceil(stats.size / IO_CHUNK), IO_WINDOW, async (index) => {
+      const start = index * IO_CHUNK;
+      const length = Math.min(IO_CHUNK, stats.size - start);
+      if ((await this.readRange(handle, buffer, start, length)) < length) {
+        throw new Error('файл изменился во время чтения (EOF раньше размера из FSTAT)');
+      }
+    });
+    return buffer;
+  }
+
+  private async readToEof(handle: Buffer): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let position = 0;
     for (;;) {
-      const buffer = Buffer.alloc(READ_CHUNK);
-      const bytesRead = await this.connection.request<number>((sftp, done) =>
-        sftp.read(handle, buffer, 0, READ_CHUNK, position, (error, count) => done(error, count)));
-      // ssh2 отдаёт EOF как прочитанные 0 байт.
-      if (bytesRead === 0) {
+      const chunk = Buffer.alloc(IO_CHUNK);
+      const count = await this.connection.request<number>((sftp, done) =>
+        sftp.read(handle, chunk, 0, IO_CHUNK, position, (error, bytesRead) => done(error, bytesRead)));
+      if (count === 0) {
         return Buffer.concat(chunks);
       }
-      chunks.push(buffer.subarray(0, bytesRead));
-      position += bytesRead;
+      chunks.push(chunk.subarray(0, count));
+      position += count;
     }
+  }
+
+  /**
+   * Читает до `length` байт файла с позиции `offset` в то же место `target`; сервер вправе ответить
+   * короче запрошенного, тогда остаток дочитывается. Меньше `length` — только при EOF.
+   */
+  private async readRange(handle: Buffer, target: Buffer, offset: number, length: number): Promise<number> {
+    let done = 0;
+    while (done < length) {
+      const count = await this.connection.request<number>((sftp, callback) =>
+        sftp.read(handle, target, offset + done, length - done, offset + done, (error, bytesRead) => callback(error, bytesRead)));
+      // ssh2 отдаёт EOF как прочитанные 0 байт.
+      if (count === 0) {
+        break;
+      }
+      done += count;
+    }
+    return done;
   }
 
   private readdir(remote: string): Promise<FileEntryWithStats[]> {
@@ -483,6 +535,30 @@ export async function connectSftpAgentFileStore(
 /** Родитель относительного пути; у пути первого уровня — корень (пустая строка). */
 function parentOf(rel: string): string {
   return rel.slice(0, Math.max(rel.lastIndexOf('/'), 0));
+}
+
+/**
+ * Задачи `0…count-1`, не более `window` одновременно. После первого отказа новые не стартуют, но
+ * уже начатые дожидаются: дескриптор файла закрывается только когда по нему не осталось запросов.
+ */
+async function runWindowed(count: number, window: number, run: (index: number) => Promise<unknown>): Promise<void> {
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const worker = async (): Promise<void> => {
+    while (next < count && failure === undefined) {
+      const index = next;
+      next += 1;
+      try {
+        await run(index);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(window, count) }, worker));
+  if (failure !== undefined) {
+    throw failure.error;
+  }
 }
 
 /** Не более `limit` одновременных вызовов `run`; порядок запуска — порядок `items`. */

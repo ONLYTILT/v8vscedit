@@ -79,7 +79,7 @@ export class LocalAgentFileStore implements AgentFileStore {
         // Файл или ссылка (в том числе junction на каталог): unlink не следует по ссылке.
         await fs.promises.unlink(target.abs);
       } else if (options?.recursive) {
-        await fs.promises.rm(target.abs, { recursive: true, force: true });
+        await removeTree(target.abs);
       } else {
         // rmdir локальной ФС сам отказывает на непустом каталоге — то, что контракт
         // требует явной проверкой от SFTP-реализации.
@@ -197,6 +197,23 @@ export async function resolveLocalAgentUserRoot(agentBaseDir: string, userName: 
 
 export async function createLocalAgentFileStore(agentBaseDir: string, userName: string): Promise<LocalAgentFileStore> {
   return new LocalAgentFileStore(await resolveLocalAgentUserRoot(agentBaseDir, userName));
+}
+
+/**
+ * Рекурсивное удаление своим обходом через unlink/rmdir, а не `fs.rm`: на Windows `fs.rmSync`
+ * системного Node 24 молча (без исключения) не удаляет файлы с кириллицей в имени (проверено
+ * 2026-11-17), а у выгрузки 1С кириллица — в каждом втором пути. Ссылки удаляются сами по себе.
+ */
+async function removeTree(dir: string): Promise<void> {
+  for (const dirent of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    const abs = path.join(dir, dirent.name);
+    if (dirent.isDirectory()) {
+      await removeTree(abs);
+    } else {
+      await fs.promises.unlink(abs);
+    }
+  }
+  await fs.promises.rmdir(dir);
 }
 
 function toEntry(rel: string, stats: fs.Stats): AgentFileEntry {

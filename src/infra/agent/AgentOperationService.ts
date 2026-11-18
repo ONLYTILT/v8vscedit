@@ -1,32 +1,15 @@
-import * as fs from 'fs';
 import {
-  buildDumpConfigToFilesCommand,
-  buildLoadConfigFromFilesCommand,
   buildUpdateDbCfgCommand,
-  type AgentConfigurationTarget,
   type AgentMessage,
 } from '../../domain/agent';
-import {
-  buildHashSnapshot,
-  buildScopeKey,
-  collectCurrentHashes,
-  diffHashSnapshots,
-  loadHashCache,
-  patchHashSnapshot,
-  saveHashCache,
-} from '../cache/HashCache';
+import { buildScopeKey } from '../cache/HashCache';
 import { saveMetadataCacheForEntry } from '../cache/MetadataCache';
 import { AgentWorkspaceService, buildAgentProjectId } from './AgentWorkspaceService';
-import {
-  hasAgentConfigurationDump,
-  mirrorAgentToProject,
-  mirrorProjectToAgent,
-  uploadProjectFiles,
-} from './AgentWorkspaceMirror';
-import { collectConfigFilesForLoad, detectPotentialRename } from './ConfigLoadFileCollector';
 import { resolveDefaultAgentBaseDir } from './DesignerAgentProcess';
 import type { AgentFileStore } from './files/AgentFileStore';
+import type { AgentTransferCancellation } from './files/AgentFileTransfer';
 import { createLocalAgentFileStore } from './files/LocalAgentFileStore';
+import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type {
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
@@ -49,6 +32,8 @@ export interface AgentOperationHooks {
   readonly onMessage?: (message: string) => void;
   readonly onProjectFilesWillChange?: (filePaths: string[]) => void;
   readonly onQuestion?: (message: AgentMessage) => Promise<string | undefined>;
+  /** Отмена синхронизации (структурно совместима с `vscode.CancellationToken`). */
+  readonly cancellation?: AgentTransferCancellation;
 }
 
 export interface AgentOperationResult {
@@ -68,7 +53,7 @@ export interface AgentOperationFilesOptions {
 
 interface AgentFiles {
   readonly store: AgentFileStore;
-  readonly workspace: AgentWorkspaceService;
+  readonly engine: AgentSyncEngine;
 }
 
 export interface DesignerAgentInfoBaseSession {
@@ -127,47 +112,33 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
   async importFromDatabase(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
     const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
-      const { store, workspace: workspaceService } = await this.getFiles(filesOptions);
-      const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
-      const command = buildDumpConfigToFilesCommand(workspace.targetAgentDir, {
-        extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined,
-        format: 'hierarchical',
-        update: (await store.stat(`${workspace.targetAgentDir}/ConfigDumpInfo.xml`)) !== undefined,
-        force: true,
-      });
-
-      await exec.execute(command);
-      // M остаётся полным снимком базы (копирование, а не перенос): частичной загрузке
-      // `load-config-from-files --partial` нужен целостный каркас выгрузки в `--dir`.
-      const changedProjectFiles = await mirrorAgentToProject(
-        store,
-        workspace.targetAgentDir,
-        target.rootPath,
-        hooks?.onProjectFilesWillChange
-      );
-      this.refreshCaches(target);
+      const { engine } = await this.getFiles(filesOptions);
+      const { changedProjectFiles } = await engine.importTarget(target, exec, hooks);
+      this.refreshMetadataCache(target);
       return { changedProjectFiles };
     }, hooks);
   }
 
   async loadFullAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    this.requireFilesOptions();
+    const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
-      await this.loadFull(target, exec, hooks);
+      const { engine } = await this.getFiles(filesOptions);
+      await engine.loadTarget(target, 'full', exec, hooks);
       return this.updateDatabaseConfigurationConnected(target, exec, hooks);
     }, hooks);
   }
 
   async loadChangedAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
-    this.requireFilesOptions();
+    const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
-      const loaded = await this.loadChanged(target, exec, hooks);
+      const { engine } = await this.getFiles(filesOptions);
+      const loaded = await engine.loadTarget(target, 'changed', exec, hooks);
       if (loaded.skipped) {
         hooks?.onMessage?.('изменений для загрузки нет');
-        return loaded;
+        return { changedProjectFiles: [], skipped: true };
       }
       await this.updateDatabaseConfigurationConnected(target, exec, hooks);
-      return loaded;
+      return { changedProjectFiles: [] };
     }, hooks);
   }
 
@@ -187,109 +158,10 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     return { changedProjectFiles: [] };
   }
 
-  private async loadFull(
-    target: AgentConfigurationOperationTarget,
-    exec: AgentCommandExecutor,
-    hooks?: AgentOperationHooks
-  ): Promise<AgentOperationResult> {
-    const { store, workspace: workspaceService } = await this.getFiles(this.requireFilesOptions());
-    const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
-    hooks?.onMessage?.('Подготовка файлов для полной загрузки.');
-    await mirrorProjectToAgent(store, target.rootPath, workspace.targetAgentDir);
-    hooks?.onMessage?.('Полная загрузка конфигурации из файлов.');
-    await exec.execute(
-      buildLoadConfigFromFilesCommand(workspace.targetAgentDir, {
-        extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined,
-        format: 'hierarchical',
-        updateConfigDumpInfo: true,
-      })
-    );
-    this.refreshHashCache(target);
-    return { changedProjectFiles: [] };
-  }
-
-  private async loadChanged(
-    target: AgentConfigurationOperationTarget,
-    exec: AgentCommandExecutor,
-    hooks?: AgentOperationHooks
-  ): Promise<AgentOperationResult> {
-    if (!fs.existsSync(target.rootPath)) {
-      throw new Error(`Каталог исходников не найден: ${target.rootPath}`);
-    }
-
-    const extensionName = target.kind === 'cfe' ? target.extensionName ?? target.name : '';
-    const commandExtensionName = target.kind === 'cfe' ? extensionName : undefined;
-    const scopeKey = buildScopeKey(target.kind, target.rootPath, extensionName);
-    const previousSnapshot = loadHashCache(this.projectRoot, scopeKey);
-    const currentSnapshot = buildHashSnapshot(scopeKey, target.rootPath);
-    const diff = diffHashSnapshots(previousSnapshot, currentSnapshot);
-    const changedFiles = [...diff.added, ...diff.modified];
-
-    if (changedFiles.length === 0 && diff.deleted.length === 0) {
-      return { changedProjectFiles: [], skipped: true };
-    }
-
-    if (Object.keys(previousSnapshot.files).length === 0) {
-      hooks?.onMessage?.('Кэш изменений не найден, выполняется полная загрузка.');
-      return this.loadFull(target, exec, hooks);
-    }
-
-    // Переименование проверяется ДО удаления: оно всегда содержит удалённые файлы, и в
-    // обратном порядке ветка переименования была недостижима (сообщение — всегда «удаление»).
-    const forceFullLoad = detectPotentialRename(previousSnapshot.files, currentSnapshot.files, diff.added, diff.deleted);
-    if (forceFullLoad) {
-      hooks?.onMessage?.('Обнаружено переименование объектов, выполняется полная загрузка.');
-      return this.loadFull(target, exec, hooks);
-    }
-
-    if (diff.deleted.length > 0) {
-      hooks?.onMessage?.('Обнаружено удаление файлов, выполняется полная загрузка.');
-      return this.loadFull(target, exec, hooks);
-    }
-
-    const filesForLoad = collectConfigFilesForLoad(target.rootPath, changedFiles, false);
-    if (filesForLoad.length === 0) {
-      return { changedProjectFiles: [], skipped: true };
-    }
-
-    const { store, workspace: workspaceService } = await this.getFiles(this.requireFilesOptions());
-    const workspace = await workspaceService.ensureWorkspace(toWorkspaceTarget(target));
-    hooks?.onMessage?.(`Подготовка частичной загрузки: ${String(filesForLoad.length)} файл(ов).`);
-    // Конфигуратору на `load-config-from-files --partial` нужен целостный каркас
-    // выгрузки в `--dir`: Configuration.xml, родительские XML для модулей форм и т.д.
-    // Без каркаса (проект только что заведён, M очищено) зеркалим проект целиком —
-    // иначе агент валится в пустой UnknownError, не имея контекста для частичной загрузки.
-    if (!(await hasAgentConfigurationDump(store, workspace.targetAgentDir))) {
-      await mirrorProjectToAgent(store, target.rootPath, workspace.targetAgentDir);
-    }
-    await uploadProjectFiles(store, target.rootPath, workspace.targetAgentDir, filesForLoad);
-    const operationId = `${buildSessionKey(target)}-${String(Date.now())}`;
-    const agentListFile = await workspaceService.writeListFile(operationId, filesForLoad);
-
-    hooks?.onMessage?.('Частичная загрузка изменённых файлов.');
-    // ConfigDumpInfo.xml для расширения/конфигурации поддерживается на стороне `loadFull`.
-    // На частичной загрузке передавать `--update-config-dump-info` нельзя:
-    // конфигуратор перезаписывает файл «срезом» только из переданного списка и при
-    // повторных частичных загрузках уходит во внутреннее `UnknownError` с пустым телом.
-    await exec.execute(
-      buildLoadConfigFromFilesCommand(workspace.targetAgentDir, {
-        extensionName: commandExtensionName,
-        format: 'hierarchical',
-        listFile: agentListFile,
-        partial: true,
-        noCheck: true,
-      })
-    );
-
-    const changedHashes = collectCurrentHashes(target.rootPath, changedFiles);
-    saveHashCache(this.projectRoot, patchHashSnapshot(previousSnapshot, changedHashes, diff.deleted));
-    return { changedProjectFiles: [] };
-  }
-
-  private refreshCaches(target: AgentConfigurationOperationTarget): void {
+  /** Кэш метаданных дерева строится по новому P; B и кэш хэшей уже сохранил движок. */
+  private refreshMetadataCache(target: AgentConfigurationOperationTarget): void {
     const extensionName = target.kind === 'cfe' ? target.extensionName ?? target.name : '';
     const scopeKey = buildScopeKey(target.kind, target.rootPath, extensionName);
-    saveHashCache(this.projectRoot, buildHashSnapshot(scopeKey, target.rootPath));
     saveMetadataCacheForEntry(this.projectRoot, scopeKey, { kind: target.kind, rootPath: target.rootPath });
   }
 
@@ -314,23 +186,9 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
         options.agentBaseDir ?? resolveDefaultAgentBaseDir(this.projectRoot),
         options.userName
       );
-      this.files = { store, workspace: new AgentWorkspaceService(store, buildAgentProjectId(this.projectRoot)) };
+      const workspace = new AgentWorkspaceService(store, buildAgentProjectId(this.projectRoot));
+      this.files = { store, engine: new AgentSyncEngine({ projectRoot: this.projectRoot, store, workspace }) };
     }
     return this.files;
   }
-
-  private refreshHashCache(target: AgentConfigurationOperationTarget): void {
-    const extensionName = target.kind === 'cfe' ? target.extensionName ?? target.name : '';
-    const scopeKey = buildScopeKey(target.kind, target.rootPath, extensionName);
-    saveHashCache(this.projectRoot, buildHashSnapshot(scopeKey, target.rootPath));
-  }
-}
-
-function buildSessionKey(target: AgentConfigurationOperationTarget): string {
-  return target.kind === 'cf' ? 'cf' : `cfe-${target.extensionName ?? target.name}`;
-}
-
-/** Без явного `extensionName` расширение называется по имени цели — как и в командах агента. */
-function toWorkspaceTarget(target: AgentConfigurationOperationTarget): AgentConfigurationTarget {
-  return target.kind === 'cf' ? { kind: 'cf' } : { kind: 'cfe', extensionName: target.extensionName ?? target.name };
 }

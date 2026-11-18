@@ -12,7 +12,6 @@ export * from './InteractiveDesignerLauncher';
 export * from './ProcessDesignerAgentTransport';
 export * from './SshConnectErrorClassifier';
 export * from './TcpPortWaiter';
-export * from './AgentWorkspaceMirror';
 export * from './files/AgentFileStore';
 export * from './files/AgentFileTransfer';
 export * from './files/LocalAgentFileStore';

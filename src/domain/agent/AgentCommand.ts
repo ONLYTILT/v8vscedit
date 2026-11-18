@@ -16,6 +16,11 @@ export interface AgentCommandOptions {
   readonly updateConfigDumpInfo?: boolean;
   readonly noCheck?: boolean;
   readonly threads?: string;
+  /** Имя архива; агент разрешает его относительно `--dir` (факт пилота §5b п.6). */
+  readonly archive?: string;
+  readonly getChanges?: string;
+  readonly configDumpInfoForChanges?: string;
+  readonly configDumpInfoOnly?: boolean;
 }
 
 export function buildAgentCommand(command: string, options: Record<string, string | boolean | undefined> = {}): string {
@@ -34,6 +39,11 @@ export function buildAgentCommand(command: string, options: Record<string, strin
 }
 
 export function buildDumpConfigToFilesCommand(dirPath: string, options: AgentCommandOptions = {}): string {
+  // Пилот: `--update` вместе с `--archive` агент не выполняет, а сообщает об этом невнятно —
+  // ошибку в построении команды ловим до отправки.
+  if (options.update && options.archive !== undefined) {
+    throw new Error('Выгрузка агента: ключи --update и --archive вместе не поддерживаются (update + archive).');
+  }
   return buildAgentCommand('config dump-config-to-files', {
     dir: dirPath,
     extension: options.extensionName,
@@ -42,6 +52,10 @@ export function buildDumpConfigToFilesCommand(dirPath: string, options: AgentCom
     update: options.update,
     force: options.force,
     'list-file': options.listFile,
+    'get-changes': options.getChanges,
+    'config-dump-info-for-changes': options.configDumpInfoForChanges,
+    'config-dump-info-only': options.configDumpInfoOnly,
+    archive: options.archive,
   });
 }
 
@@ -52,6 +66,7 @@ export function buildLoadConfigFromFilesCommand(dirPath: string, options: AgentC
     'all-extensions': options.allExtensions,
     format: options.format ?? 'hierarchical',
     'list-file': options.listFile,
+    archive: options.archive,
     partial: options.partial,
     'update-config-dump-info': options.updateConfigDumpInfo,
     'no-check': options.noCheck,
