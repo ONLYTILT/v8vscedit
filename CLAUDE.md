@@ -139,6 +139,7 @@ src/
 │   │   ├── ConfigurationXmlEditor.ts # редактирование Configuration.xml
 │   │   ├── MetadataXmlCreator.ts     # создание новых XML-объектов метаданных
 │   │   ├── MetadataXmlRemover.ts     # удаление XML-объектов метаданных
+│   │   ├── dumpInfo/                 # ConfigDumpInfoIndex: ЕДИНСТВЕННЫЙ разбор ConfigDumpInfo.xml (владельцы, версии)
 │   │   ├── childObjects/             # канон порядка <ChildObjects> (см. docs/xml-format-rulesets.md)
 │   │   │   ├── ChildObjectsOrder.ts  # ДАННЫЕ: CHILD_OBJECTS_ORDER (по MetaKind), childTagRank, hasOrderRule
 │   │   │   └── ChildObjectsEditor.ts # МЕХАНИКА: resolveInsertOffset — не знает ни одного вида метаданных
@@ -201,7 +202,10 @@ src/
 │   │   └── sync/                     # движок синхронизации M/P/B: SyncPlanner (чистый), SyncManifest (+ mirrorCoverage full/sparse),
 │   │                                  # AgentImportFlow/AgentLoadFlow, ArchiveCodec/ZipContainer (zip/zip64, ZipByteSource/ZipStreamWriter),
 │   │                                  # ArchiveFile/ArchiveImport (потоковый архив без буфера целиком), MirrorSeed (посев
-│   │                                  # разреженного зеркала M), LocalExchange (.v8vscedit/agent-exchange)
+│   │                                  # разреженного зеркала M), LocalExchange (.v8vscedit/agent-exchange),
+│   │                                  # ProjectSeed (посев M из проекта, «сироты»), SparseRestore (точечная выгрузка
+│   │                                  # `dump --list-file`), ProjectDumpInfo (отпечаток CDI проекта); причины полной
+│   │                                  # выгрузки — таблица `ARCHIVE_REASON_POLICY` в SyncPlanner (docs/architecture.md)
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
 │   │   │                              # SensitiveArgs (маскирование -Password в логах),
 │   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)
