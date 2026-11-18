@@ -143,7 +143,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
   });
 
   suite('импорт: сбои и самовосстановление', () => {
-    test('повреждённый архив при FullDump: ArchiveFormatError, P не тронут, хук не вызван, M → empty; следующий импорт чинит', async () => {
+    test('повреждённый архив при FullDump: ArchiveFormatError, P не тронут, хук не вызван, M НЕ тронут (манифест fresh); следующий импорт снова идёт архивом full-dump и чинит', async () => {
       await start();
       await doImport();
       const before = h.snapshotP();
@@ -158,12 +158,13 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
 
       assert.deepStrictEqual(h.snapshotP(), before, 'частичной записи в проект нет');
       assert.strictEqual(hookCalls, 0);
-      assert.strictEqual(h.manifest().mirrorState, 'empty');
+      // Изменено: FullDump → архив без предшествующей мутации M; испорченный архив отвергается до посева.
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
       assert.deepStrictEqual(fs.existsSync(path.join(h.userRoot, 'exchange')) ? fs.readdirSync(path.join(h.userRoot, 'exchange')) : [], []);
 
       const healed = await doImport();
       assert.strictEqual(healed.strategy, 'archive');
-      assert.strictEqual(healed.reason, 'mirror-empty');
+      assert.strictEqual(healed.reason, 'full-dump');
       assert.deepStrictEqual(h.snapshotP(), dbAsText(h.emulator.dbFiles()));
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
@@ -280,7 +281,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       assert.strictEqual(h.readP('Subsystems/Родитель/Subsystems/Дочерняя.xml'), '<Subsystem>Дочерняя v2</Subsystem>');
     });
 
-    test('усечённый счётчик записей архива (Б3): ArchiveFormatError, P не тронут, M → empty', async () => {
+    test('усечённый счётчик записей архива (Б3): ArchiveFormatError, P не тронут, M не тронут (архив отвергнут до посева)', async () => {
       await start();
       await doImport();
       const before = h.snapshotP();
@@ -297,7 +298,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       await assert.rejects(doImport(), ArchiveFormatError);
 
       assert.deepStrictEqual(h.snapshotP(), before, 'ни одного удаления «отсутствующих» файлов');
-      assert.strictEqual(h.manifest().mirrorState, 'empty');
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
 
     // Изменено планом потокового архива/посева: полной выгрузки в M при первом импорте больше нет —

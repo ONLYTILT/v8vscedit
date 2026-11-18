@@ -7,7 +7,7 @@
  *  - `v8vscedit.agent.location`: enum `local|remote`, умолчание `local`; незнакомое значение → `local`.
  *  - `v8vscedit.agent.transferConcurrency`: целое, умолчание 16, minimum 1, maximum 64; нечисло, NaN, <1 → 16,
  *    дробное округляется вниз, больше 64 → 64.
- *  - `v8vscedit.agent.archiveThresholdFiles`: целое, умолчание 300, minimum 1; нечисло, <1 → 300, дробное вниз.
+ *  - `v8vscedit.agent.archiveThresholdFiles`: целое, умолчание 20000, minimum 1; нечисло, <1 → 20000, дробное вниз.
  *  - `resolveAgentExecutionMode(location, operationMode): 'batch' | 'agent'` — чистая таблица; remote + не-agent
  *    (batch/не задан/мусор) — `Error` с упоминанием `v8vscedit.agent.location` и `v8vscedit.configuration.operationMode`,
  *    молчаливого отката на локальный режим нет. `getAgentExecutionMode()` читает обе настройки из vscode.
@@ -77,12 +77,14 @@ suite('Агент Э8: package.json — объявление настроек', 
     assert.match(property.description ?? '', /[А-Яа-яЁё]/);
   });
 
-  test('v8vscedit.agent.archiveThresholdFiles: number, 300, minimum 1, русское описание', () => {
+  test('v8vscedit.agent.archiveThresholdFiles: number, 20000 (было 300 — полная выгрузка при любой «средней» правке), minimum 1, русское описание «только удалённый агент»', () => {
     const property = manifestProperty('v8vscedit.agent.archiveThresholdFiles');
     assert.strictEqual(property.type, 'number');
-    assert.strictEqual(property.default, 300);
+    assert.strictEqual(property.default, 20000);
     assert.strictEqual(property.minimum, 1);
     assert.match(property.description ?? '', /[А-Яа-яЁё]/);
+    // Порог читают только удалённые ветки движка (локальный агент сравнивает M и P целиком).
+    assert.match(property.description ?? '', /Только удалённый агент/);
   });
 
   test('описание autoStart предупреждает, что в удалённом режиме настройка игнорируется', () => {
@@ -102,11 +104,11 @@ suite('Агент Э8: чтение настроек удалённого реж
     });
   }
 
-  test('умолчания: local, 16, 300', () => {
+  test('умолчания: local, 16, 20000', () => {
     const settings = readAgentCommandSettings({});
     assert.strictEqual(settings.location, 'local');
     assert.strictEqual(settings.transferConcurrency, 16);
-    assert.strictEqual(settings.archiveThresholdFiles, 300);
+    assert.strictEqual(settings.archiveThresholdFiles, 20000);
   });
 
   for (const bad of ['Remote', 'ssh', '', 5, null]) {
@@ -131,8 +133,8 @@ suite('Агент Э8: чтение настроек удалённого реж
 
   const thresholdTable: [unknown, number][] = [
     [1, 1], [50, 50], [300, 300], [100000, 100000],
-    [7.9, 7], [0.4, 300],
-    [0, 300], [-1, 300], ['много', 300], [null, 300],
+    [7.9, 7], [0.4, 20000],
+    [0, 20000], [-1, 20000], ['много', 20000], [null, 20000],
   ];
   for (const [raw, expected] of thresholdTable) {
     test(`archiveThresholdFiles=${JSON.stringify(raw)} → ${String(expected)}`, async () => {

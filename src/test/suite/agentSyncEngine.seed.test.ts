@@ -403,27 +403,36 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
   // ── i: локальные правки при разреженном M ─────────────────────────────────────
 
   suite('локальные правки (D) при разреженном M', () => {
-    test('D.modified файла неизменённого владельца → архив sparse-mirror-dirty, файл восстановлен', async () => {
+    // Изменено планом «полная выгрузка — только когда без неё нельзя»: правка файла неизменённого владельца
+    // при разреженном M больше не ведёт в архив sparse-mirror-dirty — файл берёт из базы точечная выгрузка.
+    test('D.modified файла неизменённого владельца → дельта с точечной выгрузкой (НЕ архив), файл восстановлен, M не тронут', async () => {
       await start();
       await h.importTarget();
       h.writeP('Catalogs/Клиенты.xml', '<Catalog>моя правка</Catalog>');
+      const mBefore = h.snapshotM();
+      const dumpsBefore = h.emulator.dumps().length;
 
       const result = await h.importTarget();
 
-      assert.strictEqual(result.strategy, 'archive');
-      assert.strictEqual(result.reason, 'sparse-mirror-dirty');
+      assert.strictEqual(result.strategy, 'delta');
+      assert.strictEqual(result.reason, undefined);
+      assert.strictEqual(result.restoredFromDatabase, 1);
+      assert.ok(h.emulator.dumps().slice(dumpsBefore).every((d) => !d.options.archive), 'архива нет');
+      assert.strictEqual(h.emulator.listDumpCalls, 1);
+      assert.deepStrictEqual(h.snapshotM(), mBefore, 'M не изменён точечной выгрузкой');
       assert.strictEqual(h.readP('Catalogs/Клиенты.xml'), '<Catalog>Клиенты</Catalog>');
       expectPMatchesDb(h, true);
     });
 
-    test('D.deleted файла неизменённого владельца → тоже архив sparse-mirror-dirty, файл возвращён', async () => {
+    test('D.deleted файла неизменённого владельца → тоже точечная выгрузка, файл возвращён', async () => {
       await start();
       await h.importTarget();
       h.removeP('Roles/Админ/Ext/Rights.xml');
 
       const result = await h.importTarget();
 
-      assert.strictEqual(result.reason, 'sparse-mirror-dirty');
+      assert.strictEqual(result.strategy, 'delta');
+      assert.strictEqual(result.restoredFromDatabase, 1);
       assert.strictEqual(h.readP('Roles/Админ/Ext/Rights.xml'), '<Rights/>');
     });
 
@@ -638,7 +647,7 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
       assert.strictEqual(h.manifest().mirrorCoverage, 'sparse');
     });
 
-    test('обрыв скачивания архива (отказ READ по full.zip): P не тронут, манифест empty, оба каталога обмена убраны; повтор успешен', async () => {
+    test('обрыв скачивания архива (отказ READ по full.zip): P не тронут, M не тронут (манифест fresh), оба каталога обмена убраны; повтор успешен', async () => {
       await start();
       await h.importTarget();
       h.emulator.removeObject('Document.Заказ');
@@ -648,13 +657,14 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
       await assert.rejects(h.importTarget(), /full\.zip/);
 
       assert.deepStrictEqual(h.snapshotP(), before);
-      assert.strictEqual(h.manifest().mirrorState, 'empty');
+      // Изменено: FullDump → архив без предшествующей мутации M; обрыв скачивания — до посева, M цел.
+      assert.strictEqual(h.manifest().mirrorState, 'fresh');
       assert.deepStrictEqual(h.serverExchangeLeftovers(), []);
       assert.deepStrictEqual(h.localExchangeLeftovers(), []);
 
       const retry = await h.importTarget();
       assert.strictEqual(retry.strategy, 'archive');
-      assert.strictEqual(retry.reason, 'mirror-empty');
+      assert.strictEqual(retry.reason, 'full-dump');
       expectPMatchesDb(h, true);
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });

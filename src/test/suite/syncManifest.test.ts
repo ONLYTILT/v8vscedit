@@ -266,3 +266,70 @@ suite('SyncManifest: mirrorCoverage', () => {
     });
   }
 });
+
+/**
+ * Отпечаток `ConfigDumpInfo.xml` проекта в манифесте (plan-archive-avoid.md §3.7): по нему импорт узнаёт,
+ * что выгрузку проекта заменили извне. Отсутствие признака безопасно (нет ложного срабатывания), поэтому
+ * битое поле ОТБРАСЫВАЕТСЯ, а манифест принимается — в отличие от неизвестной полноты M (там отвергается
+ * весь манифест).
+ */
+suite('SyncManifest: projectDumpInfo', () => {
+  let projectRoot: string;
+  let configRoot: string;
+  const scope = (): string => buildScopeKey('cf', configRoot);
+  const fingerprint = { sha1: 'a'.repeat(40), size: 33_000_000, mtimeMs: 1_700_000_000_123 };
+
+  setup(() => {
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-sync-dumpinfo-'));
+    configRoot = path.join(projectRoot, 'src', 'cf');
+    fs.mkdirSync(configRoot, { recursive: true });
+  });
+  teardown(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
+
+  function writeRaw(value: Record<string, unknown>): void {
+    const file = resolveSyncManifestPath(projectRoot, scope());
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, scopeKey: scope(), mirrorState: 'fresh', files: { 'a.xml': 'h' }, mirrorCoverage: 'sparse', ...value }));
+  }
+
+  test('round-trip: отпечаток сохраняется и читается как есть; поле лежит в файле манифеста', () => {
+    saveSyncManifest(projectRoot, {
+      schemaVersion: 1, scopeKey: scope(), mirrorState: 'fresh', files: { 'a.xml': 'h' }, projectDumpInfo: fingerprint,
+    });
+    assert.deepStrictEqual(loadSyncManifest(projectRoot, scope()).projectDumpInfo, fingerprint);
+    const raw = JSON.parse(fs.readFileSync(resolveSyncManifestPath(projectRoot, scope()), 'utf-8')) as Record<string, unknown>;
+    assert.deepStrictEqual(raw.projectDumpInfo, fingerprint);
+  });
+
+  test('поле отсутствует (манифест прежней версии) → undefined; остальное читается как раньше', () => {
+    writeRaw({});
+    const loaded = loadSyncManifest(projectRoot, scope());
+    assert.strictEqual(loaded.projectDumpInfo, undefined);
+    assert.strictEqual(loaded.mirrorState, 'fresh');
+    assert.strictEqual(loaded.mirrorCoverage, 'sparse');
+    assert.deepStrictEqual(loaded.files, { 'a.xml': 'h' });
+  });
+
+  const broken: [string, unknown][] = [
+    ['строка вместо объекта', 'sha'],
+    ['null', null],
+    ['массив', []],
+    ['нет sha1', { size: 1, mtimeMs: 2 }],
+    ['sha1 не строка', { sha1: 5, size: 1, mtimeMs: 2 }],
+    ['size строкой', { sha1: 'abc', size: '1', mtimeMs: 2 }],
+    ['нет size', { sha1: 'abc', mtimeMs: 2 }],
+    ['mtimeMs строкой', { sha1: 'abc', size: 1, mtimeMs: '2' }],
+    ['нет mtimeMs', { sha1: 'abc', size: 1 }],
+    ['size NaN (в JSON — null)', { sha1: 'abc', size: Number.NaN, mtimeMs: 2 }],
+  ];
+  for (const [label, value] of broken) {
+    test(`битое поле (${label}) → поле отброшено, манифест ПРИНЯТ (полнота и состояние M сохранены)`, () => {
+      writeRaw({ projectDumpInfo: value });
+      const loaded = loadSyncManifest(projectRoot, scope());
+      assert.strictEqual(loaded.projectDumpInfo, undefined);
+      assert.strictEqual(loaded.mirrorState, 'fresh', 'манифест не отвергнут');
+      assert.strictEqual(loaded.mirrorCoverage, 'sparse');
+      assert.deepStrictEqual(loaded.files, { 'a.xml': 'h' });
+    });
+  }
+});

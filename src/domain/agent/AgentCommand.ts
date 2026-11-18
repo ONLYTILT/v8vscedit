@@ -44,6 +44,11 @@ export function buildDumpConfigToFilesCommand(dirPath: string, options: AgentCom
   if (options.update && options.archive !== undefined) {
     throw new Error('Выгрузка агента: ключи --update и --archive вместе не поддерживаются (update + archive).');
   }
+  // Эксперимент 11: точечная выгрузка по списку с `--update` отклоняется `CommandFormatError` уже на
+  // сервере — ловим до отправки, как и пару update + archive.
+  if (options.update && options.listFile !== undefined) {
+    throw new Error('Выгрузка агента: ключи --list-file и --update вместе не поддерживаются (list-file + update).');
+  }
   return buildAgentCommand('config dump-config-to-files', {
     dir: dirPath,
     extension: options.extensionName,

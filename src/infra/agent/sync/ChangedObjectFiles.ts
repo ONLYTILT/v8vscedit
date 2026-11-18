@@ -1,6 +1,11 @@
 import type { DumpChangedObject } from '../../../domain/agent/DumpChangesParser';
 import { META_TYPES, type MetaTypeDef } from '../../../domain/MetaTypes';
 import type { AgentFileStore } from '../files/AgentFileStore';
+import {
+  AgentTransferCancelledError,
+  forEachConcurrent,
+  type AgentTransferCancellation,
+} from '../files/AgentFileTransfer';
 
 /**
  * Перевод строк `--get-changes` в файлы выгрузки. Гранулярность — владелец верхнего уровня
@@ -44,6 +49,7 @@ const CONFIGURATION_XML = 'Configuration.xml';
  * скачивалось бы, и P молча расходился с базой.
  */
 const CONFIGURATION_DIR = 'Ext';
+const XML_SUFFIX = '.xml';
 
 /**
  * Карта «английский вид из `--get-changes` → папка выгрузки». Отдельной функцией, потому что
@@ -59,6 +65,34 @@ export function buildFolderByEnglishKind(defs: readonly MetaTypeDef[]): Readonly
 }
 
 const FOLDER_BY_ENGLISH_KIND = buildFolderByEnglishKind(Object.values(META_TYPES));
+/** Обратная карта ВЫВОДИТСЯ из прямой: второго словаря «папка → вид» нет (запрет №2). */
+const ENGLISH_KIND_BY_FOLDER: ReadonlyMap<string, string> = new Map(
+  [...FOLDER_BY_ENGLISH_KIND].map(([kind, folder]) => [folder, kind] as const)
+);
+
+/** Владелец файла выгрузки: корень конфигурации или объект верхнего уровня `<EnglishKind>.<Name>`. */
+export type ProjectFileOwner = { readonly configuration: true } | { readonly fullName: string };
+
+/**
+ * Обратное к {@link resolveChangedOwners}: `<Folder>/<Name>.xml` и `<Folder>/<Name>/**` — объект,
+ * `Configuration.xml` и `Ext/**` — корень конфигурации. Вложенные подсистемы лежат в поддереве верхней
+ * и принадлежат ей. Файл вне известных папок — `undefined`: догадка здесь означала бы ошибку агента
+ * или молча невыгруженный файл.
+ */
+export function ownerOfProjectFile(rel: string): ProjectFileOwner | undefined {
+  const parts = rel.split('/');
+  if (rel === CONFIGURATION_XML || (parts.length >= 2 && parts[0] === CONFIGURATION_DIR)) {
+    return { configuration: true };
+  }
+  const kind = parts.length >= 2 ? ENGLISH_KIND_BY_FOLDER.get(parts[0]) : undefined;
+  if (kind === undefined) {
+    return undefined;
+  }
+  if (parts.length > 2) {
+    return { fullName: `${kind}.${parts[1]}` };
+  }
+  return parts[1].endsWith(XML_SUFFIX) ? { fullName: `${kind}.${parts[1].slice(0, -XML_SUFFIX.length)}` } : undefined;
+}
 
 export function resolveChangedOwners(changes: readonly DumpChangedObject[]): ChangedOwnersResult {
   const owners = new Map<string, ChangedOwner>();
@@ -88,34 +122,61 @@ export function resolveChangedOwners(changes: readonly DumpChangedObject[]): Cha
   return { owners: [...owners.values()], unresolved };
 }
 
-/** Файлы владельцев в M (каталог цели `targetRel` в хранилище агента). */
+export interface CollectOwnerFilesOptions {
+  readonly concurrency?: number;
+  readonly cancellation?: AgentTransferCancellation;
+}
+
+/**
+ * Файлы владельцев в M (каталог цели `targetRel` в хранилище агента). Владельцы обрабатываются пулом
+ * (STAT/LIST по SFTP последовательно — минуты на тысячах владельцев), а порядок результата
+ * детерминирован: по порядку `owners`, внутри владельца — XML, затем поддерево, как отдал `list`.
+ * Отмена — {@link AgentTransferCancelledError}: неполный список нельзя отдавать как результат.
+ */
 export async function collectOwnerFiles(
   store: AgentFileStore,
   targetRel: string,
-  owners: readonly ChangedOwner[]
+  owners: readonly ChangedOwner[],
+  options: CollectOwnerFilesOptions = {}
 ): Promise<OwnerFilesResult> {
+  const prefix = targetRel ? `${targetRel}/` : '';
+  const perOwner = new Map<ChangedOwner, string[] | undefined>();
+  const { cancelled } = await forEachConcurrent(owners, async (owner) => {
+    perOwner.set(owner, await ownerFilesInStore(store, prefix, owner));
+  }, options, (owner) => owner.fullName);
+  if (cancelled) {
+    throw new AgentTransferCancelledError();
+  }
   const files: string[] = [];
   const missingOwners: ChangedOwner[] = [];
-  const prefix = targetRel ? `${targetRel}/` : '';
   for (const owner of owners) {
-    let found = false;
-    const xml = await store.stat(prefix + owner.xmlRel);
-    if (xml?.type === 'file') {
-      files.push(owner.xmlRel);
-      found = true;
-    }
-    const dir = await store.stat(prefix + owner.dirRel);
-    if (dir?.type === 'dir') {
-      found = true;
-      for (const entry of await store.list(prefix + owner.dirRel, { recursive: true })) {
-        if (entry.type === 'file') {
-          files.push(entry.path.slice(prefix.length));
-        }
-      }
-    }
-    if (!found) {
+    const found = perOwner.get(owner);
+    if (found === undefined) {
       missingOwners.push(owner);
+    } else {
+      files.push(...found);
     }
   }
   return { files, missingOwners };
+}
+
+/** Файлы одного владельца в M; `undefined` — нет ни XML, ни каталога. */
+async function ownerFilesInStore(store: AgentFileStore, prefix: string, owner: ChangedOwner): Promise<string[] | undefined> {
+  const files: string[] = [];
+  let found = false;
+  const xml = await store.stat(prefix + owner.xmlRel);
+  if (xml?.type === 'file') {
+    files.push(owner.xmlRel);
+    found = true;
+  }
+  const dir = await store.stat(prefix + owner.dirRel);
+  if (dir?.type === 'dir') {
+    found = true;
+    for (const entry of await store.list(prefix + owner.dirRel, { recursive: true })) {
+      if (entry.type === 'file') {
+        files.push(entry.path.slice(prefix.length));
+      }
+    }
+  }
+  return found ? files : undefined;
 }

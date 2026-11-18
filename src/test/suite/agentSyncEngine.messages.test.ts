@@ -1,7 +1,10 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
 import type { AgentOperationHooks } from '../../infra/agent/AgentOperationService';
 import { createHarness, type HarnessKind, type SyncHarness } from './support/agentSyncHarness';
 import { patternBytes } from './support/zipFixtures';
+import { seedRichDocument } from './support/archiveAvoidFixtures';
 
 /**
  * Э7: сообщения загрузки (`hooks.onMessage`) на всех ветках исполнения плана — частичная, полная
@@ -160,5 +163,123 @@ suite('AgentSyncEngine: сообщения импорта архивом и по
     } finally {
       await second.dispose();
     }
+  });
+});
+
+/**
+ * Сообщения импорта без полной выгрузки (plan-archive-avoid.md §3.3, §3.7): точечная выгрузка грязных
+ * файлов, её отказ (с переходом к архиву), «осиротевшие» файлы и посев при замене выгрузки проекта. Тексты
+ * отказа и сирот — из плана; текст успеха точечной выгрузки планом не фиксируется, проверяется по смыслу.
+ * Те же ветки при хуках без `onMessage` проходят с тем же исходом.
+ */
+suite('AgentSyncEngine: сообщения точечной выгрузки, сирот и замены выгрузки проекта (sftp)', function () {
+  this.timeout(60_000);
+  let h: SyncHarness;
+  const FORM_BODY = 'Documents/Д/Forms/Ф/Ext/Form.xml';
+
+  setup(async () => {
+    h = await createHarness('sftp');
+    h.seedDb();
+    seedRichDocument(h.emulator);
+    h.emulator.setConfiguration('Основная', 'cf');
+  });
+  teardown(async () => { await h.dispose(); });
+
+  const collecting = (): { messages: string[]; hooks: AgentOperationHooks } => {
+    const messages: string[] = [];
+    return { messages, hooks: { onMessage: (message) => { messages.push(message); } } };
+  };
+
+  /** Первый импорт (M — разреженный), затем грязный файл неизменённого документа и правка другого объекта в БД. */
+  async function prepareDirty(): Promise<void> {
+    await h.importTarget();
+    h.emulator.updateGranularity = 'changed-files';
+    h.writeP(FORM_BODY, '<FormBody>моя правка</FormBody>');
+    h.emulator.putFile('Catalogs/Товары.xml', '<Catalog>Товары v2</Catalog>');
+  }
+
+  test('точечная выгрузка выполнена: сообщение о ней, без сообщений об архиве', async () => {
+    await prepareDirty();
+    const { messages, hooks } = collecting();
+
+    const result = await h.importTarget(hooks);
+
+    assert.strictEqual(result.restoredFromDatabase, 1);
+    assert.ok(messages.some((message) => /точечн/i.test(message)), messages.join(' | '));
+    assert.ok(!messages.some((message) => message.includes('Скачивание архива выгрузки')), messages.join(' | '));
+  });
+
+  test('точечная выгрузка не удалась: «Точечная выгрузка не удалась (<причина>): импорт пойдёт полной выгрузкой.», затем скачивание архива', async () => {
+    await prepareDirty();
+    h.emulator.listDumpMissingFiles = new Set([FORM_BODY]);
+    const { messages, hooks } = collecting();
+
+    const result = await h.importTarget(hooks);
+
+    assert.strictEqual(result.reason, 'sparse-mirror-dirty');
+    const failure = messages.findIndex((message) => /^Точечная выгрузка не удалась \(.+\): импорт пойдёт полной выгрузкой\.$/.test(message));
+    assert.ok(failure >= 0, messages.join(' | '));
+    assert.ok(failure < messages.indexOf('Скачивание архива выгрузки…'), 'сообщение об отказе — до скачивания архива');
+  });
+
+  test('сироты не удалены: сообщение «В выгрузке проекта есть файлы объектов, которых нет в базе (N объектов…)» с числом объектов', async () => {
+    h.emulator.setObject('Catalog.Удалённый', { 'Catalogs/Удалённый.xml': '<Catalog>Удалённый</Catalog>' });
+    h.emulator.snapshotToProject(h.configRoot);
+    h.emulator.removeObject('Catalog.Удалённый');
+    h.emulator.snapshotToProject(h.configRoot);
+    const { messages } = collecting();
+
+    await h.importTarget({
+      onMessage: (message) => { messages.push(message); },
+      confirmMirrorSeed: () => Promise.resolve('seed'),
+    });
+
+    assert.ok(
+      messages.some((message) => message.startsWith('В выгрузке проекта есть файлы объектов, которых нет в базе (1 объект')),
+      messages.join(' | ')
+    );
+  });
+
+  test('посев при замене выгрузки проекта: сообщение о подготовленном зеркале, без архива', async () => {
+    await h.importTarget();
+    h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>Клиенты v2</Catalog>');
+    h.emulator.snapshotToProject(h.configRoot);
+    const cdi = path.join(h.configRoot, 'ConfigDumpInfo.xml');
+    fs.utimesSync(cdi, new Date('2031-01-02T03:04:05Z'), new Date('2031-01-02T03:04:05Z'));
+    const { messages, hooks } = collecting();
+
+    const result = await h.importTarget({ ...hooks, confirmMirrorSeed: () => Promise.resolve('seed') });
+
+    assert.strictEqual(result.seededFrom, 'project');
+    assert.ok(messages.includes('Зеркало агента подготовлено из выгрузки проекта.'), messages.join(' | '));
+    assert.ok(!messages.includes('Скачивание архива выгрузки…'));
+  });
+
+  test('хуки без onMessage: точечная выгрузка и её отказ (с переходом к архиву) проходят с тем же исходом', async () => {
+    await prepareDirty();
+    const quiet: AgentOperationHooks = { cancellation: { isCancellationRequested: false } };
+    const restored = await h.importTarget(quiet);
+    assert.strictEqual(restored.strategy, 'delta');
+    assert.strictEqual(restored.restoredFromDatabase, 1);
+
+    h.writeP(FORM_BODY, '<FormBody>ещё правка</FormBody>');
+    h.emulator.putFile('Catalogs/Товары.xml', '<Catalog>Товары v3</Catalog>');
+    h.emulator.listDumpMissingFiles = new Set([FORM_BODY]);
+    const fallback = await h.importTarget(quiet);
+    assert.strictEqual(fallback.strategy, 'archive');
+    assert.strictEqual(fallback.reason, 'sparse-mirror-dirty');
+  });
+
+  test('хуки без onMessage: сироты (без хука удаления) не мешают импорту', async () => {
+    h.emulator.setObject('Catalog.Удалённый', { 'Catalogs/Удалённый.xml': '<Catalog>Удалённый</Catalog>' });
+    h.emulator.snapshotToProject(h.configRoot);
+    h.emulator.removeObject('Catalog.Удалённый');
+    h.emulator.snapshotToProject(h.configRoot);
+
+    const result = await h.importTarget({ confirmMirrorSeed: () => Promise.resolve('seed') });
+
+    assert.strictEqual(result.seededFrom, 'project');
+    assert.strictEqual(result.orphans?.removed, false);
+    assert.ok(h.existsP('Catalogs/Удалённый.xml'));
   });
 });

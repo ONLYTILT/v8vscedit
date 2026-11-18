@@ -123,7 +123,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
       idleDisconnectMinutes: 0,
       location: 'local',
       transferConcurrency: 16,
-      archiveThresholdFiles: 300,
+      archiveThresholdFiles: 20000,
     });
   });
 

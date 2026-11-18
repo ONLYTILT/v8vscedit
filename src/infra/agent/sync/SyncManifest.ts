@@ -23,6 +23,16 @@ export type SyncMirrorState = 'empty' | 'stale' | 'fresh';
  */
 export type SyncMirrorCoverage = 'full' | 'sparse';
 
+/**
+ * Отпечаток `ConfigDumpInfo.xml` проекта: по нему импорт узнаёт, что выгрузку проекта заменили извне.
+ * Отдельным полем, потому что файл версий в B не входит (`isSupportedConfigFile` исключает его явно).
+ */
+export interface ProjectDumpInfoFingerprint {
+  readonly sha1: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
 export interface SyncManifest {
   readonly schemaVersion: 1;
   readonly scopeKey: string;
@@ -30,6 +40,8 @@ export interface SyncManifest {
   readonly files: Readonly<Record<string, string>>;
   /** Нет — `full`: манифесты до появления поля писались только при полном M. */
   readonly mirrorCoverage?: SyncMirrorCoverage;
+  /** Отпечаток файла версий проекта после последнего успешного импорта; нет — признака замены нет. */
+  readonly projectDumpInfo?: ProjectDumpInfoFingerprint;
 }
 
 export interface SyncFilesDiff {
@@ -130,7 +142,7 @@ function readStoredManifest(filePath: string, scopeKey: string): SyncManifest | 
   if (!isRecord(parsed)) {
     return undefined;
   }
-  const { schemaVersion, mirrorState, files, mirrorCoverage } = parsed;
+  const { schemaVersion, mirrorState, files, mirrorCoverage, projectDumpInfo } = parsed;
   if (
     schemaVersion !== SCHEMA_VERSION
     || parsed.scopeKey !== scopeKey
@@ -148,7 +160,19 @@ function readStoredManifest(filePath: string, scopeKey: string): SyncManifest | 
     mirrorState: mirrorState as SyncMirrorState,
     files: files as Record<string, string>,
     ...(mirrorCoverage === undefined ? {} : { mirrorCoverage: mirrorCoverage as SyncMirrorCoverage }),
+    // Битый отпечаток отбрасывается, а манифест принимается: отсутствие признака лишь отключает
+    // вопрос о замене выгрузки, тогда как неизвестная полнота разрешила бы неверные удаления.
+    ...(isFingerprint(projectDumpInfo)
+      ? { projectDumpInfo: { sha1: projectDumpInfo.sha1, size: projectDumpInfo.size, mtimeMs: projectDumpInfo.mtimeMs } }
+      : {}),
   };
+}
+
+function isFingerprint(value: unknown): value is ProjectDumpInfoFingerprint {
+  return isRecord(value)
+    && typeof value.sha1 === 'string'
+    && Number.isFinite(value.size)
+    && Number.isFinite(value.mtimeMs);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

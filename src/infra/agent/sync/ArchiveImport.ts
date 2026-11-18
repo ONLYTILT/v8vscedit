@@ -12,13 +12,14 @@ import {
   listProjectFiles,
 } from './ProjectFiles';
 import {
+  AgentFullDumpDeclinedError,
   EXCHANGE_ARCHIVE,
   exchangeDirOf,
   throwIfCancelled,
   withTransferCancellation,
   type SyncOperationContext,
 } from './SyncContext';
-import type { ImportArchiveReason } from './SyncPlanner';
+import { ARCHIVE_REASON_POLICY, type ImportArchiveReason } from './SyncPlanner';
 
 /**
  * Импорт архивом: полная выгрузка базы в каталог обмена на сервере, архив — потоком в локальный
@@ -26,11 +27,39 @@ import type { ImportArchiveReason } from './SyncPlanner';
  * конфигурации — сотни мегабайт.
  *
  * P меняется только после полного валидирующего прохода `scan`: испорченный архив не оставляет
- * проект с частью новых файлов. На пустом M (`mirror-empty`) M засевается файлом версий и
- * Configuration.xml из того же архива — второй, полной выгрузки в M нет.
+ * проект с частью новых файлов. Для причин до `--update` (`ARCHIVE_REASON_POLICY.reseedMirror`) M
+ * засевается файлом версий и Configuration.xml из того же архива — второй, полной выгрузки в M нет.
+ *
+ * Перед выгрузкой — вопрос `confirmFullDump`, если его не задали раньше (`confirmed`): вызывающий,
+ * которому нужно мутировать M до архива (очистка пустого M), задаёт его сам, до мутации.
  */
-export function importByArchive(context: SyncOperationContext, reason: ImportArchiveReason): Promise<AgentImportResult> {
+export async function importByArchive(
+  context: SyncOperationContext,
+  reason: ImportArchiveReason,
+  options: { readonly confirmed?: boolean } = {}
+): Promise<AgentImportResult> {
+  if (options.confirmed !== true) {
+    await confirmFullDumpOrThrow(context, reason);
+  }
   return withTransferCancellation(() => importArchive(context, reason));
+}
+
+/** Вопрос перед полной серверной выгрузкой; нет хука — согласие (прежнее поведение), отказ — исключение. */
+export async function confirmFullDumpOrThrow(context: SyncOperationContext, reason: ImportArchiveReason): Promise<void> {
+  const confirm = context.hooks?.confirmFullDump;
+  if (confirm === undefined) {
+    return;
+  }
+  const decision = await confirm({
+    targetKind: context.target.kind,
+    targetName: context.extensionName ?? context.target.name,
+    projectDir: context.target.rootPath,
+    reason,
+    reasonText: ARCHIVE_REASON_POLICY[reason].text,
+  });
+  if (decision === 'cancel') {
+    throw new AgentFullDumpDeclinedError();
+  }
 }
 
 async function importArchive(context: SyncOperationContext, reason: ImportArchiveReason): Promise<AgentImportResult> {
@@ -65,7 +94,7 @@ async function importArchive(context: SyncOperationContext, reason: ImportArchiv
     }, cancellation);
     assertConfigurationPresent(entries.has(CONFIGURATION_XML), 'архиве выгрузки');
 
-    const seeded = reason === 'mirror-empty';
+    const seeded = ARCHIVE_REASON_POLICY[reason].reseedMirror;
     if (seeded) {
       // До записи в P: сбой посева оставляет проект нетронутым, а M — недостоверным (`empty`).
       await seedMirrorFromArchive(context, reader);

@@ -1,4 +1,4 @@
-import type { AgentFileStore } from './AgentFileStore';
+import type { AgentFileEntry, AgentFileStore } from './AgentFileStore';
 
 /**
  * Число одновременных запросов по умолчанию. При пинге ~80 мс до удалённого агента
@@ -75,7 +75,7 @@ export function downloadFiles(
   sink: AgentDownloadSink,
   options: AgentTransferOptions = {}
 ): Promise<AgentTransferResult> {
-  return runTransfer(rels, async (rel) => sink(rel, await store.readFile(rel)), options);
+  return runTransfer(rels, async (rel) => sink(rel, await store.readFile(rel)), options, String);
 }
 
 /** Пишет в хранилище содержимое, полученное от `source`; не более `concurrency` запросов одновременно. */
@@ -85,7 +85,35 @@ export function uploadFiles(
   source: AgentUploadSource,
   options: AgentTransferOptions = {}
 ): Promise<AgentTransferResult> {
-  return runTransfer(rels, async (rel) => store.writeFile(rel, await source(rel)), options);
+  return runTransfer(rels, async (rel) => store.writeFile(rel, await source(rel)), options, String);
+}
+
+/**
+ * Произвольная операция над каждым элементом тем же пулом, что у передачи файлов: STAT/LIST по SFTP
+ * упираются в задержку так же, как чтение файлов (сотни владельцев × 80 мс последовательно — минуты).
+ * `describe` — имя элемента в отказе {@link AgentTransferError} и в прогрессе.
+ */
+export function forEachConcurrent<T>(
+  items: readonly T[],
+  run: (item: T) => void | Promise<void>,
+  options: AgentTransferOptions = {},
+  describe: (item: T) => string = String
+): Promise<AgentTransferResult> {
+  return runTransfer(items, async (item) => { await run(item); }, options, describe);
+}
+
+/**
+ * STAT каждого пути пулом. Ключи карты — в порядке `rels`; при отмене — только выполненные (без
+ * исключения): решение, что делать с неполной картой, принимает вызывающий.
+ */
+export async function statFiles(
+  store: AgentFileStore,
+  rels: readonly string[],
+  options: AgentTransferOptions = {}
+): Promise<Map<string, AgentFileEntry | undefined>> {
+  const done = new Map<string, AgentFileEntry | undefined>();
+  await forEachConcurrent(rels, async (rel) => { done.set(rel, await store.stat(rel)); }, options);
+  return new Map(rels.filter((rel) => done.has(rel)).map((rel) => [rel, done.get(rel)] as const));
 }
 
 /**
@@ -93,10 +121,11 @@ export function uploadFiles(
  * новые файлы не стартуют, но уже начатые дожидаются: иначе их отказы потерялись бы, а
  * запись в хранилище продолжилась бы после того, как вызывающий уже получил ответ.
  */
-async function runTransfer(
-  rels: readonly string[],
-  transferOne: (rel: string) => Promise<void>,
-  options: AgentTransferOptions
+async function runTransfer<T>(
+  rels: readonly T[],
+  transferOne: (rel: T) => Promise<void>,
+  options: AgentTransferOptions,
+  describe: (item: T) => string
 ): Promise<AgentTransferResult> {
   const concurrency = options.concurrency ?? DEFAULT_AGENT_TRANSFER_CONCURRENCY;
   if (!Number.isInteger(concurrency) || concurrency < 1) {
@@ -119,9 +148,9 @@ async function runTransfer(
       try {
         await transferOne(rel);
         done += 1;
-        options.onProgress?.({ done, total: rels.length, path: rel });
+        options.onProgress?.({ done, total: rels.length, path: describe(rel) });
       } catch (error) {
-        failures.push({ path: rel, error: error instanceof Error ? error : new Error(String(error)) });
+        failures.push({ path: describe(rel), error: error instanceof Error ? error : new Error(String(error)) });
       }
     }
   };

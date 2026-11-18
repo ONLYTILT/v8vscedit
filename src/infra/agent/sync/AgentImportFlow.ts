@@ -1,10 +1,10 @@
-import * as path from 'path';
+import * as fs from 'fs';
 import { buildDumpConfigToFilesCommand } from '../../../domain/agent/AgentCommand';
 import { parseDumpChanges, type DumpChangeSet } from '../../../domain/agent/DumpChangesParser';
-import { downloadFiles } from '../files/AgentFileTransfer';
-import { importByArchive } from './ArchiveImport';
+import { downloadFiles, statFiles, type AgentTransferOptions } from '../files/AgentFileTransfer';
+import { confirmFullDumpOrThrow, importByArchive } from './ArchiveImport';
 import { collectOwnerFiles, resolveChangedOwners, type ChangedOwner } from './ChangedObjectFiles';
-import { inspectProjectMirrorSeed, seedMirror } from './MirrorSeed';
+import { isProjectDumpReplaced } from './ProjectDumpInfo';
 import {
   CONFIG_DUMP_INFO_XML,
   CONFIGURATION_XML,
@@ -14,30 +14,35 @@ import {
   listProjectFiles,
   projectFileExists,
 } from './ProjectFiles';
+import { handleOrphans, seedFromProject, type OrphanFilesOutcome } from './ProjectSeed';
+import { restoreFromDatabase } from './SparseRestore';
 import {
-  AgentSyncCancelledError,
   exchangeDirOf,
   throwIfCancelled,
+  withTransferCancellation,
   type SyncOperationContext,
 } from './SyncContext';
 import {
   buildSyncManifestFiles,
   diffSyncFiles,
-  type SyncFilesDiff,
   type SyncMirrorCoverage,
   type SyncMirrorState,
 } from './SyncManifest';
-import { planRemoteImport, type ImportArchiveReason } from './SyncPlanner';
+import { planBeforeUpdate, planRemoteImport, type ImportArchiveReason } from './SyncPlanner';
 
 /**
  * Импорт БД → P (таблица плана §1.1). Локальное хранилище — полное сравнение M и P; удалённое —
  * список изменений `--get-changes`, дельта по владельцам и архив там, где списку верить нельзя.
- * Всё, что приходит от агента, сначала целиком оказывается у нас (память или архив), и только
- * потом пишется в проект: отмена и сбой передачи не оставляют P наполовину обновлённым.
+ * Всё, что приходит от агента, сначала целиком оказывается у нас (staging на диске или архив), и
+ * только потом пишется в проект: отмена и сбой передачи не оставляют P наполовину обновлённым.
  *
  * Пустой удалённый M засевается без полной выгрузки в него: из выгрузки проекта (с согласия
  * пользователя) или из архива первого импорта. Такой M разреженный, и правила дельты для него
- * строже: отсутствие файла в M не означает его удаления в базе.
+ * строже: отсутствие файла в M не означает его удаления в базе, а правки файлов, которых в M нет,
+ * берёт из базы точечная выгрузка (`SparseRestore`), а не архив.
+ *
+ * Решения — в две фазы (plan-archive-avoid.md §3.1): до `--update` (`planBeforeUpdate`) и после
+ * (`planRemoteImport`); политика причин полной выгрузки — `ARCHIVE_REASON_POLICY`.
  */
 
 export interface AgentImportResult {
@@ -46,6 +51,10 @@ export interface AgentImportResult {
   readonly reason?: ImportArchiveReason;
   /** Из чего засеян пустой M в этой операции. */
   readonly seededFrom?: 'project' | 'archive';
+  /** Сколько локально изменённых файлов взято из базы точечной выгрузкой. */
+  readonly restoredFromDatabase?: number;
+  /** «Осиротевшие» файлы выгрузки проекта после посева из неё (их владельцев нет в базе). */
+  readonly orphans?: { readonly owners: string[]; readonly files: string[]; readonly removed: boolean };
 }
 
 export interface AgentImportOutcome {
@@ -88,7 +97,7 @@ async function importByCompare(context: SyncOperationContext): Promise<AgentImpo
     if (!hasSameProjectContent(projectDir, rel, data)) {
       changed.push(rel);
     }
-  }, { concurrency: context.transferConcurrency, cancellation: context.hooks?.cancellation });
+  }, transferOptions(context));
   throwIfCancelled(context);
 
   const inMirror = new Set(mirrorFiles);
@@ -106,71 +115,74 @@ async function importByCompare(context: SyncOperationContext): Promise<AgentImpo
 
 // --- удалённое хранилище: список изменений, дельта, архив --------------------------------------
 
+/** Результат фазы 2 вместе с владельцами списка изменений — их знает поиск сирот после посева. */
+interface ChangesOutcome {
+  readonly result: AgentImportResult;
+  readonly changedOwners: ReadonlySet<string>;
+}
+
 async function importRemote(context: SyncOperationContext): Promise<AgentImportResult> {
   const mirrorState = await effectiveMirrorState(context);
   if (mirrorState !== 'empty') {
-    return importChanges(context, mirrorState, undefined);
+    // Ручная замена выгрузки проекта (новый файл версий): та же развилка посева, что у пустого M.
+    if (await isProjectDumpReplaced(context.target.rootPath, context.manifest.projectDumpInfo)) {
+      const seed = await seedFromProject(context, 'project-replaced');
+      if (seed.kind === 'seeded') {
+        return importSeeded(context, seed.base);
+      }
+    }
+    return (await importChanges(context, mirrorState, undefined)).result;
   }
-  const assumedBase = await seedFromProject(context);
-  if (assumedBase !== undefined) {
-    return { ...(await importChanges(context, 'fresh', assumedBase)), seededFrom: 'project' };
+  const seed = await seedFromProject(context, 'mirror-empty');
+  if (seed.kind === 'seeded') {
+    return importSeeded(context, seed.base);
   }
   // Первый раз (или M потерян/недостоверен) без посева из проекта: ОДНА серверная выгрузка
-  // архивом, M засевается из него же. Недостоверный M очищается заранее: его остаток не должен
-  // пережить операцию, даже если до посева дело не дойдёт.
+  // архивом, M засевается из него же. Вопрос — ДО очистки M (отказ не должен мутировать M), кроме
+  // случая, когда пользователь уже выбрал «Полная выгрузка» в вопросе о посеве. Недостоверный M
+  // очищается заранее: его остаток не должен пережить операцию, даже если до посева дело не дойдёт.
+  if (seed.kind !== 'full') {
+    await confirmFullDumpOrThrow(context, 'mirror-empty');
+  }
   context.markMirrorMutated();
   await context.store.remove(context.workspace.targetAgentDir, { recursive: true });
-  return importByArchive(context, 'mirror-empty');
+  return importByArchive(context, 'mirror-empty', { confirmed: true });
 }
 
-/**
- * Посев M из выгрузки проекта — только с согласия пользователя: файл версий проекта описывает базу
- * на момент выгрузки, и ручные правки XML после неё импорт не перезапишет. Возвращает B, от которой
- * считаются локальные правки (= hash(P): правки после выгрузки не перетираются, как обещано в
- * вопросе), или `undefined`, если посева нет.
- */
-async function seedFromProject(context: SyncOperationContext): Promise<Record<string, string> | undefined> {
-  const confirm = context.hooks?.confirmMirrorSeed;
-  if (confirm === undefined) {
-    return undefined;
+/** Импорт после посева из выгрузки проекта: D = ∅ относительно hash(P), затем поиск сирот. */
+async function importSeeded(context: SyncOperationContext, base: Record<string, string>): Promise<AgentImportResult> {
+  const { result, changedOwners } = await importChanges(context, 'fresh', base);
+  // Архив сам удаляет из P всё, чего нет в базе: сирот после него не бывает.
+  const orphans = result.strategy === 'archive' ? undefined : await handleOrphans(context, changedOwners);
+  return { ...withOrphans(result, orphans), seededFrom: 'project' };
+}
+
+function withOrphans(result: AgentImportResult, orphans: OrphanFilesOutcome | undefined): AgentImportResult {
+  if (orphans === undefined) {
+    return result;
   }
-  const inspection = inspectProjectMirrorSeed(context.target, context.extensionName);
-  if (!inspection.ok) {
-    context.hooks?.onMessage?.(inspection.message);
-    return undefined;
-  }
-  const projectDir = context.target.rootPath;
-  const current = await buildSyncManifestFiles(projectDir, context.projectRoot);
-  const base = context.manifest.files;
-  const decision = await confirm({
-    ...inspection.candidate,
-    localEditsSinceBaseline: Object.keys(base).length > 0 ? countFiles(diffSyncFiles(base, current)) : undefined,
-  });
-  if (decision === 'cancel') {
-    // До любой мутации: манифест и M остаются как были.
-    throw new AgentSyncCancelledError();
-  }
-  if (decision === 'full') {
-    return undefined;
-  }
-  await seedMirror(context, {
-    configuration: path.join(projectDir, CONFIGURATION_XML),
-    dumpInfo: path.join(projectDir, CONFIG_DUMP_INFO_XML),
-  });
-  context.hooks?.onMessage?.('Зеркало агента подготовлено из выгрузки проекта.');
-  return current;
+  const { changedProjectFiles, ...summary } = orphans;
+  return {
+    ...result,
+    changedProjectFiles: [...new Set([...result.changedProjectFiles, ...changedProjectFiles])].sort(),
+    orphans: summary,
+  };
 }
 
 async function importChanges(
   context: SyncOperationContext,
   mirrorState: SyncMirrorState,
   assumedBase: Readonly<Record<string, string>> | undefined
-): Promise<AgentImportResult> {
+): Promise<ChangesOutcome> {
   const mirror = context.workspace.targetAgentDir;
   const changeSet = await fetchChangeSet(context);
   // `--get-changes` вместе с `--update` только пишет список (пилот §5b п.4): M обновляется вторым
-  // шагом. Пустой список значит, что M и так совпадает с базой.
-  if (!(changeSet.kind === 'objects' && changeSet.objects.length === 0)) {
+  // шагом. FullDump/нераспознанный список уходят в архив ДО него — иначе вторая полная выгрузка.
+  const before = planBeforeUpdate({ mirrorState, changeSet });
+  if (before.action === 'archive') {
+    return { result: await importByArchive(context, before.reason), changedOwners: new Set() };
+  }
+  if (before.action === 'update') {
     context.markMirrorMutated();
     await context.exec.execute(buildDumpConfigToFilesCommand(mirror, {
       extensionName: context.extensionName,
@@ -181,10 +193,11 @@ async function importChanges(
 
   const projectDir = context.target.rootPath;
   const coverage = context.mirror.coverage;
-  const { owners, unresolved } = changeSet.kind === 'objects'
-    ? resolveChangedOwners(changeSet.objects)
-    : { owners: [], unresolved: [] };
-  const ownerFiles = unresolved.length === 0 ? await collectOwnerFiles(context.store, mirror, owners) : undefined;
+  const { owners, unresolved } = resolveChangedOwners(before.objects);
+  const changedOwners = new Set(owners.map((owner) => owner.fullName));
+  const ownerFiles = unresolved.length === 0
+    ? await withTransferCancellation(() => collectOwnerFiles(context.store, mirror, owners, transferOptions(context)))
+    : undefined;
   const inMirror = new Set(ownerFiles?.files ?? []);
   // Владелец изменения, которого нет в M даже после второго шага, — признак неверного перевода
   // строки в путь (вложенная подсистема и т.п.): дельта молча пропустила бы его, архив — нет.
@@ -197,7 +210,7 @@ async function importChanges(
   const dirty = diffSyncFiles(assumedBase ?? context.manifest.files, await buildSyncManifestFiles(projectDir, context.projectRoot));
   const dirtyFiles = [...dirty.added, ...dirty.modified, ...dirty.deleted];
   // Сверх порога план и так даст архив — лишние STAT по M не нужны.
-  const unrestorable = coverage === 'sparse' && new Set([...changedFiles, ...dirtyFiles]).size <= context.archiveThresholdFiles
+  const dirtyAbsentFromMirror = coverage === 'sparse' && new Set([...changedFiles, ...dirtyFiles]).size <= context.archiveThresholdFiles
     ? await absentFromMirror(context, [...dirty.modified, ...dirty.deleted].filter((rel) => !inMirror.has(rel)))
     : [];
   const plan = planRemoteImport({
@@ -208,24 +221,40 @@ async function importChanges(
     dirtyFiles,
     mirrorCoverage: coverage,
     dirtyAddedFiles: dirty.added,
-    unrestorableDirtyFiles: unrestorable,
+    dirtyAbsentFromMirror,
     archiveThresholdFiles: context.archiveThresholdFiles,
   });
   if (plan.action === 'archive') {
-    return importByArchive(context, plan.reason);
+    return { result: await importByArchive(context, plan.reason), changedOwners };
   }
-  return importByDelta(context, plan.files, inMirror, new Set(plan.deletableIfAbsent));
+  const deletable = new Set(plan.deletableIfAbsent);
+  const restore = plan.restoreFromDatabase;
+  if (restore.length === 0) {
+    return { result: await importByDelta(context, plan.files, inMirror, deletable), changedOwners };
+  }
+  context.hooks?.onMessage?.(`Точечная выгрузка из базы локально изменённых файлов: ${String(restore.length)}.`);
+  const restored = await restoreFromDatabase(context, restore);
+  if (!restored.ok) {
+    // Текст агента бывает многострочным: сообщение журнала — одна строка.
+    const reason = restored.reason.replace(/\s+/g, ' ').trim();
+    context.hooks?.onMessage?.(`Точечная выгрузка не удалась (${reason}): импорт пойдёт полной выгрузкой.`);
+    return { result: await importByArchive(context, 'sparse-mirror-dirty'), changedOwners };
+  }
+  const source = { dir: restored.sourceDir, files: new Set(restore) };
+  const result = await importByDelta(context, plan.files, inMirror, deletable, source);
+  return { result: { ...result, restoredFromDatabase: restore.length }, changedOwners };
 }
 
-/** Файлы, которых нет в M: правку такого файла в разреженном M восстановить нечем. */
+function transferOptions(context: SyncOperationContext): AgentTransferOptions {
+  return { concurrency: context.transferConcurrency, cancellation: context.hooks?.cancellation };
+}
+
+/** Файлы, которых нет в M: правку такого файла в разреженном M берёт точечная выгрузка из базы. */
 async function absentFromMirror(context: SyncOperationContext, rels: readonly string[]): Promise<string[]> {
   const prefix = `${context.workspace.targetAgentDir}/`;
-  const entries = await Promise.all(rels.map((rel) => context.store.stat(prefix + rel)));
-  return rels.filter((_rel, index) => entries[index]?.type !== 'file');
-}
-
-function countFiles(diff: SyncFilesDiff): number {
-  return diff.added.length + diff.modified.length + diff.deleted.length;
+  const entries = await statFiles(context.store, rels.map((rel) => prefix + rel), transferOptions(context));
+  throwIfCancelled(context);
+  return rels.filter((rel) => entries.get(prefix + rel)?.type !== 'file');
 }
 
 /** Флаг манифеста; M без файла версий (потерян на сервере) — недостоверен, как пустой. */
@@ -253,55 +282,74 @@ function projectOwnerFiles(projectDir: string, owner: ChangedOwner): string[] {
   return [...files, ...listProjectFiles(projectDir, owner.dirRel)];
 }
 
+/** Файлы точечной выгрузки: каталог обмена, откуда они берутся вместо M. */
+interface RestoreSource {
+  readonly dir: string;
+  readonly files: ReadonlySet<string>;
+}
+
+/**
+ * Дельта: STAT отсутствующих в M — пулом, скачивание — пулом, отличающиеся от P файлы — во временные
+ * файлы локального каталога обмена; в памяти только «путь → staging»: при пороге в тысячи файлов
+ * буфер в памяти занял бы гигабайты, а второе скачивание ради записи удвоило бы трафик (Н25).
+ * Staging убирает движок вместе с каталогом обмена.
+ */
 async function importByDelta(
   context: SyncOperationContext,
   files: readonly string[],
   knownInMirror: ReadonlySet<string>,
-  deletableIfAbsent: ReadonlySet<string>
+  deletableIfAbsent: ReadonlySet<string>,
+  restore: RestoreSource = { dir: '', files: new Set() }
 ): Promise<AgentImportResult> {
   const { store } = context;
   const prefix = `${context.workspace.targetAgentDir}/`;
-  const present: string[] = [];
-  for (const rel of files) {
-    if (knownInMirror.has(rel) || (await store.stat(prefix + rel))?.type === 'file') {
-      present.push(rel);
-    }
-  }
+  const toStat = files.filter((rel) => !knownInMirror.has(rel) && !restore.files.has(rel));
+  const stats = await statFiles(store, toStat.map((rel) => prefix + rel), transferOptions(context));
+  throwIfCancelled(context);
+  const present = files.filter((rel) =>
+    restore.files.has(rel) || knownInMirror.has(rel) || stats.get(prefix + rel)?.type === 'file');
   const presentSet = new Set(present);
   const lost = files.filter((rel) => !presentSet.has(rel) && !deletableIfAbsent.has(rel));
   // План отдаёт неудаляемыми только файлы, проверенные STAT по M (правки неизменённых владельцев
-  // уходят архивом); исчезнуть из M между той проверкой и этой файл может только при чужой записи
-  // в M. Без границы такая гонка молча оставила бы P неверным; M после неё недостоверен.
+  // берёт точечная выгрузка); исчезнуть из M между той проверкой и этой файл может только при чужой
+  // записи в M. Без границы такая гонка молча оставила бы P неверным; M после неё недостоверен.
   if (lost.length > 0) {
     context.markMirrorMutated();
     throw new Error(`Разреженное зеркало агента не содержит файлов, нужных импорту: ${lost.join(', ')}. Повторите импорт.`);
   }
 
-  // Число файлов дельты ограничено порогом архива, поэтому они держатся в памяти: второе
-  // скачивание ради записи удвоило бы передачу по сети (Н25).
-  const downloaded = new Map<string, Uint8Array>();
-  await downloadFiles(store, present.map((rel) => prefix + rel), (agentRel, data) => {
-    downloaded.set(agentRel.slice(prefix.length), data);
-  }, { concurrency: context.transferConcurrency, cancellation: context.hooks?.cancellation });
+  const projectDir = context.target.rootPath;
+  // Источник файла — каталог точечной выгрузки или M; путь в проекте восстанавливается по префиксу.
+  const restorePrefix = `${restore.dir}/`;
+  const sources = present.map((rel) => (restore.files.has(rel) ? restorePrefix : prefix) + rel);
+  const staged = new Map<string, string>();
+  let stagingCount = 0;
+  await downloadFiles(store, sources, async (source, data) => {
+    const rel = source.startsWith(restorePrefix) ? source.slice(restorePrefix.length) : source.slice(prefix.length);
+    if (hasSameProjectContent(projectDir, rel, data)) {
+      return;
+    }
+    // Имя по номеру, а не по пути (длинные пути Windows); номер берётся до первого await. Это не файл
+    // выгрузки: его читает только эта операция после успешной записи, а обрыв убирает каталог обмена
+    // целиком — temp+rename здесь не нужен.
+    stagingCount += 1;
+    const stagingPath = await context.localExchange.file(`delta-${String(stagingCount)}`);
+    await fs.promises.writeFile(stagingPath, data);
+    staged.set(rel, stagingPath);
+  }, transferOptions(context));
   throwIfCancelled(context);
 
-  const projectDir = context.target.rootPath;
-  const writes = [...downloaded]
-    .filter(([rel, data]) => !hasSameProjectContent(projectDir, rel, data))
-    .map(([rel]) => rel);
   const deletes = files.filter((rel) => !presentSet.has(rel) && projectFileExists(projectDir, rel));
   // Configuration.xml попадает в удаляемые, только если владелец «конфигурация» исчез из M.
   assertConfigurationPresent(!deletes.includes(CONFIGURATION_XML), `"${context.workspace.targetAgentDir}"`);
   const changedProjectFiles = await applyProjectChanges({
     projectDir,
-    writes,
+    writes: [...staged.keys()],
     deletes,
-    read: async (rels, sink) => {
-      const wanted = new Set(rels);
-      for (const [rel, data] of downloaded) {
-        if (wanted.has(rel)) {
-          await sink(rel, data);
-        }
+    // Запрашиваются ровно `writes` — ключи staging; читаются по одному: память — O(файл).
+    read: async (_rels, sink) => {
+      for (const [rel, stagingPath] of staged) {
+        await sink(rel, await fs.promises.readFile(stagingPath));
       }
     },
     onWillChange: context.hooks?.onProjectFilesWillChange,

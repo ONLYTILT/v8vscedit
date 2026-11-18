@@ -19,6 +19,12 @@
  *  - `load --partial` вместе с `--update-config-dump-info` падает UnknownError (решение из
  *    комментария `loadChanged`), `--list-file` читается как UTF-8 (BOM допустим) с разделителем `\n`.
  *
+ *  - `dump --list-file` (эксперимент 12, агент 8.3.27.2130): строки списка — ИМЕНА объектов (не пути), список —
+ *    UTF-8 с BOM и `\n`; несовместим с `--update`; сначала проверяются ВСЕ строки (всё или ничего); имя
+ *    владельца даёт только его XML, файловый подобъект (запись CDI с `configVersion`) — свои файлы,
+ *    вложенный (без `configVersion`) — ошибка; в `--dir` пишутся только файлы, `ConfigDumpInfo.xml` не
+ *    создаётся и не меняется, прочие файлы каталога не трогаются.
+ *
  * `load --archive` разрешает имя архива относительно `--dir`, как и выгрузка (подтверждено пилотом
  * 2026-11-17, §5b п.15). Эмулятор принимает именно эту форму.
  */
@@ -47,6 +53,11 @@ export interface ParsedAgentCommand {
   readonly options: Readonly<Record<string, string | true>>;
 }
 
+/** Задан ли ключ команды (`options` — запись без `undefined`, поэтому сравнение со значением линтер отвергает). */
+export function hasOption(command: ParsedAgentCommand, name: string): boolean {
+  return name in command.options;
+}
+
 export function parseAgentCommandLine(raw: string): ParsedAgentCommand {
   const match = /^(config [\w-]+|common [\w-]+)\s*(.*)$/.exec(raw);
   if (!match) {
@@ -73,6 +84,11 @@ interface EmulatedObject {
   /** Версия КАЖДОГО файла: настоящий агент при `--update` пишет только файлы, изменившиеся после известной версии. */
   fileVersions: Map<string, number>;
   parts: string[];
+  /**
+   * Вложенные (встроенные) подобъекты без `configVersion` — реквизиты, ТЧ: в XML родителя, а не в
+   * отдельном файле. `undefined` — по умолчанию один реквизит (кроме корня конфигурации).
+   */
+  inline?: string[];
 }
 
 /**
@@ -94,6 +110,12 @@ export class AgentConfigEmulator {
   readonly commands: ParsedAgentCommand[] = [];
   readonly loads: EmulatedLoad[] = [];
   updateDbCalls = 0;
+  /** Сколько раз агент получал `dump --list-file` (включая отклонённые). */
+  listDumpCalls = 0;
+  /** Списки имён всех `dump --list-file` по порядку (последний — `lastListNames`). */
+  readonly listDumpNames: string[][] = [];
+  /** Файлы (относительные пути), которые `--list-file` «не выгружает»: моделирует недовыгрузку агента. */
+  listDumpMissingFiles = new Set<string>();
   /** Вызывается в начале каждой команды (после журналирования, до исполнения): точка для отмены/гонок. */
   onCommand: ((command: ParsedAgentCommand) => void) | undefined;
   /** Подменяет содержимое СЛЕДУЮЩЕГО файла `--get-changes` (однократно); текст отдаётся как есть. */
@@ -105,6 +127,10 @@ export class AgentConfigEmulator {
   formatVersion = '2.20';
   /** Если возвращает Error — команда падает с ним. */
   failWhen: ((command: ParsedAgentCommand) => Error | undefined) | undefined;
+
+  get lastListNames(): readonly string[] | undefined {
+    return this.listDumpNames.at(-1);
+  }
 
   private readonly objects = new Map<string, EmulatedObject>();
   private versionCounter = 1;
@@ -172,6 +198,35 @@ export class AgentConfigEmulator {
 
   hasObject(fullName: string): boolean {
     return this.objects.has(fullName);
+  }
+
+  /** Добавляет встроенный подобъект (`Attribute.Имя`, `TabularSection.Имя`) к уже заданному владельцу. */
+  addInlineChild(owner: string, child: string): void {
+    const object = this.requireObject(owner);
+    object.inline = [...(object.inline ?? defaultInline(owner)), child];
+  }
+
+  /** Полностью задаёт набор встроенных подобъектов владельца (в т.ч. пустой). */
+  setInlineChildren(owner: string, children: string[]): void {
+    this.requireObject(owner).inline = [...children];
+  }
+
+  /** Имена записей CDI владельца: сам владелец, встроенные, файловые подобъекты (порядок файла). */
+  cdiNamesOf(owner: string): string[] {
+    const object = this.requireObject(owner);
+    return [
+      owner,
+      ...(object.inline ?? defaultInline(owner)).map((child) => `${owner}.${child}`),
+      ...fileSubobjects(owner, object).filter(([suffix]) => suffix !== '').map(([suffix]) => `${owner}${suffix}`),
+    ];
+  }
+
+  private requireObject(owner: string): EmulatedObject {
+    const object = this.objects.get(owner);
+    if (!object) {
+      throw new Error(`эмулятор: нет владельца ${owner}`);
+    }
+    return object;
   }
 
   /** Все файлы выгрузки «базы», включая сгенерированный ConfigDumpInfo.xml. */
@@ -267,6 +322,12 @@ export class AgentConfigEmulator {
     const update = cmd.options.update === true;
     const infoOnly = cmd.options['config-dump-info-only'] === true;
 
+    const listFile = this.option(cmd, 'list-file');
+    if (listFile !== undefined) {
+      this.dumpByList(dirAbs, listFile, update);
+      return;
+    }
+
     if (archive !== undefined) {
       if (update) {
         throw agentError('CommandFormatError', '--update и --archive вместе не поддерживаются');
@@ -331,6 +392,63 @@ export class AgentConfigEmulator {
       this.writeFiles(dirAbs, Object.fromEntries(object.files));
     }
     fs.writeFileSync(path.join(dirAbs, CDI), this.buildConfigDumpInfo());
+  }
+
+  /** `dump --list-file`: имена из списка → файлы в `--dir` (CDI не пишется). */
+  private dumpByList(dirAbs: string, listFile: string, update: boolean): void {
+    this.listDumpCalls += 1;
+    if (update) {
+      throw agentError('CommandFormatError', 'Ключ -listFile не может использоваться совместно с ключами инкрементальной выгрузки.');
+    }
+    const listAbs = this.abs(listFile);
+    if (!fs.existsSync(listAbs)) {
+      throw agentError('ConfigFilesError', 'Файл не обнаружен');
+    }
+    const text = fs.readFileSync(listAbs, 'utf-8');
+    const names = (text.startsWith(BOM) ? text.slice(1) : text).split('\n').filter((line) => line.trim() !== '');
+    this.listDumpNames.push(names);
+
+    const records = this.cdiRecords();
+    // Сначала проверяются ВСЕ строки: при ошибке не пишется ничего.
+    const toWrite = new Map<string, Buffer>();
+    for (const name of names) {
+      const record = name.includes('/') || name.endsWith('.xml') ? undefined : records.get(name);
+      if (!record) {
+        throw agentError('ConfigFilesError', `Объект метаданных ${name} не существует в конфигурации.`);
+      }
+      if (record.kind === 'inline') {
+        throw agentError(
+          'ConfigFilesError',
+          `Невозможно сохранить объект метаданых ${name} в отдельный XML-файл. Вы можете сохранить его как часть родительского объекта.`
+        );
+      }
+      for (const [rel, data] of record.files) {
+        if (!this.listDumpMissingFiles.has(rel)) {
+          toWrite.set(rel, data);
+        }
+      }
+    }
+    fs.mkdirSync(dirAbs, { recursive: true });
+    this.writeFiles(dirAbs, Object.fromEntries(toWrite));
+  }
+
+  /** Все имена CDI → что агент выгрузит по такому имени (владелец — его XML, файловый — свои файлы). */
+  private cdiRecords(): Map<string, { kind: 'owner' | 'file' | 'inline'; files: Map<string, Buffer> }> {
+    const records = new Map<string, { kind: 'owner' | 'file' | 'inline'; files: Map<string, Buffer> }>();
+    const filesOf = (object: EmulatedObject, rels: string[]): Map<string, Buffer> =>
+      new Map(rels.map((rel) => [rel, object.files.get(rel) ?? Buffer.alloc(0)] as const));
+    for (const [owner, object] of this.objects) {
+      for (const [suffix, rels] of fileSubobjects(owner, object)) {
+        records.set(`${owner}${suffix}`, { kind: suffix === '' ? 'owner' : 'file', files: filesOf(object, rels) });
+      }
+      if (!records.has(owner)) {
+        records.set(owner, { kind: 'owner', files: new Map() });
+      }
+      for (const child of object.inline ?? defaultInline(owner)) {
+        records.set(`${owner}.${child}`, { kind: 'inline', files: new Map() });
+      }
+    }
+    return records;
   }
 
   private computeChangesText(known: Map<string, number>): string {
@@ -432,23 +550,47 @@ export class AgentConfigEmulator {
   // ── ConfigDumpInfo.xml ────────────────────────────────────────────────
 
   private buildConfigDumpInfo(): Buffer {
-    const lines = [...this.objects.entries()]
-      .sort(([a], [b]) => (a < b ? -1 : 1))
-      .map(([name, object]) => `  <Metadata name="${name}" configVersion="${String(object.version)}"/>`);
+    const lines: string[] = [];
+    let idCounter = 0;
+    const id = (): string => `id="00000000-0000-0000-0000-${String(++idCounter).padStart(12, '0')}"`;
+    for (const [name, object] of [...this.objects.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      // Как у платформы: тег владельца открывающий, внутри — встроенные (без configVersion) и файловые
+      // подобъекты (с configVersion), `</Metadata>`; порядок атрибутов `name`, `id`, `configVersion`.
+      const children: string[] = [
+        ...(object.inline ?? defaultInline(name)).map((child) => `    <Metadata name="${name}.${child}" ${id()}/>`),
+        ...fileSubobjects(name, object)
+          .filter(([suffix]) => suffix !== '')
+          .map(([suffix, rels]) => {
+            const version = Math.max(...rels.map((rel) => object.fileVersions.get(rel) ?? object.version));
+            return `    <Metadata name="${name}${suffix}" ${id()} configVersion="${String(version)}"/>`;
+          }),
+      ];
+      const open = `  <Metadata name="${name}" ${id()} configVersion="${String(object.version)}"`;
+      if (children.length === 0) {
+        lines.push(`${open}/>`);
+      } else {
+        lines.push(`${open}>`, ...children, '  </Metadata>');
+      }
+    }
     // Заголовок как у платформы: пространство имён, `format="Hierarchical"` и версия формата — по ним
     // проверяется пригодность файла версий проекта для посева зеркала.
     const header = `<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" format="Hierarchical" version="${this.formatVersion}">`;
     return Buffer.from(`${BOM}${header}\n${lines.join('\n')}\n</ConfigDumpInfo>\n`, 'utf-8');
   }
 
+  /** Версии владельцев верхнего уровня (имена из двух сегментов); вложенные записи эмулятору не нужны. */
   private readConfigDumpInfo(dirAbs: string): Map<string, number> | undefined {
     const file = path.join(dirAbs, CDI);
     if (!fs.existsSync(file)) {
       return undefined;
     }
     const result = new Map<string, number>();
-    for (const match of fs.readFileSync(file, 'utf-8').matchAll(/<Metadata name="([^"]+)" configVersion="(\d+)"/g)) {
-      result.set(match[1], Number(match[2]));
+    for (const tag of fs.readFileSync(file, 'utf-8').matchAll(/<Metadata\b[^>]*>/g)) {
+      const name = /\bname="([^"]+)"/.exec(tag[0])?.[1];
+      const version = /\bconfigVersion="(\d+)"/.exec(tag[0])?.[1];
+      if (name !== undefined && version !== undefined && name.split('.').length === 2) {
+        result.set(name, Number(version));
+      }
     }
     return result;
   }
@@ -488,6 +630,61 @@ export function ownerOfPath(rel: string): string | undefined {
     return undefined;
   }
   return `${english}.${parts[1].replace(/\.xml$/, '')}`;
+}
+
+function defaultInline(owner: string): string[] {
+  return owner === CONFIGURATION_OWNER ? [] : ['Attribute.Реквизит'];
+}
+
+const stemOf = (fileName: string): string => fileName.replace(/\.[^.]+$/, '');
+
+/**
+ * Суффикс имени записи CDI, которой принадлежит файл владельца (`''` — XML самого владельца), или
+ * `undefined`, если у файла нет своей записи. Карта — ДЕТАЛЬ СТЕНДА, снятая с эксперимента 12; продакшн
+ * её не знает (имена он берёт из CDI проекта).
+ */
+export function cdiSuffixOfFile(owner: string, rel: string): string | undefined {
+  const parts = rel.split('/');
+  if (owner === CONFIGURATION_OWNER) {
+    if (rel === 'Configuration.xml') {
+      return '';
+    }
+    return parts.length === 2 && parts[0] === 'Ext' ? `.${stemOf(parts[1])}` : undefined;
+  }
+  if (parts.length === 2 && parts[1].endsWith('.xml')) {
+    return '';
+  }
+  const rest = parts.slice(2);
+  switch (rest[0]) {
+    case 'Forms':
+      if (rest.length === 2 && rest[1].endsWith('.xml')) {
+        return `.Form.${stemOf(rest[1])}`;
+      }
+      return rest[2] === 'Ext' && (rest[3] === 'Form.xml' || rest[3] === 'Form') ? `.Form.${rest[1]}.Form` : undefined;
+    case 'Templates':
+      if (rest.length === 2 && rest[1].endsWith('.xml')) {
+        return `.Template.${stemOf(rest[1])}`;
+      }
+      return rest[2] === 'Ext' ? `.Template.${rest[1]}.Template` : undefined;
+    case 'Commands':
+      return rest[2] === 'Ext' && rest[3] === 'CommandModule.bsl' ? `.Command.${rest[1]}.CommandModule` : undefined;
+    case 'Ext':
+      return rest.length === 2 ? `.${stemOf(rest[1])}` : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/** Записи CDI владельца с файлами: `[суффикс, файлы]`, владелец первым (`''`), далее по порядку файлов. */
+function fileSubobjects(owner: string, object: EmulatedObject): [string, string[]][] {
+  const groups = new Map<string, string[]>();
+  for (const rel of object.files.keys()) {
+    const suffix = cdiSuffixOfFile(owner, rel);
+    if (suffix !== undefined) {
+      groups.set(suffix, [...(groups.get(suffix) ?? []), rel]);
+    }
+  }
+  return [...groups].sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : 0));
 }
 
 /** Удаление дерева без fs.rmSync: на Windows с Node 24 rmSync молча не удаляет файлы с кириллицей в имени. */

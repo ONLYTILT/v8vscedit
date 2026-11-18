@@ -1,6 +1,7 @@
 // Перенесено из ExtensionCommandRunner.ts (Э2) без изменения поведения; публичный API реэкспортируется оттуда.
 import * as vscode from 'vscode';
 import type { DesignerAgentEndpointOptions, DesignerAgentInfoBaseConnection } from '../../../../infra/agent';
+import { DEFAULT_ARCHIVE_THRESHOLD_FILES } from '../../../../infra/agent/sync/AgentSyncEngine';
 import { nonEmptyString, type ConnectionParams } from '../connectionSettings';
 
 /** Где работает агент: `local` — запускает расширение на этой машине, `remote` — уже запущен на сервере. */
@@ -11,7 +12,6 @@ export type AgentExecutionMode = 'batch' | 'agent';
 
 const DEFAULT_TRANSFER_CONCURRENCY = 16;
 const MAX_TRANSFER_CONCURRENCY = 64;
-const DEFAULT_ARCHIVE_THRESHOLD_FILES = 300;
 // Удалённый агент проверяет логин/пароль обращением к клиент-серверной базе: на стенде пилота вход
 // стабильно дольше 10 с (прежний зашитый readyTimeout), при обмене ключами за 0,7 с.
 const DEFAULT_CONNECT_TIMEOUT_MS = 60_000;

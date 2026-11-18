@@ -8,12 +8,14 @@ import { buildScopeKey, saveHashCache } from '../../cache/HashCache';
 import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
 import { createLocalExchange, pruneStaleLocalExchanges } from './LocalExchange';
-import { throwIfCancelled, type SyncOperationContext } from './SyncContext';
+import { fingerprintProjectDumpInfo } from './ProjectDumpInfo';
+import { EXCHANGE_RESTORE_LIST_SUFFIX, throwIfCancelled, type SyncOperationContext } from './SyncContext';
 import {
   buildSyncManifestFiles,
   loadSyncManifest,
   mirrorCoverageOf,
   saveSyncManifest,
+  type ProjectDumpInfoFingerprint,
   type SyncManifest,
   type SyncMirrorCoverage,
   type SyncMirrorState,
@@ -23,8 +25,13 @@ export { AgentSyncCancelledError } from './SyncContext';
 export type { AgentImportResult } from './AgentImportFlow';
 export type { AgentLoadMode, AgentLoadResult } from './AgentLoadFlow';
 
-/** Порог архива по умолчанию (план, «решения без вопросов»): больше файлов — один архив вместо дельты. */
-export const DEFAULT_ARCHIVE_THRESHOLD_FILES = 300;
+/**
+ * Порог архива по умолчанию: больше изменённых файлов — полная выгрузка/загрузка архивом вместо дельты.
+ * Читают его только удалённые ветки. 20000 ≈ 20% БП КОРП: дельта ≈ 20 мс/файл по SFTP (окно 16 при
+ * 80 мс), т.е. ~7 мин, а архив большой конфигурации — десятки минут серверной выгрузки; точка
+ * безубыточности ≈ 60–100 тыс. файлов, порог взят с запасом (plan-archive-avoid.md §2).
+ */
+export const DEFAULT_ARCHIVE_THRESHOLD_FILES = 20_000;
 
 export interface AgentSyncEngineOptions {
   readonly projectRoot: string;
@@ -45,6 +52,11 @@ interface OperationBaseline {
   files: Record<string, string>;
   mirrorState: SyncMirrorState;
   mirrorCoverage: SyncMirrorCoverage;
+  /**
+   * Отпечаток файла версий проекта (`current: undefined` — файла нет, поле убирается). Нет поля
+   * (загрузка) — в манифесте остаётся прежнее: загрузка P не меняет, а перезапись скрыла бы его замену.
+   */
+  projectDumpInfo?: { readonly current: ProjectDumpInfoFingerprint | undefined };
 }
 
 /**
@@ -73,7 +85,12 @@ export class AgentSyncEngine {
       const { result, mirrorCoverage } = await runImport(context);
       return {
         result,
-        baseline: { files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot), mirrorState: 'fresh', mirrorCoverage },
+        baseline: {
+          files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot),
+          mirrorState: 'fresh',
+          mirrorCoverage,
+          projectDumpInfo: { current: await fingerprintProjectDumpInfo(target.rootPath, context.manifest.projectDumpInfo) },
+        },
       };
     });
   }
@@ -164,8 +181,16 @@ export class AgentSyncEngine {
   }
 
   /** B и кэш хэшей пишутся вместе: загрузка «по изменениям» и CLI читают одно и то же. */
-  private saveBaseline(manifest: SyncManifest, { files, mirrorState, mirrorCoverage }: OperationBaseline): void {
-    saveSyncManifest(this.options.projectRoot, { ...manifest, mirrorState, files, mirrorCoverage });
+  private saveBaseline(manifest: SyncManifest, { files, mirrorState, mirrorCoverage, projectDumpInfo }: OperationBaseline): void {
+    const { projectDumpInfo: previous, ...rest } = manifest;
+    const fingerprint = projectDumpInfo === undefined ? previous : projectDumpInfo.current;
+    saveSyncManifest(this.options.projectRoot, {
+      ...rest,
+      mirrorState,
+      files,
+      mirrorCoverage,
+      ...(fingerprint === undefined ? {} : { projectDumpInfo: fingerprint }),
+    });
     saveHashCache(this.options.projectRoot, {
       schemaVersion: 1,
       scopeKey: manifest.scopeKey,
@@ -178,7 +203,7 @@ export class AgentSyncEngine {
   private async removeExchange(context: SyncOperationContext): Promise<void> {
     await context.localExchange.dispose();
     const base = `${context.workspace.exchangeRoot}/${context.operationId}`;
-    for (const rel of [base, `${base}.changes`]) {
+    for (const rel of [base, `${base}.changes`, `${base}${EXCHANGE_RESTORE_LIST_SUFFIX}`]) {
       try {
         await context.store.remove(rel, { recursive: true });
       } catch {

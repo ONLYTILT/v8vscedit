@@ -25,7 +25,9 @@ import {
 // Режим, а не булев флаг: remote без агентского режима — отказ, а не тихий откат на пакетный.
 import { getAgentExecutionMode } from './agent/agentSettings';
 import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
+import { promptFullDump } from './agent/fullDumpPrompt';
 import { promptMirrorSeed } from './agent/mirrorSeedPrompt';
+import { promptOrphanRemoval } from './agent/orphanFilesPrompt';
 import { releaseAgentInfoBaseForBatch } from './agent/AgentServiceRegistry';
 import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from './agent/remoteLocalDesigner';
 
@@ -118,6 +120,8 @@ export async function runDecompileExtension(
       hooks,
       rootPath: extensionRoot,
       confirmMirrorSeed: promptMirrorSeed,
+      confirmFullDump: promptFullDump,
+      confirmOrphanRemoval: promptOrphanRemoval,
     },
     async (service, operationHooks) => {
       await service.importFromDatabase(
@@ -151,6 +155,8 @@ export async function runDecompileMainConfiguration(
       hooks,
       rootPath: configRoot,
       confirmMirrorSeed: promptMirrorSeed,
+      confirmFullDump: promptFullDump,
+      confirmOrphanRemoval: promptOrphanRemoval,
     },
     async (service, operationHooks) => {
       await service.importFromDatabase(

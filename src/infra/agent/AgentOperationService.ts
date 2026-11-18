@@ -13,6 +13,7 @@ import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
 import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type { MirrorSeedCandidate } from './sync/MirrorSeed';
+import type { ImportArchiveReason } from './sync/SyncPlanner';
 import type {
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
@@ -34,9 +35,33 @@ export interface AgentConfigurationOperationTarget {
 /** Ответ на вопрос о посеве зеркала: из выгрузки проекта, полной выгрузкой (самопосев из архива) или отмена. */
 export type AgentMirrorSeedDecision = 'seed' | 'full' | 'cancel';
 
+/** Почему предлагается посев: зеркало пусто или выгрузку проекта заменили извне (файл версий изменился). */
+export type AgentMirrorSeedReason = 'mirror-empty' | 'project-replaced';
+
 export interface AgentMirrorSeedRequest extends MirrorSeedCandidate {
+  readonly reason: AgentMirrorSeedReason;
   /** Файлов P, изменённых относительно известной B (`undefined` — B нет): эти правки не будут перезаписаны. */
   readonly localEditsSinceBaseline: number | undefined;
+}
+
+/** Ответ на вопрос перед полной серверной выгрузкой импорта. */
+export type AgentFullDumpDecision = 'dump' | 'cancel';
+
+export interface AgentFullDumpRequest {
+  readonly targetKind: 'cf' | 'cfe';
+  readonly targetName: string;
+  readonly projectDir: string;
+  readonly reason: ImportArchiveReason;
+  /** Текст причины из `ARCHIVE_REASON_POLICY`. */
+  readonly reasonText: string;
+}
+
+/** Файлы выгрузки проекта, владельцев которых нет в базе (после посева из выгрузки проекта). */
+export interface AgentOrphanFilesRequest {
+  readonly targetName: string;
+  /** Полные имена владельцев `<EnglishKind>.<Name>`. */
+  readonly owners: readonly string[];
+  readonly files: readonly string[];
 }
 
 export interface AgentOperationHooks {
@@ -50,6 +75,13 @@ export interface AgentOperationHooks {
    * человека скрытое расхождение P и БД (ручные правки после выгрузки) принимать нельзя.
    */
   readonly confirmMirrorSeed?: (request: AgentMirrorSeedRequest) => Promise<AgentMirrorSeedDecision>;
+  /**
+   * Согласие на полную серверную выгрузку импорта (любая причина архива). Нет хука — `'dump'`: прежнее
+   * поведение без человека.
+   */
+  readonly confirmFullDump?: (request: AgentFullDumpRequest) => Promise<AgentFullDumpDecision>;
+  /** Удалить «осиротевшие» файлы выгрузки проекта. Нет хука — не удалять, только сообщение. */
+  readonly confirmOrphanRemoval?: (request: AgentOrphanFilesRequest) => Promise<boolean>;
 }
 
 export interface AgentOperationResult {

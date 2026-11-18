@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 import type { AgentMessage } from '../../../../domain/agent';
 import { AgentCommandError, type AgentOperationHooks, type AgentOperationService } from '../../../../infra/agent';
-import { AgentSyncCancelledError } from '../../../../infra/agent/sync/SyncContext';
+import { AgentFullDumpDeclinedError, AgentSyncCancelledError } from '../../../../infra/agent/sync/SyncContext';
 import type { ConfigurationImportHooks, ConfigurationProgressHooks } from '../configurationOperationTypes';
 import {
   beginConfigurationOperationStatus,
@@ -25,6 +25,10 @@ export interface RunAgentOptions {
   readonly onProgressMessage?: (message: string) => void;
   /** Вопрос о посеве пустого зеркала агента; без него импорт идёт без диалога (полная выгрузка). */
   readonly confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
+  /** Вопрос перед полной серверной выгрузкой импорта; без него — выгрузка без вопроса. */
+  readonly confirmFullDump?: AgentOperationHooks['confirmFullDump'];
+  /** Вопрос об удалении «осиротевших» файлов выгрузки проекта; без него — только сообщение. */
+  readonly confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
 }
 
 export async function runAgentConfigurationOperation(
@@ -36,6 +40,8 @@ export async function runAgentConfigurationOperation(
       onProjectFilesWillChange?: (filePaths: string[]) => void;
       onQuestion: (message: AgentMessage) => Promise<string | undefined>;
       confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
+      confirmFullDump?: AgentOperationHooks['confirmFullDump'];
+      confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
     }
   ) => Promise<void>
 ): Promise<boolean> {
@@ -60,6 +66,8 @@ export async function runAgentConfigurationOperation(
       : undefined,
     onQuestion: showAgentQuestion,
     confirmMirrorSeed: options.confirmMirrorSeed,
+    confirmFullDump: options.confirmFullDump,
+    confirmOrphanRemoval: options.confirmOrphanRemoval,
   });
 
   try {
@@ -73,6 +81,14 @@ export async function runAgentConfigurationOperation(
     }
     return true;
   } catch (error) {
+    if (error instanceof AgentFullDumpDeclinedError) {
+      // Отказ от полной выгрузки — решение пользователя, а не сбой: текст ошибки — инструкция ручной
+      // выгрузки, её и показываем (до общей ветки отмены: это её подкласс).
+      options.outputChannel.appendLine(`[agent] ${error.message}`);
+      endConfigurationOperationStatus(options.progressTitle, 'отменено');
+      void vscode.window.showInformationMessage(error.message);
+      return false;
+    }
     if (error instanceof AgentSyncCancelledError) {
       // Отмена пользователем (Esc в вопросе о посеве, кнопка отмены прогресса) — не ошибка: без тоста
       // «Ошибка импорта…» и без диагностики агента, только запись в журнал и сообщение.

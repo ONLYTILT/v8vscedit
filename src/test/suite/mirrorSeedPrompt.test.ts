@@ -10,8 +10,10 @@ import {
   type CachedAgentService,
 } from '../../ui/commands/ext/agent/AgentServiceRegistry';
 import { runAgentConfigurationOperation, type RunAgentOptions } from '../../ui/commands/ext/agent/agentConfigurationOperation';
-import { AgentSyncCancelledError } from '../../infra/agent/sync/SyncContext';
+import { AgentFullDumpDeclinedError, AgentSyncCancelledError } from '../../infra/agent/sync/SyncContext';
+import { promptFullDump } from '../../ui/commands/ext/agent/fullDumpPrompt';
 import { promptMirrorSeed } from '../../ui/commands/ext/agent/mirrorSeedPrompt';
+import { promptOrphanRemoval } from '../../ui/commands/ext/agent/orphanFilesPrompt';
 import { runDecompileExtension, runDecompileMainConfiguration } from '../../ui/commands/ext/ExtensionCommandRunner';
 
 /**
@@ -35,6 +37,7 @@ const FULL_LABEL = 'Полная выгрузка';
 
 function request(overrides: Partial<AgentMirrorSeedRequest> = {}): AgentMirrorSeedRequest {
   return {
+    reason: 'mirror-empty',
     targetKind: 'cf',
     targetName: 'Бухгалтерия КОРП',
     projectDir: path.join(os.tmpdir(), 'project', 'src', 'cf'),
@@ -119,6 +122,71 @@ suite('promptMirrorSeed', () => {
   });
 });
 
+/**
+ * Причина вопроса (`request.reason`): `mirror-empty` — зеркало пусто (прежний текст, вторая кнопка «Полная
+ * выгрузка»); `project-replaced` — выгрузку проекта заменили извне (plan-archive-avoid.md §3.7), вторая
+ * кнопка «Обычный импорт» (→ `full`: прежний путь без посева). Исходы одинаковы: seed/full/cancel.
+ */
+suite('promptMirrorSeed: тексты по причине (reason)', () => {
+  const restores: (() => void)[] = [];
+  teardown(() => { restores.splice(0).forEach((restore) => restore()); });
+
+  const FIRST_LABEL = 'Использовать выгрузку проекта';
+  const table = [
+    {
+      reason: 'mirror-empty' as const,
+      secondLabel: 'Полная выгрузка',
+      message: /Зеркало выгрузки агента для «Бухгалтерия КОРП» пусто/,
+    },
+    {
+      reason: 'project-replaced' as const,
+      secondLabel: 'Обычный импорт',
+      message: /Выгрузка проекта для «Бухгалтерия КОРП» заменена \(файл версий изменился после последней синхронизации\)\. Взять её за основу зеркала агента\?/,
+    },
+  ];
+
+  function stubWarning(answer: string | undefined): { calls: unknown[][] } {
+    const calls: unknown[][] = [];
+    restores.push(stubWindow('showWarningMessage', (...args) => { calls.push(args); return Promise.resolve(answer); }));
+    return { calls };
+  }
+
+  for (const { reason, secondLabel, message } of table) {
+    suite(reason, () => {
+      test(`сообщение соответствует причине; модальный диалог с кнопками «${FIRST_LABEL}» и «${secondLabel}»`, async () => {
+        const { calls } = stubWarning(undefined);
+        await promptMirrorSeed(request({ reason }));
+        assert.match(String(calls[0][0]), message);
+        assert.strictEqual((calls[0][1] as { modal?: boolean }).modal, true);
+        assert.deepStrictEqual(calls[0].slice(2), [FIRST_LABEL, secondLabel]);
+      });
+
+      for (const [answer, expected] of [[FIRST_LABEL, 'seed'], [secondLabel, 'full'], [undefined, 'cancel'], ['Отмена', 'cancel']] as const) {
+        test(`ответ ${String(answer)} → ${expected}`, async () => {
+          stubWarning(answer);
+          assert.strictEqual(await promptMirrorSeed(request({ reason })), expected);
+        });
+      }
+
+      test('detail содержит каталог выгрузки проекта и предупреждение о ручных правках', async () => {
+        const { calls } = stubWarning(undefined);
+        const req = request({ reason, localEditsSinceBaseline: 4 });
+        await promptMirrorSeed(req);
+        const detail = (calls[0][1] as { detail?: string }).detail ?? '';
+        assert.ok(detail.includes(req.projectDir), detail);
+        assert.match(detail, /НЕ будут/);
+        assert.match(detail, /известно\s+4/);
+      });
+    });
+  }
+
+  test('при project-replaced в сообщении нет слов о ПУСТОМ зеркале (текст причины не перепутан)', async () => {
+    const { calls } = stubWarning(undefined);
+    await promptMirrorSeed(request({ reason: 'project-replaced' }));
+    assert.doesNotMatch(String(calls[0][0]), /пуст/);
+  });
+});
+
 suite('Проброс confirmMirrorSeed в хуки агентской операции', function () {
   this.timeout(60_000);
   let tmp: string;
@@ -193,6 +261,60 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
     });
     assert.strictEqual(seen[0], custom);
     assert.strictEqual(seen[1], undefined);
+  });
+
+  test('runDecompileMainConfiguration: importFromDatabase получает хуки promptFullDump и promptOrphanRemoval', async () => {
+    const ok = await runDecompileMainConfiguration('Основная', path.join(tmp, 'src', 'cf'), folder, channel);
+    assert.strictEqual(ok, true);
+    assert.strictEqual(captured[0].hooks.confirmFullDump, promptFullDump);
+    assert.strictEqual(captured[0].hooks.confirmOrphanRemoval, promptOrphanRemoval);
+  });
+
+  test('runDecompileExtension: importFromDatabase получает хуки promptFullDump и promptOrphanRemoval', async () => {
+    const ok = await runDecompileExtension('Расш', path.join(tmp, 'src', 'cfe', 'Расш'), folder, channel);
+    assert.strictEqual(ok, true);
+    assert.strictEqual(captured[0].hooks.confirmFullDump, promptFullDump);
+    assert.strictEqual(captured[0].hooks.confirmOrphanRemoval, promptOrphanRemoval);
+  });
+
+  test('runAgentConfigurationOperation: confirmFullDump/confirmOrphanRemoval из опций попадают в хуки; без опций хуков нет', async () => {
+    const base: RunAgentOptions = {
+      progressTitle: 'Импорт', progressStartMessage: 'старт', successMessage: 'Готово', errorTitle: 'Сбой',
+      showSuccessMessage: false, workspaceFolder: folder, outputChannel: channel, rootPath: tmp,
+    };
+    const fullDump = (): Promise<'dump'> => Promise.resolve('dump');
+    const orphans = (): Promise<boolean> => Promise.resolve(true);
+    const seen: Record<string, unknown>[] = [];
+    const record = (_service: unknown, hooks: unknown): Promise<void> => { seen.push(hooks as Record<string, unknown>); return Promise.resolve(); };
+    await runAgentConfigurationOperation({ ...base, confirmFullDump: fullDump, confirmOrphanRemoval: orphans }, record);
+    await runAgentConfigurationOperation(base, record);
+    assert.strictEqual(seen[0].confirmFullDump, fullDump);
+    assert.strictEqual(seen[0].confirmOrphanRemoval, orphans);
+    assert.strictEqual(seen[1].confirmFullDump, undefined);
+    assert.strictEqual(seen[1].confirmOrphanRemoval, undefined);
+  });
+
+  test('отказ от полной выгрузки (AgentFullDumpDeclinedError): информационное сообщение с инструкцией, без тоста ошибки и диагностики, возврат false', async () => {
+    const errors: unknown[][] = [];
+    const infos: unknown[][] = [];
+    restores.push(stubWindow('showErrorMessage', (...args) => { errors.push(args); return Promise.resolve(undefined); }));
+    restores.push(stubWindow('showInformationMessage', (...args) => { infos.push(args); return Promise.resolve(undefined); }));
+    const lines: string[] = [];
+    const recording = { appendLine: (line: string) => { lines.push(line); }, show: () => undefined } as unknown as vscode.OutputChannel;
+    const declined = new AgentFullDumpDeclinedError();
+
+    const ok = await runAgentConfigurationOperation({
+      progressTitle: 'Импорт', progressStartMessage: 'старт', successMessage: 'Готово', errorTitle: 'Ошибка импорта',
+      showSuccessMessage: false, workspaceFolder: folder, outputChannel: recording, rootPath: tmp,
+    }, () => Promise.reject(declined));
+
+    assert.strictEqual(ok, false);
+    assert.deepStrictEqual(errors, [], 'тоста ошибки нет');
+    assert.strictEqual(infos.length, 1);
+    assert.strictEqual(infos[0][0], declined.message, 'показан текст самой ошибки с инструкцией ручной выгрузки');
+    assert.match(infos[0][0], /вручную/);
+    assert.ok(lines.some((line) => line.includes(declined.message)), `в журнале текст ошибки: ${lines.join(' | ')}`);
+    assert.ok(!lines.some((line) => line.includes('[agent][error]')), 'отказ не пишется как ошибка');
   });
 
   test('отмена пользователем (Esc в вопросе о посеве → AgentSyncCancelledError): не ошибка — без тоста ошибки, информационное сообщение, результат false', async () => {

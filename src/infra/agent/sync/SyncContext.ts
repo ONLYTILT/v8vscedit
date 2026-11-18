@@ -14,6 +14,21 @@ export class AgentSyncCancelledError extends Error {
   }
 }
 
+/**
+ * Пользователь отказался от полной серверной выгрузки (вопрос `confirmFullDump`). Подкласс отмены:
+ * общий путь отмены (без тоста ошибки) годится, а UI показывает инструкцию ручной выгрузки из текста.
+ */
+export class AgentFullDumpDeclinedError extends AgentSyncCancelledError {
+  constructor() {
+    super();
+    this.message =
+      'Полная выгрузка на сервере отменена. Выгрузите конфигурацию в файлы вручную (иерархический формат) и ' +
+      'замените содержимое каталога выгрузки проекта целиком, включая ConfigDumpInfo.xml; следующий импорт ' +
+      'предложит взять её за основу.';
+    this.name = 'AgentFullDumpDeclinedError';
+  }
+}
+
 /** Общие для одной операции импорта или загрузки данные, которые передаются стратегиям. */
 export interface SyncOperationContext {
   /** Корень проекта — для stat-мемо быстрой проверки при построении манифеста B. */
@@ -67,3 +82,9 @@ export function exchangeDirOf(context: SyncOperationContext): string {
 
 /** Имя архива внутри каталога обмена. */
 export const EXCHANGE_ARCHIVE = 'full.zip';
+
+/** Каталог точечной выгрузки внутри каталога обмена: M она не трогает (эксперимент 12, вариант А). */
+export const EXCHANGE_RESTORE_DIR = 'restore';
+
+/** Суффикс списка имён точечной выгрузки — рядом с каталогом обмена, как `.changes`; убирает движок. */
+export const EXCHANGE_RESTORE_LIST_SUFFIX = '.objects.txt';

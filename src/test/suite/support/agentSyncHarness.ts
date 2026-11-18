@@ -20,6 +20,7 @@ import { connectSftpAgentFileStore } from '../../../infra/agent/files/SftpAgentF
 import { AgentSyncEngine } from '../../../infra/agent/sync/AgentSyncEngine';
 import {
   loadSyncManifest,
+  resolveSyncManifestPath,
   saveSyncManifest,
   type SyncManifest,
   type SyncMirrorCoverage,
@@ -86,6 +87,10 @@ export interface SyncHarness {
   removeP(rel: string): void;
   existsP(rel: string): boolean;
   readM(rel: string): string;
+  /** Все файлы M: путь → байты (для проверки «M не тронут» побайтно, в т.ч. двоичных). */
+  snapshotM(): Record<string, string>;
+  /** Сырой текст файла манифеста B (или `undefined`): проверка «манифест не тронут» побайтно. */
+  rawManifestText(): string | undefined;
   /** Файлы M (относительные POSIX-пути, без каталогов), отсортированы. */
   listM(): string[];
   /** Остатки серверного каталога обмена (`userRoot/exchange`). */
@@ -262,6 +267,28 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     existsP: (rel) => fs.existsSync(abs(rel)),
     readM: (rel) => fs.readFileSync(path.join(mirrorAbs, ...rel.split('/')), 'utf-8'),
     listM: () => listFilesUnder(mirrorAbs),
+    snapshotM: () => {
+      const out: Record<string, string> = {};
+      const collect = (dir: string, rel: string): void => {
+        if (!fs.existsSync(dir)) {
+          return;
+        }
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+          if (entry.isDirectory()) {
+            collect(path.join(dir, entry.name), childRel);
+          } else {
+            out[childRel] = fs.readFileSync(path.join(dir, entry.name)).toString('base64');
+          }
+        }
+      };
+      collect(mirrorAbs, '');
+      return out;
+    },
+    rawManifestText: () => {
+      const file = resolveSyncManifestPath(projectRoot, scopeKey);
+      return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : undefined;
+    },
     serverExchangeLeftovers: () => {
       const dir = path.join(userRoot, 'exchange');
       return fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];

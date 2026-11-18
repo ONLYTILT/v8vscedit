@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildSyncManifestFiles, mirrorCoverageOf } from '../../infra/agent/sync/SyncManifest';
@@ -183,5 +184,61 @@ suite('AgentSyncEngine (Э7): локальное хранилище не зас�
     await h.importTarget();
     await h.loadTarget('full');
     assert.strictEqual(mirrorCoverageOf(h.manifest()), 'full');
+  });
+});
+
+/**
+ * Локальный агент и новые вопросы импорта (plan-archive-avoid.md §8): `confirmFullDump`,
+ * `confirmOrphanRemoval` и посев при замене выгрузки проекта относятся ТОЛЬКО к удалённому хранилищу —
+ * локальный импорт всегда `compare` и полной серверной выгрузки как отдельной причины не знает. Отпечаток
+ * `ConfigDumpInfo.xml` проекта при этом пишется в манифест (не используется, но не зависит от хранилища).
+ */
+suite('AgentSyncEngine: локальное хранилище и вопросы полной выгрузки/сирот', function () {
+  this.timeout(60_000);
+  let h: SyncHarness;
+
+  setup(async () => {
+    h = await createHarness('local');
+    h.seedDb();
+    h.emulator.setConfiguration('Основная', 'cf');
+  });
+  teardown(async () => { await h.dispose(); });
+
+  function spyHooks(): { calls: string[]; hooks: Parameters<SyncHarness['importTarget']>[0] } {
+    const calls: string[] = [];
+    return {
+      calls,
+      hooks: {
+        confirmFullDump: () => { calls.push('fullDump'); return Promise.resolve('cancel'); },
+        confirmOrphanRemoval: () => { calls.push('orphans'); return Promise.resolve(true); },
+        confirmMirrorSeed: () => { calls.push('seed'); return Promise.resolve('cancel'); },
+      },
+    };
+  }
+
+  test('удаление объекта в базе и замена выгрузки проекта: ни один из хуков не вызывается, стратегия compare', async () => {
+    const spy = spyHooks();
+    await h.importTarget(spy.hooks);
+    h.emulator.removeObject('Document.Заказ');
+    h.emulator.snapshotToProject(h.configRoot);
+    h.emulator.setObject('Catalog.Новый', { 'Catalogs/Новый.xml': '<n/>' });
+
+    const result = await h.importTarget(spy.hooks);
+
+    assert.strictEqual(result.strategy, 'compare');
+    assert.deepStrictEqual(spy.calls, []);
+    assert.strictEqual(result.orphans, undefined);
+    assert.ok(h.emulator.dumps().every((d) => !d.options.archive && !d.options['list-file']));
+  });
+
+  test('отпечаток ConfigDumpInfo.xml проекта пишется в манифест после импорта: sha1, размер и mtime файла', async () => {
+    await h.importTarget();
+
+    const cdi = path.join(h.configRoot, 'ConfigDumpInfo.xml');
+    const stored = h.manifest().projectDumpInfo;
+    assert.ok(stored, 'отпечаток записан');
+    assert.strictEqual(stored.size, fs.statSync(cdi).size);
+    assert.strictEqual(stored.mtimeMs, fs.statSync(cdi).mtimeMs);
+    assert.strictEqual(stored.sha1, createHash('sha1').update(fs.readFileSync(cdi)).digest('hex'));
   });
 });

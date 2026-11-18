@@ -222,11 +222,12 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
           assert.strictEqual(result.strategy, 'archive');
           assert.strictEqual(result.reason, 'full-dump');
           const dumps = h.emulator.dumps().slice(dumpsBefore);
-          assert.strictEqual(dumps.length, 3, 'список, запись M, архив');
+          // Изменено планом «полная выгрузка — только когда без неё нельзя»: FullDump уходит в архив БЕЗ
+          // предшествующей полной перезаписи M командой --update (раньше было три команды, две полные выгрузки).
+          assert.strictEqual(dumps.length, 2, 'список и архив: --update без --get-changes не выполняется');
           assert.ok(dumps[0].options['get-changes'] && dumps[0].options.update === true);
-          assert.ok(!dumps[1].options['get-changes'] && dumps[1].options.update === true);
-          assert.strictEqual(dumps[2].options.archive, 'full.zip');
-          assert.ok(!dumps[2].options.update);
+          assert.strictEqual(dumps[1].options.archive, 'full.zip');
+          assert.ok(!dumps[1].options.update);
           assert.strictEqual(h.manifest().mirrorState, 'fresh');
         }
         assert.deepStrictEqual(exchangeLeftovers(h), []);
@@ -238,6 +239,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         h.writeP('Catalogs/Клиенты.xml', '<Catalog>моя правка</Catalog>');
         h.removeP('Roles/Админ/Ext/Rights.xml');
         h.writeP('Catalogs/Лишний.xml', '<Catalog>добавлен локально</Catalog>');
+        const dumpsBefore = h.emulator.dumps().length;
 
         const result = await doImport();
 
@@ -248,11 +250,15 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
           ['Catalogs/Клиенты.xml', 'Catalogs/Лишний.xml', 'Roles/Админ/Ext/Rights.xml']
         );
         assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
-        // Изменено планом посева: M после первого импорта разреженный, а правки (D.modified/D.deleted)
-        // файлов неизменённых владельцев в нём не восстановить — архив `sparse-mirror-dirty`, а не дельта.
-        assert.strictEqual(result.strategy, kind === 'sftp' ? 'archive' : 'compare');
+        // Изменено планом «полная выгрузка — только когда без неё нельзя»: M после первого импорта
+        // разреженный, правки (D.modified/D.deleted) файлов неизменённых владельцев дельтой не восстановить, но
+        // и архив не нужен — их берёт из базы точечная выгрузка `dump --list-file` (раньше — архив sparse-mirror-dirty).
+        assert.strictEqual(result.strategy, kind === 'sftp' ? 'delta' : 'compare');
         if (kind === 'sftp') {
-          assert.strictEqual(result.reason, 'sparse-mirror-dirty');
+          assert.strictEqual(result.reason, undefined);
+          assert.strictEqual(result.restoredFromDatabase, 2, 'Клиенты.xml и Rights.xml взяты из базы');
+          assert.ok(h.emulator.dumps().slice(dumpsBefore).every((d) => !d.options.archive), 'архива во втором импорте нет');
+          assert.strictEqual(h.emulator.listDumpCalls, 1);
         }
       });
 
@@ -349,7 +355,9 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.strictEqual(hookCalls, 0);
         assert.deepStrictEqual(h.manifest().files, manifestBefore);
         if (kind === 'sftp') {
-          assert.strictEqual(h.manifest().mirrorState, 'empty', 'M уже изменён, P — нет: следующий импорт обязан быть полным');
+          // Изменено: FullDump → архив без предшествующей мутации M; сбой проверки архива (нет Configuration.xml)
+          // происходит ДО посева, M не тронут — манифест прежний (fresh), а не empty.
+          assert.strictEqual(h.manifest().mirrorState, 'fresh', 'M не тронут: проверка архива до посева');
         }
         assert.deepStrictEqual(exchangeLeftovers(h), []);
       });
