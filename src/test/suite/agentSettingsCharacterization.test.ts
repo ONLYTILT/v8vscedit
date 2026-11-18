@@ -24,7 +24,7 @@ import {
 
 const AGENT_KEYS = [
   'host', 'listenAddress', 'port', 'user', 'privateKeyPath',
-  'autoStart', 'visible', 'agentModeArgs', 'progressInterval', 'startupTimeoutMs', 'authWarmupMs',
+  'autoStart', 'visible', 'agentModeArgs', 'progressInterval', 'startupTimeoutMs', 'authWarmupMs', 'connectTimeoutMs',
   'location', 'transferConcurrency', 'archiveThresholdFiles',
 ] as const;
 
@@ -119,6 +119,7 @@ suite('Агент: readAgentCommandSettings (characterization)', () => {
       progressInterval: 0.5,
       startupTimeoutMs: 15000,
       authWarmupMs: 90000,
+      connectTimeoutMs: 60000,
       idleDisconnectMinutes: 0,
       location: 'local',
       transferConcurrency: 16,

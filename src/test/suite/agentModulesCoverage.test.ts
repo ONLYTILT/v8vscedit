@@ -96,7 +96,7 @@ const AGENT_KEYS = ['host', 'listenAddress', 'port', 'user', 'privateKeyPath', '
 function settings(overrides: Partial<AgentCommandSettings> = {}): AgentCommandSettings {
   return {
     host: '127.0.0.1', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
-    visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5, startupTimeoutMs: 15000, authWarmupMs: 90000, idleDisconnectMinutes: 0,
+    visible: false, autoStart: false, agentModeArgs: [], progressInterval: 0.5, startupTimeoutMs: 15000, authWarmupMs: 90000, connectTimeoutMs: 60000, idleDisconnectMinutes: 0,
     location: 'local', transferConcurrency: 16, archiveThresholdFiles: 300,
     ...overrides,
   };

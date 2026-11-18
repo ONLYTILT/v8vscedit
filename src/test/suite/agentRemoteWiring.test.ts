@@ -50,7 +50,7 @@ function settings(overrides: Partial<AgentCommandSettings> = {}): AgentCommandSe
   return {
     host: 'srv.example', listenAddress: '127.0.0.1', port: 1543, user: 'u', password: 'p', privateKeyPath: '',
     visible: false, autoStart: true, agentModeArgs: [], progressInterval: 0.5,
-    startupTimeoutMs: 21000, authWarmupMs: 45000, idleDisconnectMinutes: 0,
+    startupTimeoutMs: 21000, authWarmupMs: 45000, connectTimeoutMs: 60000, idleDisconnectMinutes: 0,
     location: 'local', transferConcurrency: 16, archiveThresholdFiles: 300,
     ...overrides,
   };

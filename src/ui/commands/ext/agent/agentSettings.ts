@@ -12,6 +12,9 @@ export type AgentExecutionMode = 'batch' | 'agent';
 const DEFAULT_TRANSFER_CONCURRENCY = 16;
 const MAX_TRANSFER_CONCURRENCY = 64;
 const DEFAULT_ARCHIVE_THRESHOLD_FILES = 300;
+// Удалённый агент проверяет логин/пароль обращением к клиент-серверной базе: на стенде пилота вход
+// стабильно дольше 10 с (прежний зашитый readyTimeout), при обмене ключами за 0,7 с.
+const DEFAULT_CONNECT_TIMEOUT_MS = 60_000;
 
 export interface AgentCommandSettings {
   readonly host: string;
@@ -26,6 +29,8 @@ export interface AgentCommandSettings {
   readonly progressInterval: number;
   readonly startupTimeoutMs: number;
   readonly authWarmupMs: number;
+  /** Предел одной попытки SSH: TCP + обмен ключами + вход (readyTimeout ssh2), мс. */
+  readonly connectTimeoutMs: number;
   /** Простой агента (минуты), после которого база отпускается сама; 0 — держать до явного release. */
   readonly idleDisconnectMinutes: number;
   readonly location: AgentLocation;
@@ -98,6 +103,10 @@ export function readAgentCommandSettings(connection: ConnectionParams): AgentCom
     progressInterval: config.get<number>('progressInterval', 0.5),
     startupTimeoutMs: config.get<number>('startupTimeoutMs', 15000),
     authWarmupMs: config.get<number>('authWarmupMs', 90000),
+    connectTimeoutMs: readPositiveInteger(
+      config.get<unknown>('connectTimeoutMs', DEFAULT_CONNECT_TIMEOUT_MS),
+      DEFAULT_CONNECT_TIMEOUT_MS
+    ),
     idleDisconnectMinutes: config.get<number>('idleDisconnectMinutes', 0),
     location: readAgentLocation(),
     transferConcurrency: readPositiveInteger(
@@ -123,6 +132,8 @@ export function toAgentEndpointOptions(settings: AgentCommandSettings): Designer
     user: settings.user,
     password: settings.password,
     privateKeyPath: nonEmptyString(settings.privateKeyPath),
+    // Транспорт принимает секунды; округление вверх не даёт урезать заданный предел.
+    connectTimeoutSeconds: Math.ceil(settings.connectTimeoutMs / 1000),
   };
 }
 
