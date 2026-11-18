@@ -50,7 +50,7 @@ export class AgentSyncEngine {
   ): Promise<AgentImportResult> {
     return this.runOperation(target, exec, hooks, async (context) => {
       const result = await runImport(context);
-      return { result, baseline: { files: buildSyncManifestFiles(target.rootPath), mirrorState: 'fresh' } };
+      return { result, baseline: { files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot), mirrorState: 'fresh' } };
     });
   }
 
@@ -91,6 +91,7 @@ export class AgentSyncEngine {
     // Объект, а не локальная переменная: флаг меняет колбэк, который вызывают стратегии.
     const mirror = { mutated: false };
     const context: SyncOperationContext = {
+      projectRoot,
       store,
       exec,
       target,

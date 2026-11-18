@@ -4,7 +4,6 @@ import { getBool, getString } from '../core/args';
 import { resolveConnection } from '../core/connection';
 import { createTempDir, printLogFile, runDesignerAndPrintResult, safeRemoveDir, writeUtf8BomLines } from '../core/onecCommon';
 import {
-  buildHashSnapshot,
   buildScopeKey,
   collectCurrentHashes,
   diffHashSnapshots,
@@ -13,6 +12,7 @@ import {
   loadHashCache,
   patchHashSnapshot,
   saveHashCache,
+  scanHashSnapshot,
 } from '../core/hashCache';
 import { resolveConfigDir } from '../core/projectLayout';
 import type { CliArgs } from '../core/types';
@@ -37,7 +37,8 @@ export async function importGitChanges(args: CliArgs): Promise<number> {
   const normalizedTarget = target === 'cfe' ? 'cfe' : 'cf';
   const scopeKey = buildScopeKey(normalizedTarget, configDir, extension);
   const previousSnapshot = loadHashCache(projectRoot, scopeKey);
-  const currentSnapshot = buildHashSnapshot(scopeKey, configDir);
+  // Быстрая проверка через stat-мемо проекта: перехешируются только файлы со сменившимся отпечатком.
+  const currentSnapshot = await scanHashSnapshot(projectRoot, scopeKey, configDir);
   const diff = diffHashSnapshots(previousSnapshot, currentSnapshot);
   const hasRename = detectPotentialRename(previousSnapshot.files, currentSnapshot.files, diff.added, diff.deleted);
   const forceFullLoad = hasRename;

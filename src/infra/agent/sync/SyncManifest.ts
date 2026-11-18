@@ -1,14 +1,15 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildHashSnapshot, loadHashCache } from '../../cache/HashCache';
+import { loadHashCache } from '../../cache/HashCache';
+import { scanHashSnapshot, type HashScanOptions } from '../../cache/HashScanner';
 import { writeFileAtomic } from '../../fs/AtomicFileWriter';
 
 /**
  * Манифест B — базовая линия синхронизации цели (cf или cfe/<имя>) с агентом: «отн. путь → sha1»
  * отслеживаемых файлов P на момент последней успешной операции и состояние серверного зеркала M.
  *
- * Набор отслеживаемых файлов и хэш — РОВНО те же, что у HashCache (`buildHashSnapshot`): иначе B и
+ * Набор отслеживаемых файлов и хэш — РОВНО те же, что у HashCache (`buildHashSnapshot`/`scanHashSnapshot`): иначе B и
  * кэш хэшей расходились бы, и загрузка «по изменениям» считала бы разные множества в двух местах.
  */
 
@@ -41,8 +42,18 @@ export function resolveSyncManifestPath(projectRoot: string, scopeKey: string): 
   return path.join(projectRoot, '.v8vscedit', 'agent-sync', `${hash}.json`);
 }
 
-export function buildSyncManifestFiles(configDir: string): Record<string, string> {
-  return buildHashSnapshot('', configDir).files;
+/**
+ * Текущее состояние P быстрой проверкой: с `projectRoot` используется stat-мемо проекта — тот же,
+ * что у детектора изменений (мемо привязан к каталогу, а не к области), поэтому после проверки
+ * изменений манифест агента почти ничего не перечитывает. Операции агента идут в Extension Host,
+ * и полный синхронный проход по выгрузке блокировал бы его.
+ */
+export async function buildSyncManifestFiles(
+  configDir: string,
+  projectRoot?: string,
+  options?: HashScanOptions
+): Promise<Record<string, string>> {
+  return (await scanHashSnapshot(projectRoot, '', configDir, options)).files;
 }
 
 /**

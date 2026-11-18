@@ -90,7 +90,8 @@ export interface CommandServices {
   aiSkillsInstaller: AiSkillsInstaller;
   refreshChangedConfigurationState: () => void;
   markChangedConfigurationByFiles: (filePaths: string[]) => void;
-  getChangedConfigurations: () => ChangedConfiguration[];
+  /** Ждёт окончания фоновой проверки изменений: до её результата ответ «изменений нет» был бы ложным. */
+  getChangedConfigurations: () => Promise<ChangedConfiguration[]>;
   markConfigurationsClean: (rootPaths: string[]) => void;
   suppressConfigurationReloadForFiles: (filePaths: string[]) => void;
   revealTreeNode: (predicate: (node: MetadataNode) => boolean, rootPath?: string) => Promise<boolean>;

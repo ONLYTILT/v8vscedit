@@ -14,6 +14,8 @@ export class AgentSyncCancelledError extends Error {
 
 /** Общие для одной операции импорта или загрузки данные, которые передаются стратегиям. */
 export interface SyncOperationContext {
+  /** Корень проекта — для stat-мемо быстрой проверки при построении манифеста B. */
+  readonly projectRoot: string;
   readonly store: AgentFileStore;
   readonly exec: AgentCommandExecutor;
   readonly target: AgentConfigurationOperationTarget;

@@ -122,7 +122,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.strictEqual(result.strategy, kind === 'sftp' ? 'archive' : 'compare');
         assert.strictEqual(result.reason, kind === 'sftp' ? 'mirror-empty' : undefined);
         assert.deepStrictEqual(relativeSorted(h, result.changedProjectFiles), Object.keys(h.emulator.dbFiles()).sort());
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
 
         const dumps = h.emulator.dumps();
         assert.strictEqual(dumps[0].options.dir, h.mirrorDir);
@@ -173,7 +173,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         const touched = touchedFiles(h.configRoot).filter((rel) => rel !== 'ConfigDumpInfo.xml');
         assert.deepStrictEqual(touched, ['Catalogs/Товары/Ext/ObjectModule.bsl'], 'Catalogs/Товары.xml не переписан');
         assert.strictEqual(h.manifest().files['Catalogs/Товары/Ext/ObjectModule.bsl'], sha1('Процедура Новая() КонецПроцедуры'));
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
 
         if (kind === 'sftp') {
           // Дельта-импорт ДВУМЯ шагами (§5b п.4): список, затем запись M; архив не нужен.
@@ -223,7 +223,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         expectPMatchesDb(h, true);
         assert.strictEqual(h.existsP('Documents'), false, 'каталог Documents опустел и убран');
         assert.ok(relativeSorted(h, result.changedProjectFiles).includes('Documents/Заказ/Forms/Форма.xml'));
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         if (kind === 'sftp') {
           assert.strictEqual(result.strategy, 'archive');
           assert.strictEqual(result.reason, 'full-dump');
@@ -253,7 +253,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
           relativeSorted(h, result.changedProjectFiles).filter((rel) => rel !== 'ConfigDumpInfo.xml'),
           ['Catalogs/Клиенты.xml', 'Catalogs/Лишний.xml', 'Roles/Админ/Ext/Rights.xml']
         );
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         assert.strictEqual(result.strategy, kind === 'sftp' ? 'delta' : 'compare');
       });
 
@@ -405,7 +405,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
           const retry = await doImport({ cancellation: cancel });
           assert.strictEqual(retry.strategy, kind === 'sftp' ? 'archive' : 'compare');
           expectPMatchesDb(h, true);
-          assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+          assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         });
       });
     });
@@ -460,7 +460,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.deepStrictEqual(h.emulator.loads.at(-1)?.mode, 'partial');
         assert.strictEqual(h.emulator.dbTrackedFiles()['Catalogs/Товары/Ext/ObjectModule.bsl'].toString('utf-8'), 'Процедура Правка() КонецПроцедуры');
         assert.strictEqual(h.manifest().files['Catalogs/Товары/Ext/ObjectModule.bsl'], sha1('Процедура Правка() КонецПроцедуры'));
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         if (kind === 'sftp') {
           assert.strictEqual(h.manifest().mirrorState, 'fresh');
         }
@@ -488,8 +488,8 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.strictEqual(loads.length, 1);
         assert.ok(!loads[0].options.partial);
         assert.deepStrictEqual(h.emulator.dbTrackedFiles()['Catalogs/Клиенты.xml'], undefined, 'удалённого в проекте объекта нет и в базе');
-        assert.deepStrictEqual(Object.keys(h.emulator.dbTrackedFiles()).sort(), Object.keys(buildSyncManifestFiles(h.configRoot)).sort());
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(Object.keys(h.emulator.dbTrackedFiles()).sort(), Object.keys(await buildSyncManifestFiles(h.configRoot)).sort());
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         if (kind === 'sftp') {
           assert.strictEqual(loads[0].options.archive, 'full.zip');
           assert.ok(String(loads[0].options.dir).startsWith('exchange/'), String(loads[0].options.dir));
@@ -523,8 +523,8 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         const loads = h.emulator.commands.slice(commandsBefore).filter((c) => c.command === 'config load-config-from-files');
         assert.strictEqual(loads.length, 1);
         assert.ok(!loads[0].options.partial && !loads[0].options['list-file']);
-        assert.deepStrictEqual(Object.keys(h.emulator.dbTrackedFiles()).sort(), Object.keys(buildSyncManifestFiles(h.configRoot)).sort());
-        assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+        assert.deepStrictEqual(Object.keys(h.emulator.dbTrackedFiles()).sort(), Object.keys(await buildSyncManifestFiles(h.configRoot)).sort());
+        assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
       });
 
       test('нет каталога исходников: full — «Каталог источника не найден», changed — «Каталог исходников не найден»; команд агента нет', async () => {

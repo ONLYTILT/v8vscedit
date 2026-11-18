@@ -120,7 +120,7 @@ async function importRemote(context: SyncOperationContext): Promise<AgentImportR
   // строки в путь (вложенная подсистема и т.п.): дельта молча пропустила бы его, архив — нет.
   const missingOwners = ownerFiles?.missingOwners.map((owner) => owner.fullName) ?? [];
   const changedFiles = [...new Set([...inMirror, ...owners.flatMap((owner) => projectOwnerFiles(projectDir, owner))])];
-  const dirty = diffSyncFiles(context.manifest.files, buildSyncManifestFiles(projectDir));
+  const dirty = diffSyncFiles(context.manifest.files, await buildSyncManifestFiles(projectDir, context.projectRoot));
   const plan = planRemoteImport({
     mirrorState,
     changeSet,

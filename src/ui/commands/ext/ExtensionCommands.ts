@@ -140,7 +140,7 @@ export function registerExtensionCommands(
       await yieldToUi();
       const completedRootPaths: string[] = [];
       try {
-        const changed = services.getChangedConfigurations();
+        const changed = await services.getChangedConfigurations();
 
         if (changed.length === 0) {
           setConfigurationProgress(services, 'Обновление конфигураций', 'изменений нет', false);

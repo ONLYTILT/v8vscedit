@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import type { ConfigEntry } from './domain/Configuration';
 import { findConfigurations } from './infra/fs/ConfigLocator';
 import { type ChangedConfiguration, ConfigurationChangeDetector } from './infra/fs/ConfigurationChangeDetector';
+import { ChangeDetectionRunner } from './infra/fs/ChangeDetectionRunner';
 import { ConfigurationCleanWindow } from './infra/fs/ConfigurationCleanWindow';
 import { MetadataTreeProvider } from './ui/tree/MetadataTreeProvider';
 import { registerCommands } from './ui/commands/CommandRegistry';
@@ -134,6 +135,9 @@ export class Container {
   readonly aiMcpViewProvider: AiMcpViewProvider;
   readonly lspManager: LspManager;
   readonly changeDetector: ConfigurationChangeDetector;
+  // Фоновая проверка изменений с single-flight: проход по выгрузке не должен блокировать поток
+  // Extension Host, а повторные запросы во время прохода схлопываются в один повтор.
+  private readonly changeDetection: ChangeDetectionRunner<ChangedConfiguration[]>;
 
   private changeStateTimer: NodeJS.Timeout | undefined;
   private treeCacheTimer: NodeJS.Timeout | undefined;
@@ -313,7 +317,22 @@ export class Container {
       this.dynamicPanelController
     );
     context.subscriptions.push(this.dynamicPanelController, this.dynamicPanelViewProvider);
-    this.changeDetector = new ConfigurationChangeDetector(workspaceFolder.uri.fsPath);
+    this.changeDetector = new ConfigurationChangeDetector(workspaceFolder.uri.fsPath, {
+      log: (line) => this.outputChannel.appendLine(line),
+    });
+    this.changeDetection = new ChangeDetectionRunner<ChangedConfiguration[]>({
+      // Состав конфигураций берётся при старте КАЖДОГО прогона: повтор подхватывает новый состав.
+      run: () => this.changeDetector.detect(this.treeProvider.getEntries()),
+      apply: (changed) => {
+        this.changedConfigurations = changed;
+        void vscode.commands.executeCommand('setContext', 'v8vscedit.hasChangedConfigurations', changed.length > 0);
+      },
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.outputChannel.appendLine(`[hash-cache] Проверка изменений не выполнена: ${message}`);
+      },
+    });
+    context.subscriptions.push({ dispose: () => this.changeDetection.dispose() });
 
     this.lspManager = new LspManager(context, this.outputChannel);
     const extensionPackageJson = context.extension.packageJSON as { version?: string };
@@ -374,12 +393,11 @@ export class Container {
       this.outputChannel.appendLine('[init] env.json отсутствовал или был пуст — создан из шаблона');
     }
     this.basedOnXmlService.invalidate();
-    // P2-замечание: ensureHashCaches при первом запуске может пересчитывать хеш-кэш
-    // целиком на потоке активации. Отложить его в microtask нельзя без регрессии —
-    // последующий refreshChangedConfigurationState() читает эти кэши через
-    // changeDetector.detect(), а reloadEntries вызывается не только при bootstrap
-    // (см. вызов из watcher'а), поэтому синхронная готовность здесь наблюдаема.
-    this.ensureHashCaches(entries);
+    // Хеш-кэш здесь не создаётся и не проверяется синхронно: на большой выгрузке это блокировало
+    // поток активации на минуты. Первичная инициализация базовой линии и сравнение идут в ОДНОМ
+    // фоновом прогоне detect (refreshChangedConfigurationState ниже), поэтому порядок «кэш готов →
+    // сравнение» соблюдается по построению, а single-flight исключает параллельный прогон по
+    // недописанному кэшу. Кэш дерева метаданных при отсутствии строит сам MetadataTreeProvider.
     // Состав корней конфигураций мог измениться (новая cfe / переименование),
     // поэтому кэш `findConfigRoot` нужно сбросить до перестроения дерева.
     this.repositoryService.invalidateConfigRootCache();
@@ -401,6 +419,7 @@ export class Container {
     // Статус-бар хранилища создаётся лениво и не попадает в subscriptions —
     // диспозим его явно, наравне с disposeCachedAgentOperationServices.
     disposeRepositoryCommandStatusBar();
+    this.changeDetection.dispose();
     await Promise.allSettled([
       this.mcpServer.stop(),
       this.bslAnalyzerMcpService.stopAll(),
@@ -677,21 +696,12 @@ export class Container {
     this.context.subscriptions.push(observer);
   }
 
-  private ensureHashCaches(entries: ConfigEntry[]): void {
-    const created = this.changeDetector.ensureCaches(entries, (message) => {
-      this.outputChannel.appendLine(`[init] ${message}`);
-    });
-    if (created > 0) {
-      this.outputChannel.appendLine(`[hash-cache] Создано первичных кэшей: ${String(created)}`);
-    }
-  }
-
   private scheduleChangedConfigurationStateRefresh(uri?: vscode.Uri): void {
     // События файлов, записанных самим импортом/обновлением, watcher доставляет с
     // задержкой — уже после markConfigurationsClean. Пока окно тишины открыто,
     // такое событие игнорируется целиком: хеш-кэш операция только что
-    // актуализировала, а полный пересчёт (detect обходит и хеширует всю выгрузку)
-    // на каждое из тысяч событий заблокировал бы Extension Host на минуты.
+    // актуализировала, а пересчёт (detect делает stat каждого файла выгрузки) на
+    // каждое из тысяч событий был бы лишней нагрузкой на диск.
     // Единственный авторитетный пересчёт по окончании окна ставит markConfigurationsClean.
     if (uri && this.cleanWindow.isOpenFor(uri.fsPath)) {
       return;
@@ -759,14 +769,9 @@ export class Container {
     }, 500);
   }
 
+  /** Ставит фоновую проверку; результат применяет `changeDetection.apply`. */
   private refreshChangedConfigurationState(): void {
-    const changed = this.changeDetector.detect(this.treeProvider.getEntries());
-    this.changedConfigurations = changed;
-    void vscode.commands.executeCommand(
-      'setContext',
-      'v8vscedit.hasChangedConfigurations',
-      changed.length > 0
-    );
+    void this.changeDetection.request();
   }
 
   private markChangedConfigurationByFiles(filePaths: string[]): void {
@@ -792,7 +797,12 @@ export class Container {
     }
   }
 
-  private getChangedConfigurations(): ChangedConfiguration[] {
+  /**
+   * Ждёт окончания фоновой проверки: в окне после старта или reloadEntries ответ без ожидания был
+   * бы ложным «изменений нет», и «Обновить конфигурации» пропустило бы загрузку в БД.
+   */
+  private async getChangedConfigurations(): Promise<ChangedConfiguration[]> {
+    await this.changeDetection.whenIdle();
     return [...this.changedConfigurations];
   }
 
@@ -821,6 +831,8 @@ export class Container {
       'v8vscedit.hasChangedConfigurations',
       this.changedConfigurations.length > 0
     );
+    // Прогон, начатый до записи импортом новой базовой линии, сравнивал бы со старой — отбрасываем.
+    this.changeDetection.invalidate();
   }
 
   private markChangedConfigurationByFile(filePath: string): boolean {
@@ -852,6 +864,8 @@ export class Container {
     }
 
     void vscode.commands.executeCommand('setContext', 'v8vscedit.hasChangedConfigurations', true);
+    // Прогон, начатый до этой правки, своим «изменений нет» затёр бы оптимистичную пометку.
+    this.changeDetection.invalidate();
   }
 
   private suppressConfigurationReloadForFiles(filePaths: string[]): void {

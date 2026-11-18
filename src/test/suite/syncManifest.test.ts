@@ -12,6 +12,8 @@ import {
   saveSyncManifest,
   type SyncManifest,
 } from '../../infra/agent/sync/SyncManifest';
+import { resolveHashStatMemoPath } from '../../infra/cache/HashStatMemo';
+import { countingFs, futureNow } from './support/hashScanFixtures';
 
 /**
  * Э7: манифест B — «отн. путь → sha1» отслеживаемых файлов P на момент последней успешной
@@ -44,20 +46,46 @@ suite('SyncManifest (Э7)', () => {
   teardown(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
   suite('buildSyncManifestFiles', () => {
-    test('sha1 содержимого по POSIX-путям; ConfigDumpInfo.xml не отслеживается', () => {
-      const files = buildSyncManifestFiles(configRoot);
+    test('sha1 содержимого по POSIX-путям; ConfigDumpInfo.xml не отслеживается', async () => {
+      const files = await buildSyncManifestFiles(configRoot);
       assert.strictEqual(files['Configuration.xml'], sha1('<Configuration/>'));
       assert.strictEqual(files['Catalogs/Товары/Ext/ObjectModule.bsl'], sha1('Процедура А() КонецПроцедуры'));
       assert.ok(!('ConfigDumpInfo.xml' in files));
       assert.ok(Object.keys(files).every((rel) => !rel.includes('\\')));
     });
 
-    test('набор и хэши совпадают с HashCache (единый критерий «отслеживаемого файла»)', () => {
-      assert.deepStrictEqual(buildSyncManifestFiles(configRoot), buildHashSnapshot(SCOPE(), configRoot).files);
+    test('набор и хэши совпадают с HashCache (единый критерий «отслеживаемого файла»)', async () => {
+      assert.deepStrictEqual(await buildSyncManifestFiles(configRoot), buildHashSnapshot(SCOPE(), configRoot).files);
     });
 
-    test('каталога нет → пустой манифест, без исключения', () => {
-      assert.deepStrictEqual(buildSyncManifestFiles(path.join(projectRoot, 'нет')), {});
+    test('каталога нет → пустой манифест, без исключения', async () => {
+      assert.deepStrictEqual(await buildSyncManifestFiles(path.join(projectRoot, 'нет')), {});
+    });
+
+    test('без projectRoot мемо не пишется; с projectRoot второй вызов не читает файлы (быстрая проверка)', async () => {
+      const counting = countingFs();
+      await buildSyncManifestFiles(configRoot, undefined, { fs: counting, now: futureNow });
+      assert.ok(!fs.existsSync(path.join(projectRoot, '.v8vscedit')));
+
+      counting.reset();
+      const first = await buildSyncManifestFiles(configRoot, projectRoot, { fs: counting, now: futureNow });
+      assert.strictEqual(counting.counts.readFile, 3, 'первый вызов хеширует все 3 отслеживаемых файла');
+      counting.reset();
+      const second = await buildSyncManifestFiles(configRoot, projectRoot, { fs: counting, now: futureNow });
+      assert.strictEqual(counting.counts.readFile, 0);
+      assert.deepStrictEqual(second, first);
+      assert.deepStrictEqual(second, buildHashSnapshot(SCOPE(), configRoot).files);
+    });
+
+    test('мемо и базовая линия сосуществуют: B берётся из базовой линии, buildSyncManifestFiles её не меняет (байты)', async () => {
+      const snapshot = { ...buildHashSnapshot(SCOPE(), configRoot), files: { 'Catalogs/Товары.xml': 'из-базовой-линии' } };
+      saveHashCache(projectRoot, snapshot);
+      const baselineFile = path.join(projectRoot, '.v8vscedit', 'cache', `${sha1(SCOPE())}.json`);
+      const bytes = fs.readFileSync(baselineFile);
+      await buildSyncManifestFiles(configRoot, projectRoot, { now: futureNow });
+      assert.ok(fs.existsSync(resolveHashStatMemoPath(projectRoot, configRoot)), 'мемо записан');
+      assert.deepStrictEqual(fs.readFileSync(baselineFile), bytes, 'базовая линия не тронута');
+      assert.deepStrictEqual(loadSyncManifest(projectRoot, SCOPE()).files, snapshot.files);
     });
   });
 

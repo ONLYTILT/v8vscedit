@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getBool, getString } from '../core/args';
 import { resolveConnection } from '../core/connection';
-import { buildHashSnapshot, buildScopeKey, collectCurrentHashes, loadHashCache, patchHashSnapshot, saveHashCache } from '../core/hashCache';
+import { buildScopeKey, collectCurrentHashes, loadHashCache, patchHashSnapshot, saveHashCache, scanHashSnapshot } from '../core/hashCache';
 import { createTempDir, printLogFile, runDesignerAndPrintResult, safeRemoveDir, writeUtf8BomLines } from '../core/onecCommon';
 import { resolveConfigDir } from '../core/projectLayout';
 import type { CliArgs } from '../core/types';
@@ -81,9 +81,13 @@ export async function importConfiguration(args: CliArgs): Promise<number> {
     if (verbose) {
       printLogFile(outFile);
     }
+    /* c8 ignore start */
+    // Тело достижимо только при успешной загрузке платформой 1С (e2e с 1cv8); сама логика обновления
+    // хеш-кэша покрыта unit-тестом экспортированной refreshHashCacheAfterImport (cliHashCache.test).
     if (exitCode === 0) {
-      refreshHashCacheAfterImport(projectRoot, configDir, target, extension, mode, partialFiles);
+      await refreshHashCacheAfterImport(projectRoot, configDir, target, extension, mode, partialFiles);
     }
+    /* c8 ignore stop */
     return exitCode;
   } finally {
     safeRemoveDir(tempDir);
@@ -94,19 +98,24 @@ function isConfigurationOnSupport(configDir: string): boolean {
   return fs.existsSync(path.join(configDir, 'Ext', 'ParentConfigurations.bin'));
 }
 
-function refreshHashCacheAfterImport(
+/**
+ * Экспортируется ради теста без платформы 1С: сама загрузка требует 1cv8, а обновление кэша —
+ * чистая работа с ФС. Полная ветка идёт быстрой проверкой: `/LoadConfigFromFiles` файлы выгрузки не
+ * переписывает, и после полной загрузки почти все хеши берутся из stat-мемо.
+ */
+export async function refreshHashCacheAfterImport(
   projectRoot: string,
   configDir: string,
   target: string,
   extension: string,
   mode: string,
   partialFiles: string[]
-): void {
+): Promise<void> {
   const normalizedTarget = target === 'cfe' ? 'cfe' : 'cf';
   const scopeKey = buildScopeKey(normalizedTarget, configDir, extension);
   console.log('Формирование хеш-кэша');
   if (mode === 'Full') {
-    const snapshot = buildHashSnapshot(scopeKey, configDir);
+    const snapshot = await scanHashSnapshot(projectRoot, scopeKey, configDir);
     saveHashCache(projectRoot, snapshot);
     console.log('Формирование кэша метаданных');
     saveMetadataCacheForEntry(projectRoot, scopeKey, { kind: normalizedTarget, rootPath: configDir });

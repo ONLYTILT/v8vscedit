@@ -50,7 +50,7 @@ export async function runLoad(context: SyncOperationContext, mode: AgentLoadMode
   if (!fs.existsSync(projectDir)) {
     throw new Error(`${mode === 'full' ? 'Каталог источника не найден' : 'Каталог исходников не найден'}: ${projectDir}`);
   }
-  const files = buildSyncManifestFiles(projectDir);
+  const files = await buildSyncManifestFiles(projectDir, context.projectRoot);
   const storeKind = context.store.kind;
   const fullVia = storeKind === 'local' ? 'dir' : 'archive';
   if (mode === 'full') {

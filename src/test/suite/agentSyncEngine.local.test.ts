@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildSyncManifestFiles } from '../../infra/agent/sync/SyncManifest';
+import { emptyHashStatMemo, loadHashStatMemo, saveHashStatMemo } from '../../infra/cache/HashStatMemo';
 import { createHarness, type SyncHarness } from './support/agentSyncHarness';
 
 /**
@@ -86,7 +87,7 @@ suite('AgentSyncEngine (Э7): локальное хранилище', function (
 
   test('частичная загрузка без каркаса M (нет Configuration.xml): P зеркалится в M целиком, лишнее в M убирается', async () => {
     await doImport();
-    h.saveManifest('fresh', buildSyncManifestFiles(h.configRoot));
+    h.saveManifest('fresh', await buildSyncManifestFiles(h.configRoot));
     fs.unlinkSync(path.join(h.mirrorAbs, 'Configuration.xml'));
     fs.writeFileSync(path.join(h.mirrorAbs, 'Stray.xml'), '<stray/>');
     h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
@@ -124,6 +125,19 @@ suite('AgentSyncEngine (Э7): локальное хранилище', function (
     const inP = Object.keys(h.snapshotP()).sort();
     const inM = allFiles(h.mirrorAbs).map((f) => path.relative(h.mirrorAbs, f).replace(/\\/g, '/')).sort();
     assert.deepStrictEqual(inP, inM);
-    assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+    assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
+  });
+
+  test('импорт строит манифест B через stat-мемо проекта: мемо обновлён (устаревшая запись вычищена), B = hash(P)', async () => {
+    // Свежезаписанные файлы racy и в мемо не попадают, поэтому участие мемо проверяется по вычистке
+    // заведомо устаревшей записи: её убирает только проход, которому передан projectRoot.
+    saveHashStatMemo(h.projectRoot, {
+      ...emptyHashStatMemo(h.configRoot),
+      entries: { 'Нет/Такого.xml': [1, 1, 1, 'устарело'] },
+    });
+    await doImport();
+    const memo = await loadHashStatMemo(h.projectRoot, h.configRoot);
+    assert.ok(!('Нет/Такого.xml' in memo.entries));
+    assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
   });
 });

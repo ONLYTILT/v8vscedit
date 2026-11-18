@@ -429,7 +429,7 @@ suite('Э9: хранилище конфигурации в удалённом р
           projectSecretStorage: secrets,
           treeProvider: { refresh: () => undefined },
           refreshActionsView: () => undefined,
-          getChangedConfigurations: () => [],
+          getChangedConfigurations: () => Promise.resolve([]),
           designerExecutorDeps: deps(),
         } as unknown as CommandServices);
       } finally {

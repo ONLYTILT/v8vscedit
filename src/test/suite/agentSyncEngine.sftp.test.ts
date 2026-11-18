@@ -259,7 +259,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
 
       assert.strictEqual(result.strategy, 'delta');
       assert.strictEqual(h.readP('Ext/SessionModule.bsl'), 'Процедура УстановкаПараметровСеанса(Параметры) КонецПроцедуры');
-      assert.deepStrictEqual(h.manifest().files, buildSyncManifestFiles(h.configRoot));
+      assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
       const tracked = dbAsText(h.emulator.dbTrackedFiles());
       const actual = h.snapshotP();
       delete actual['ConfigDumpInfo.xml'];
@@ -360,7 +360,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
     test('M empty при известном B → очистка M, полная выгрузка в M без скачивания, затем частичная загрузка', async () => {
       await start();
       await doImport();
-      h.saveManifest('empty', buildSyncManifestFiles(h.configRoot));
+      h.saveManifest('empty', await buildSyncManifestFiles(h.configRoot));
       fs.writeFileSync(path.join(h.mirrorAbs, 'Остаток.xml'), '<stale/>');
       h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
       const from = h.emulator.commands.length;
@@ -390,7 +390,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
     test('M empty при известном B, хуки без onMessage: подготовка full-dump проходит с тем же исходом', async () => {
       await start();
       await doImport();
-      h.saveManifest('empty', buildSyncManifestFiles(h.configRoot));
+      h.saveManifest('empty', await buildSyncManifestFiles(h.configRoot));
       h.writeP('Catalogs/Клиенты.xml', '<Catalog>v2</Catalog>');
 
       const result = await h.engine.loadTarget(h.target, 'changed', h.exec, { cancellation: { isCancellationRequested: false } });
@@ -483,7 +483,7 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       }
       const manifest = loadSyncManifest(h.projectRoot, buildScopeKey('cfe', extRoot, 'Расш'));
       assert.strictEqual(manifest.mirrorState, 'stale');
-      assert.deepStrictEqual(manifest.files, buildSyncManifestFiles(extRoot));
+      assert.deepStrictEqual(manifest.files, await buildSyncManifestFiles(extRoot));
       assert.ok(fs.existsSync(path.join(h.userRoot, 'workspace', path.basename(path.dirname(h.mirrorAbs)), 'cfe', 'Расш', 'Configuration.xml')));
       assert.deepStrictEqual(h.manifest().files, {}, 'манифест cf не затронут');
     });

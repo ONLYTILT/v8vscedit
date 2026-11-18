@@ -2,10 +2,15 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { buildHashSnapshot } from '../../infra/cache/HashCache';
-import { buildMetadataCacheSnapshot, type MetadataCacheNode } from '../../infra/cache/MetadataCache';
+import { buildHashSnapshot, saveHashCache } from '../../infra/cache/HashCache';
+import {
+  buildMetadataCacheScopeKey,
+  buildMetadataCacheSnapshot,
+  type MetadataCacheNode,
+} from '../../infra/cache/MetadataCache';
 import { ConfigurationChangeDetector } from '../../infra/fs/ConfigurationChangeDetector';
 import { parseV8iContent } from '../../infra/environment/InfoBaseRegistryService';
+import { parseConfigXml } from '../../infra/xml';
 import { resolveV8ExecutablePath } from '../../infra/process/OnecPlatform';
 import { runProcess } from '../../infra/process/ProcessRunner';
 import { extractMobileFunctionalityUseItems } from '../../infra/xml/MetadataPropertiesXml';
@@ -15,31 +20,16 @@ import {
   buildMetadataTypeItem,
 } from '../../ui/views/properties/MetadataTypeService';
 import { skipWithoutCorpus } from './support/corpus';
+import { buildMinimalConfigXml, writeRel } from './support/hashScanFixtures';
 
 const EXAMPLE_CF = path.resolve(__dirname, '../../../example/2.20/src/cf');
-const EXAMPLE_CFE_ROOT = path.resolve(__dirname, '../../../example/2.21/src/cfe');
-
-function findFirstCfeRoot(): string | null {
-  if (!fs.existsSync(EXAMPLE_CFE_ROOT)) {
-    return null;
-  }
-  for (const entry of fs.readdirSync(EXAMPLE_CFE_ROOT, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const candidate = path.join(EXAMPLE_CFE_ROOT, entry.name);
-    if (fs.existsSync(path.join(candidate, 'Configuration.xml'))) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
 suite('coverage edge-сценарии на реальных данных', () => {
-  test('обходит оставшиеся ветки хеш-кэша, детектора изменений и кэша подсистем', function () {
+  test('обходит оставшиеся ветки хеш-кэша, детектора изменений и кэша подсистем', async function () {
     // Тест работает на эталоне `example/` (не в git) — без корпуса пропускается.
     skipWithoutCorpus(this);
-    this.timeout(60000);
+    // Холодная сборка снимка дерева по всему корпусу (БП 3.0, ~97 тыс. файлов) синхронна и на
+    // загруженной машине занимает больше минуты — бюджет задан с запасом под неё.
+    this.timeout(240000);
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-coverage-'));
     const dataDir = path.join(tempRoot, 'data');
     fs.mkdirSync(dataDir, { recursive: true });
@@ -48,12 +38,25 @@ suite('coverage edge-сценарии на реальных данных', () =>
     const hash = buildHashSnapshot('scope', dataDir);
     assert.ok(hash.files['Object.xml']);
 
+    // Конфигурации для detect — минимальные временные: полный проход по корпусу (~97 тыс. файлов
+    // с пустым stat-мемо) не укладывается в бюджет теста, а ветки детектора на реальных файлах
+    // покрывает сьют configurationChangeDetector.test.ts.
     const detector = new ConfigurationChangeDetector(tempRoot);
-    const cfeRoot = findFirstCfeRoot();
-    const configEntries = cfeRoot
-      ? [{ rootPath: cfeRoot, kind: 'cfe' as const }, { rootPath: EXAMPLE_CF, kind: 'cf' as const }]
-      : [{ rootPath: EXAMPLE_CF, kind: 'cf' as const }];
-    const changes = detector.detect(configEntries);
+    const cfRoot = path.join(tempRoot, 'src', 'cf');
+    const cfeRoot = path.join(tempRoot, 'src', 'cfe', 'Расш');
+    writeRel(cfRoot, 'Configuration.xml', buildMinimalConfigXml('Осн'));
+    writeRel(cfeRoot, 'Configuration.xml', buildMinimalConfigXml('Расш', true));
+    const configEntries = [
+      { rootPath: cfeRoot, kind: 'cfe' as const },
+      { rootPath: cfRoot, kind: 'cf' as const },
+    ];
+    // detect без базовой линии только инициализирует её (0 изменений), поэтому базовая линия
+    // засевается заглушкой с несуществующим файлом — тогда каждая конфигурация «изменена».
+    for (const entry of configEntries) {
+      const scopeKey = buildMetadataCacheScopeKey(entry, parseConfigXml(path.join(entry.rootPath, 'Configuration.xml')));
+      saveHashCache(tempRoot, { schemaVersion: 1, scopeKey, generatedAt: 'x', files: { 'нет.xml': 'x' } });
+    }
+    const changes = await detector.detect(configEntries);
     assert.ok(changes.length >= 1);
     assert.strictEqual(changes[0]?.kind, 'cf');
 

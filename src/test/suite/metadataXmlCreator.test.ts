@@ -12,7 +12,7 @@ import {
 } from '../../ui/views/properties/PropertyBuilder';
 
 suite('metadataXmlCreator', () => {
-  test('создаёт корневой объект и сохраняет изменённость после пересборки meta-кэша', () => {
+  test('создаёт корневой объект и сохраняет изменённость после пересборки meta-кэша', async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-meta-project-'));
     const configRoot = path.join(projectRoot, 'src', 'cf');
     fs.mkdirSync(configRoot, { recursive: true });
@@ -20,7 +20,8 @@ suite('metadataXmlCreator', () => {
 
     const entry = { rootPath: configRoot, kind: 'cf' as const };
     const detector = new ConfigurationChangeDetector(projectRoot);
-    detector.ensureCaches([entry]);
+    // Первый detect — первичная инициализация базовой линии (бывший ensureCaches): изменений нет.
+    assert.deepStrictEqual(await detector.detect([entry]), []);
 
     const creator = new MetadataXmlCreator();
     const result = creator.addRootObject({ configRoot, kind: 'Catalog', name: 'Товары' });
@@ -29,8 +30,7 @@ suite('metadataXmlCreator', () => {
     assert.ok(fs.existsSync(path.join(configRoot, 'Catalogs', 'Товары', 'Ext', 'ObjectModule.bsl')));
 
     fs.rmSync(path.join(projectRoot, '.v8vscedit', 'meta'), { recursive: true, force: true });
-    detector.ensureCaches([entry]);
-    const changed = detector.detect([entry]);
+    const changed = await detector.detect([entry]);
     assert.strictEqual(changed.length, 1);
     assert.ok(changed[0].changedFilesCount > 0);
   });

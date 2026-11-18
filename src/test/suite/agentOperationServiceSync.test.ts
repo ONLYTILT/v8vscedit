@@ -39,7 +39,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     const file = resolveSyncManifestPath(tempRoot, scope());
     assert.ok(file.includes(path.join('.v8vscedit', 'agent-sync')));
     assert.ok(fs.existsSync(file));
-    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, buildSyncManifestFiles(configRoot));
+    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, await buildSyncManifestFiles(configRoot));
   });
 
   test('после частичной загрузки B подтянут к новому P; следующая загрузка без правок — skipped', async () => {
@@ -47,7 +47,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     await service.loadFullAndUpdate(cf());
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>v2</Catalog>', 'utf-8');
     await service.loadChangedAndUpdate(cf());
-    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, buildSyncManifestFiles(configRoot));
+    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, await buildSyncManifestFiles(configRoot));
     const again = await service.loadChangedAndUpdate(cf());
     assert.strictEqual(again.skipped, true);
   });
@@ -64,7 +64,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     });
     await newService(tempRoot, dump).importFromDatabase(cf());
     assert.ok('Catalogs/Новый.xml' in loadSyncManifest(tempRoot, scope()).files);
-    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, buildSyncManifestFiles(configRoot));
+    assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, await buildSyncManifestFiles(configRoot));
   });
 
   test('манифеста нет, есть только HashCache (обновление с прежней версии) → B берётся из него: правка даёт частичную, а не полную загрузку', async () => {
@@ -82,7 +82,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
       schemaVersion: 1,
       scopeKey: scope(),
       mirrorState: 'fresh',
-      files: buildSyncManifestFiles(configRoot),
+      files: await buildSyncManifestFiles(configRoot),
     });
     const factory = new ScriptedFactory();
     const result = await newService(tempRoot, factory).loadChangedAndUpdate(cf());

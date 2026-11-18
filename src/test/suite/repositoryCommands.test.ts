@@ -183,7 +183,7 @@ suite('RepositoryCommands — обработчики команд', () => {
       projectSecretStorage: new ProjectSecretStorage(fakeSecretStore(), root),
       treeProvider: { refresh: () => { refreshes += 1; } },
       refreshActionsView: () => undefined,
-      getChangedConfigurations: () => changedConfigs,
+      getChangedConfigurations: () => Promise.resolve(changedConfigs),
       repositoryConnectionViewProvider: {
         show: (...args: unknown[]) => { connectionForm.calls.push(args); return Promise.resolve(connectionForm.answer); },
       },

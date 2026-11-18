@@ -554,7 +554,7 @@ async function confirmUpdateBeforeCommit(
   target: RepositoryTarget,
   services: CommandServices
 ): Promise<boolean | undefined> {
-  const changed = services.getChangedConfigurations().find(
+  const changed = (await services.getChangedConfigurations()).find(
     (item) => path.resolve(item.rootPath).toLowerCase() === path.resolve(target.configRoot).toLowerCase()
   );
   if (!changed) {
