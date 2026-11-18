@@ -45,3 +45,31 @@ export interface DesignerBatchExecutor {
   /** Освобождает ресурсы исполнителя, включая не забранные staging-файлы. */
   dispose(): Promise<void>;
 }
+
+/** Имя лога `/Out` в рабочем каталоге запуска (локальном или на сервере). */
+export const DESIGNER_LOG_FILE_NAME = 'out.log';
+
+/**
+ * Имя файла в запросе — простое имя внутри рабочего каталога. Разделители, `..` и
+ * абсолютные пути позволили бы запросу писать (или забирать) файлы вне каталога
+ * запуска, а совпадение имён — молча перетереть один файл другим или лог `/Out`.
+ * Общая проверка всех исполнителей: локальный и удалённый отказывают одинаково и ДО
+ * любых побочных эффектов.
+ */
+export function validateDesignerFileNames(args: readonly DesignerArg[]): void {
+  const seen = new Set<string>([DESIGNER_LOG_FILE_NAME]);
+  for (const arg of args) {
+    if (typeof arg === 'string') {
+      continue;
+    }
+    const name = arg.name;
+    if (!name || name === '.' || name === '..' || /[\\/:]/.test(name)) {
+      throw new Error(`Недопустимое имя файла пакетного конфигуратора: "${name}". Ожидается простое имя файла.`);
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      throw new Error(`Имя файла пакетного конфигуратора "${name}" повторяется или занято логом /Out.`);
+    }
+    seen.add(key);
+  }
+}

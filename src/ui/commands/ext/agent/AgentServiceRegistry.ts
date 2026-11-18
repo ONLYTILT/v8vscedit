@@ -21,6 +21,7 @@ import {
 import { getOrCreate } from '../../../../infra/process';
 import { resolveConnectionFromSettings, resolveSettingsPath } from '../connectionSettings';
 import { resetConfigurationOperationStatus } from '../configurationOperationStatus';
+import { disposeCachedDesignerExecutors } from '../designerExecutorRegistry';
 import {
   isAgentConfigurationOperationMode,
   readAgentCommandSettings,
@@ -101,6 +102,9 @@ export async function disposeCachedAgentOperationServices(): Promise<void> {
   // Статус-бар создаётся лениво при begin/update/end и не попадает в context.subscriptions,
   // поэтому освобождаем его здесь — на общем пути остановки расширения.
   resetConfigurationOperationStatus();
+  // Хосты PowerShell удалённого Конфигуратора сбрасываются тем же путём (смена v8vscedit.agent.*/
+  // remote.*, остановка расширения): их параметры — те же настройки.
+  await disposeCachedDesignerExecutors();
 
   const entries = [...agentServices.values()];
   agentServices.clear();

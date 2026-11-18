@@ -20,8 +20,10 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { ProjectSecretStorage } from '../../infra/environment/ProjectSecretStorage';
 import { registerCommands } from '../../ui/commands/CommandRegistry';
 import type { CommandServices } from '../../ui/commands/_shared';
+import { disposeCachedDesignerExecutors } from '../../ui/commands/ext/designerExecutorRegistry';
 import { endConfigurationOperation, tryBeginConfigurationOperation } from '../../ui/commands/ext/configurationOperationLock';
 import {
   REMOTE_DB_PASSWORD,
@@ -29,8 +31,11 @@ import {
   RemoteHarness,
   type RemoteHarnessOptions,
   assertNoSecrets,
+  memorySecrets,
   setAgentSetting,
 } from './support/agentRemoteHarness';
+import { createOkPowerShellHost } from './support/okPowerShellHost';
+import { resetRemoteSettings, setRemoteSetting } from './support/remoteDesignerSettings';
 
 const ROOT = path.resolve(__dirname, '../../..');
 const COMMAND = 'v8vscedit.remote.checkConnection';
@@ -47,6 +52,12 @@ suite('Агент Э8: команда v8vscedit.remote.checkConnection', functio
     h = new RemoteHarness();
     started = true;
     await h.start(options);
+    // Э9: после SSH/SFTP команда проверяет и PowerShell. Здесь она «исправна» (заглушка хоста): сама PS-часть
+    // проверяется в remotePowerShellCheck.test.ts, а этот сьют — только SSH/SFTP-поведение Э8.
+    await setRemoteSetting('user', 'CORP\\svc');
+    await setRemoteSetting('v8Path', 'C:\\1c\\1cv8.exe');
+    const storage = new ProjectSecretStorage(memorySecrets(h.secrets), h.root);
+    await storage.setRemotePassword('PS-пароль-Э8');
     originalRegister = commandsRef.registerCommand;
     const handlers = new Map<string, () => Promise<void>>();
     commandsRef.registerCommand = (id: string, callback: () => Promise<void>) => {
@@ -56,7 +67,12 @@ suite('Агент Э8: команда v8vscedit.remote.checkConnection', functio
     try {
       registerCommands(
         { subscriptions: [] } as unknown as vscode.ExtensionContext,
-        { workspaceFolder: h.folder, outputChannel: h.channel } as unknown as CommandServices
+        {
+          workspaceFolder: h.folder,
+          outputChannel: h.channel,
+          projectSecretStorage: storage,
+          designerExecutorDeps: { createHost: () => createOkPowerShellHost() },
+        } as unknown as CommandServices
       );
     } finally {
       commandsRef.registerCommand = originalRegister;
@@ -66,6 +82,8 @@ suite('Агент Э8: команда v8vscedit.remote.checkConnection', functio
 
   teardown(async () => {
     await endConfigurationOperation();
+    await disposeCachedDesignerExecutors();
+    await resetRemoteSettings();
     if (started) {
       await h.dispose();
       started = false;

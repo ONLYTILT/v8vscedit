@@ -26,6 +26,7 @@ import {
 import { getAgentExecutionMode } from './agent/agentSettings';
 import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
 import { releaseAgentInfoBaseForBatch } from './agent/AgentServiceRegistry';
+import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from './agent/remoteLocalDesigner';
 
 // Прежний публичный API модуля сохраняется реэкспортом: потребители (Container, команды, тесты)
 // импортируют из ExtensionCommandRunner, а реализация живёт в соседних модулях (Э2).
@@ -786,6 +787,23 @@ export async function runInternalCliCommand(
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel
 ): Promise<boolean> {
+  // Н51: в удалённом режиме внутренний CLI запускает ЛОКАЛЬНЫЙ 1cv8 — для файловой базы это не та
+  // машина и, возможно, не та база; отказ до любых побочных эффектов (статус, release агента).
+  const decision = decideLocalDesignerInRemote(
+    readInfoBaseConnectionKind(resolveProjectSettingsPath(workspaceFolder.uri.fsPath)),
+    'batch'
+  );
+  if (decision.action === 'refuse') {
+    outputChannel.appendLine(`[actions][error] ${decision.reason}`);
+    options.onFailureReason?.(decision.reason);
+    if (options.showErrorMessage !== false) {
+      void vscode.window.showErrorMessage(`${options.errorTitle}\n${decision.reason}`);
+    }
+    return false;
+  }
+  if (decision.notice) {
+    outputChannel.appendLine(`[actions] ${decision.notice}`);
+  }
   const cliPath = resolveInternalCliPath(workspaceFolder.uri.fsPath);
   const processArgs = [cliPath, ...options.cliArgs];
   // В журнал пишем МАСКИРОВАННЫЙ вектор: buildConnectionCliArgs кладёт в

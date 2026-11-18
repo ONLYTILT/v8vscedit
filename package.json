@@ -470,6 +470,10 @@
         "title": "Проверить подключение к серверу 1С"
       },
       {
+        "command": "v8vscedit.remote.resetPassword",
+        "title": "Сбросить пароль удалённого сервера"
+      },
+      {
         "command": "v8vscedit.repository.connect",
         "title": "Подключить к хранилищу",
         "icon": "$(plug)"
@@ -914,6 +918,53 @@
           "default": 0,
           "minimum": 0,
           "description": "Через сколько минут простоя агент конфигуратора сам отключает информационную базу (connect-ib держится между операциями и блокирует базу для коллег и пакетного Конфигуратора). 0 — не отключать по таймеру: база отпускается перед пакетными операциями и командой «Агент конфигуратора: отключить информационную базу». Применяется к агенту, запущенному после изменения настройки"
+        },
+        "v8vscedit.remote.computerName": {
+          "type": "string",
+          "default": "",
+          "description": "Имя сервера 1С для PowerShell-сессии (WinRM), через которую на сервере выполняются пакетные операции Конфигуратора (хранилище конфигурации) при v8vscedit.agent.location = remote. Пусто — v8vscedit.agent.host"
+        },
+        "v8vscedit.remote.authentication": {
+          "type": "string",
+          "enum": [
+            "Default",
+            "Negotiate",
+            "Kerberos"
+          ],
+          "enumDescriptions": [
+            "Способ проверки подлинности WinRM по умолчанию.",
+            "Negotiate: Kerberos, а при недоступности — NTLM.",
+            "Только Kerberos (сервер должен быть в домене и адресоваться DNS-именем)."
+          ],
+          "default": "Default",
+          "description": "Способ проверки подлинности PowerShell-сессии с сервером 1С (параметр -Authentication у New-PSSession)"
+        },
+        "v8vscedit.remote.user": {
+          "type": "string",
+          "default": "",
+          "description": "Учётная запись Windows для PowerShell-сессии с сервером 1С (например DOMAIN\\user). Обязательна для удалённого режима. Пароль спрашивается при первом подключении и хранится в SecretStorage VS Code, а не в настройках"
+        },
+        "v8vscedit.remote.useSsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Подключаться к WinRM сервера 1С по HTTPS (параметр -UseSSL у New-PSSession)"
+        },
+        "v8vscedit.remote.port": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Порт WinRM сервера 1С. 0 — стандартный порт (5985 для HTTP, 5986 для HTTPS)"
+        },
+        "v8vscedit.remote.v8Path": {
+          "type": "string",
+          "default": "",
+          "description": "Путь к 1cv8.exe НА СЕРВЕРЕ 1С. Пусто — путь выводится из --v8version в env.json (стандартный каталог установки платформы) и проверяется на сервере"
+        },
+        "v8vscedit.remote.ibConnection": {
+          "type": "string",
+          "default": "",
+          "description": "Строка подключения к базе с точки зрения сервера 1С (например /Ssrv/base), если с сервера кластер адресуется иначе, чем в --ibconnection env.json. Пусто — --ibconnection из env.json"
         }
       }
     },

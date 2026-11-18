@@ -5,6 +5,7 @@ import type { CfeDiffService } from '../../infra/cfe/CfeDiffService';
 import type { CfePatchMethodService } from '../../infra/cfe/CfePatchMethodService';
 import type { RepositoryService } from '../../infra/repository/RepositoryService';
 import type { DesignerBatchExecutor } from '../../infra/process/designer/DesignerBatchExecutor';
+import type { DesignerExecutorDeps } from './ext/designerExecutorRegistry';
 import type { ProjectSecretStorage } from '../../infra/environment';
 import type { RoleRightsService } from '../../infra/role';
 import type { AiSkillsInstaller } from '../../infra/skills/AiSkillsInstaller';
@@ -76,6 +77,11 @@ export interface CommandServices {
    * тест обработчиков команд без установленной платформы.
    */
   createDesignerExecutor?: (v8Path: string, cwd: string) => DesignerBatchExecutor;
+  /**
+   * Шов реестра исполнителей пакетного Конфигуратора (подмена хоста PowerShell удалённого режима в
+   * тестах команд хранилища и проверки подключения). В продукте не задаётся.
+   */
+  designerExecutorDeps?: DesignerExecutorDeps;
   bslAnalyzerConfigService: BslAnalyzerConfigService;
   projectEnvironmentViewProvider: ProjectEnvironmentViewProvider;
   aiMcpViewProvider?: AiMcpViewProvider;

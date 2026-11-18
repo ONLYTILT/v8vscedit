@@ -1,5 +1,9 @@
 import type { DesignerArg, DesignerBatchRequest } from '../process/designer/DesignerBatchExecutor';
 import type { RepositoryBinding } from './RepositoryService';
+import { buildInfoBaseConnectionArgs, type InfoBaseConnection } from '../process/designer/InfoBaseConnectionArgs';
+
+// Н5: прежние импорты из этого модуля остаются рабочими.
+export { buildInfoBaseConnectionArgs, type InfoBaseConnection };
 
 /**
  * ЕДИНСТВЕННЫЙ построитель вектора пакетного конфигуратора для операций хранилища.
@@ -9,15 +13,6 @@ import type { RepositoryBinding } from './RepositoryService';
  * ключи, поэтому расхождение двух копий не проявилось бы ни одним запуском —
  * отсюда одна реализация под точным регресс-тестом вектора.
  */
-
-/** Параметры подключения к информационной базе (подмножество env.json/CLI). */
-export interface InfoBaseConnection {
-  readonly infoBasePath?: string;
-  readonly infoBaseServer?: string;
-  readonly infoBaseRef?: string;
-  readonly userName?: string;
-  readonly password?: string;
-}
 
 /**
  * Содержимое файла `-Objects`: строка (UI собирает XML сам) или байты как есть (CLI
@@ -105,28 +100,6 @@ export function repositoryOperationOutputName(op: RepositoryOperation): string |
 }
 
 const OBJECTS_INPUT = 'objects.xml';
-
-/**
- * Аргументы подключения к ИБ: `/S сервер/база` (приоритет) или `/F путь`, затем
- * `/N<пользователь>` и `/P<пароль>` СЛИТНО — у платформы это один аргумент.
- */
-export function buildInfoBaseConnectionArgs(connection: InfoBaseConnection): string[] {
-  const args: string[] = [];
-  if (connection.infoBaseServer && connection.infoBaseRef) {
-    args.push('/S', `${connection.infoBaseServer}/${connection.infoBaseRef}`);
-  } else if (connection.infoBasePath) {
-    args.push('/F', connection.infoBasePath);
-  } else {
-    throw new Error('Недостаточно параметров подключения к базе: нужен путь файловой базы или сервер и имя базы.');
-  }
-  if (connection.userName) {
-    args.push(`/N${connection.userName}`);
-  }
-  if (connection.password) {
-    args.push(`/P${connection.password}`);
-  }
-  return args;
-}
 
 export function buildRepositoryDesignerRequest(
   connection: InfoBaseConnection,

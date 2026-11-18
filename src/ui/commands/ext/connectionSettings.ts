@@ -29,6 +29,8 @@ export interface ConnectionParams {
   userName?: string;
   password?: string;
   v8Path?: string;
+  /** `--v8version` env.json как есть: по нему выводится путь к 1cv8 на удалённом сервере. */
+  v8Version?: string;
 }
 
 export function resolveSettingsPath(workspaceRoot: string, extensionRoot: string): string {
@@ -80,6 +82,7 @@ export async function resolveConnectionFromSettings(settingsPath: string): Promi
   connection.userName = asString(defaults['--db-user']) ?? '';
   connection.password = await resolveConnectionPassword(asString(defaults['--db-pwd']) ?? '');
   connection.v8Path = resolveV8PathFromSettings(defaults);
+  connection.v8Version = asString(defaults['--v8version']);
   return connection;
 }
 

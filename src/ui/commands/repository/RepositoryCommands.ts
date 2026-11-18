@@ -537,6 +537,7 @@ function toCliServices(services: CommandServices): RepositoryCliServices {
     repositoryService: services.repositoryService,
     projectSecretStorage: services.projectSecretStorage,
     createDesignerExecutor: services.createDesignerExecutor,
+    designerExecutorDeps: services.designerExecutorDeps,
   };
 }
 

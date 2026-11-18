@@ -7,6 +7,7 @@ import { resolveDbPassword, type ProjectSecretStorage } from '../../../infra/env
 import { formatCommandLineForLog, normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion } from '../../../infra/process';
 import { getAgentOperationServiceForInteractiveDesigner, isAgentConfigurationOperationMode } from '../ext/ExtensionCommandRunner';
 import { CONFIGURATION_OPERATION_BUSY_MESSAGE, isConfigurationOperationRunning } from '../ext/configurationOperationLock';
+import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from '../ext/agent/remoteLocalDesigner';
 
 interface DbRunConnectionParams {
   infoBasePath?: string;
@@ -52,6 +53,19 @@ export async function runDbClientFromWorkspace(
   try {
     const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath);
     const connection = await resolveConnectionFromSettings(settingsPath, secrets);
+    if (options.mode === 'DESIGNER') {
+      // Н51: Конфигуратор — локальный 1cv8; файловая база удалённого режима для него недоступна.
+      // Тонкий клиент к базе подключается сам и с агентом не конфликтует — его это не касается.
+      const decision = decideLocalDesignerInRemote(readInfoBaseConnectionKind(settingsPath), 'interactive');
+      if (decision.action === 'refuse') {
+        outputChannel.appendLine(`[db-run][error] ${decision.reason}`);
+        void vscode.window.showErrorMessage(decision.reason);
+        return;
+      }
+      if (decision.notice) {
+        outputChannel.appendLine(`[db-run] ${decision.notice}`);
+      }
+    }
     const v8Path = resolveV8ExecutablePath(connection.v8Path ?? '');
     const args = buildLaunchArguments(options, connection);
     // Интерактивный Конфигуратор и подключённый агент конфликтуют по блокировке базы:

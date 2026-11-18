@@ -3,11 +3,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { decodeDesignerLogBytes } from '../OutputDecoder';
 import { describeProcessInterruption, runProcess } from '../ProcessRunner';
-import type {
-  DesignerArg,
-  DesignerBatchExecutor,
-  DesignerBatchRequest,
-  DesignerBatchResult,
+import {
+  DESIGNER_LOG_FILE_NAME,
+  validateDesignerFileNames,
+  type DesignerArg,
+  type DesignerBatchExecutor,
+  type DesignerBatchRequest,
+  type DesignerBatchResult,
 } from './DesignerBatchExecutor';
 
 export interface LocalDesignerBatchExecutorOptions {
@@ -16,8 +18,6 @@ export interface LocalDesignerBatchExecutorOptions {
   /** Где создавать рабочие и staging-каталоги; по умолчанию — временный каталог ОС. */
   readonly tempRoot?: string;
 }
-
-const LOG_FILE_NAME = 'out.log';
 
 /**
  * Исполнитель пакетного конфигуратора на этой машине.
@@ -38,13 +38,13 @@ export class LocalDesignerBatchExecutor implements DesignerBatchExecutor {
 
   async run(request: DesignerBatchRequest): Promise<DesignerBatchResult> {
     // Проверка имён — до создания каталога, чтобы отказ не оставлял следов.
-    validateFileNames(request.args);
+    validateDesignerFileNames(request.args);
     const tempRoot = this.options.tempRoot ?? os.tmpdir();
     const workDir = fs.mkdtempSync(path.join(tempRoot, 'v8batch-'));
     try {
       const outputNames: string[] = [];
       const args = request.args.map((arg) => this.materialize(arg, workDir, outputNames));
-      const logPath = path.join(workDir, LOG_FILE_NAME);
+      const logPath = path.join(workDir, DESIGNER_LOG_FILE_NAME);
       args.push('/Out', logPath, '/DisableStartupDialogs');
 
       // shell: false — пароль в аргументе не должен проходить через разбор оболочки.
@@ -109,29 +109,6 @@ export class LocalDesignerBatchExecutor implements DesignerBatchExecutor {
       outputs.set(name, staged);
     }
     return outputs;
-  }
-}
-
-/**
- * Имя файла в запросе — простое имя внутри рабочего каталога. Разделители, `..` и
- * абсолютные пути позволили бы запросу писать (или забирать) файлы вне каталога
- * запуска, а совпадение имён — молча перетереть один файл другим или лог `/Out`.
- */
-function validateFileNames(args: readonly DesignerArg[]): void {
-  const seen = new Set<string>([LOG_FILE_NAME]);
-  for (const arg of args) {
-    if (typeof arg === 'string') {
-      continue;
-    }
-    const name = arg.name;
-    if (!name || name === '.' || name === '..' || /[\\/:]/.test(name)) {
-      throw new Error(`Недопустимое имя файла пакетного конфигуратора: "${name}". Ожидается простое имя файла.`);
-    }
-    const key = name.toLowerCase();
-    if (seen.has(key)) {
-      throw new Error(`Имя файла пакетного конфигуратора "${name}" повторяется или занято логом /Out.`);
-    }
-    seen.add(key);
   }
 }
 

@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { decodeDesignerLogBytes, resolveV8ExecutablePath, runProcess } from '../../infra/process';
-import { buildInfoBaseConnectionArgs } from '../../infra/repository/RepositoryDesignerArgs';
+import { buildInfoBaseConnectionArgs } from '../../infra/process/designer/InfoBaseConnectionArgs';
 import type { OnecConnection } from './types';
 
 // Перенос staging-файла общий для CLI и расширения, поэтому живёт в infra.

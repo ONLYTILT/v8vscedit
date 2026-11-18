@@ -8,14 +8,19 @@ import {
   resolveV8ExecutablePath,
   resolveV8PathHintFromVersion,
 } from '../../../infra/process';
-import { describeDesignerArgs, type DesignerBatchExecutor } from '../../../infra/process/designer/DesignerBatchExecutor';
-import { LocalDesignerBatchExecutor } from '../../../infra/process/designer/LocalDesignerBatchExecutor';
+import {
+  describeDesignerArgs,
+  type DesignerBatchExecutor,
+  type DesignerBatchResult,
+} from '../../../infra/process/designer/DesignerBatchExecutor';
 import { moveStagingToTarget } from '../../../infra/fs/StagingFile';
 import {
   buildRepositoryDesignerRequest,
   type RepositoryOperation,
 } from '../../../infra/repository/RepositoryDesignerArgs';
+import { resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
 import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
+import { acquireDesignerBatchExecutor, type DesignerExecutorDeps } from '../ext/designerExecutorRegistry';
 
 interface ConnectionParams {
   infoBasePath?: string;
@@ -24,6 +29,8 @@ interface ConnectionParams {
   userName?: string;
   password?: string;
   v8Path?: string;
+  /** `--v8version` env.json: по нему путь к 1cv8 на сервере выводится, если `remote.v8Path` пуст. */
+  v8Version?: string;
 }
 
 interface RepositoryCliRunOptions {
@@ -38,7 +45,8 @@ interface RepositoryCliRunOptions {
   errorTitle: string;
   failureOperation?: string;
   showSuccessMessage?: boolean;
-  afterSuccess?: () => void | Promise<void>;
+  /** Получает результат запуска: по логу платформы уточняется, что именно сделано (Н10). */
+  afterSuccess?: (result: DesignerBatchResult) => void | Promise<void>;
 }
 
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -53,14 +61,45 @@ export interface RepositoryCliServices {
   repositoryService: RepositoryService;
   projectSecretStorage: ProjectSecretStorage;
   /**
-   * Фабрика исполнителя пакетного конфигуратора. Шов под удалённый исполнитель и под
-   * интеграционный тест без установленной платформы; по умолчанию — локальный запуск.
+   * Фабрика исполнителя пакетного конфигуратора — приоритетный шов под интеграционный тест без
+   * установленной платформы. Без неё исполнитель выбирает реестр (локальный или удалённый).
    */
   createDesignerExecutor?: (v8Path: string, cwd: string) => DesignerBatchExecutor;
+  /** Шов реестра исполнителей (подмена хоста PowerShell в тестах); в продукте не задаётся. */
+  designerExecutorDeps?: DesignerExecutorDeps;
 }
 
-const createLocalDesignerExecutor = (v8Path: string, cwd: string): DesignerBatchExecutor =>
-  new LocalDesignerBatchExecutor(v8Path, { cwd });
+interface ResolvedExecutor {
+  readonly executor: DesignerBatchExecutor;
+  readonly v8Path: string;
+  readonly connection: ConnectionParams;
+}
+
+/**
+ * Исполнитель и путь к 1cv8. Ошибки конфигурации (env.json, удалённый режим) бросаются здесь,
+ * ДО начала операции: статус не включается, на сервер ничего не уходит.
+ */
+/** Подключение из env.json: путь к 1cv8 вычислен всегда (пустая строка — искать стандартную установку). */
+type ResolvedConnection = ConnectionParams & { v8Path: string };
+
+async function resolveExecutor(connection: ResolvedConnection, services: RepositoryCliServices): Promise<ResolvedExecutor> {
+  if (services.createDesignerExecutor) {
+    const v8Path = resolveV8ExecutablePath(connection.v8Path);
+    return { executor: services.createDesignerExecutor(v8Path, services.workspaceFolder.uri.fsPath), v8Path, connection };
+  }
+  const lease = await acquireDesignerBatchExecutor({
+    workspaceFolder: services.workspaceFolder,
+    outputChannel: services.outputChannel,
+    secrets: services.projectSecretStorage,
+    localV8Path: connection.v8Path,
+    v8Version: connection.v8Version,
+  }, services.designerExecutorDeps);
+  // С сервера база может адресоваться иначе (remote.ibConnection): учётные данные — те же, из env.json.
+  const effective = lease.ibConnectionOverride
+    ? { ...parseIbConnection(lease.ibConnectionOverride), userName: connection.userName, password: connection.password }
+    : connection;
+  return { executor: lease.executor, v8Path: lease.v8Path, connection: effective };
+}
 
 export async function runRepositoryCliCommand(
   options: RepositoryCliRunOptions,
@@ -76,11 +115,7 @@ export async function runRepositoryCliCommand(
     throw new Error(`Для "${options.target.displayName}" не настроено подключение к хранилищу в env.json.`);
   }
 
-  const v8Path = resolveV8ExecutablePath(connection.v8Path ?? '');
-  const executor = (services.createDesignerExecutor ?? createLocalDesignerExecutor)(
-    v8Path,
-    services.workspaceFolder.uri.fsPath
-  );
+  const { executor, v8Path, connection: effectiveConnection } = await resolveExecutor(connection, services);
 
   beginRepositoryOperationStatus(options.progressTitle, options.progressStartMessage);
 
@@ -88,7 +123,7 @@ export async function runRepositoryCliCommand(
     // Пакетный Конфигуратор не войдёт в базу, пока её держит агент: отпускаем до запуска,
     // а сбой отключения — отказ операции (ошибка показывается, исполнитель освобождается в finally).
     await releaseAgentInfoBaseForBatch(services.workspaceFolder, services.outputChannel);
-    const request = buildRepositoryDesignerRequest(connection, binding, options.operation, options.target.extensionName);
+    const request = buildRepositoryDesignerRequest(effectiveConnection, binding, options.operation, options.target.extensionName);
     // Секреты (пароли базы, хранилища и пользователя операции) маскируются ЗНАЧЕНИЯМИ —
     // это точнее правил по ключам и не зависит от формы записи.
     const commandAsText = formatCommandLineForLog(v8Path, describeDesignerArgs(request.args), request.secrets);
@@ -143,7 +178,7 @@ export async function runRepositoryCliCommand(
     }
 
     if (options.afterSuccess) {
-      await options.afterSuccess();
+      await options.afterSuccess(result);
     }
 
     services.outputChannel.appendLine(`[repository] Завершено: ${commandAsText}`);
@@ -191,8 +226,9 @@ export async function runRepositoryLockAction(
     successMessage: `Объекты "${node.label ?? target.displayName}" захвачены.`,
     errorTitle: `Ошибка захвата объектов "${node.label ?? target.displayName}".`,
     failureOperation: 'захвате объектов хранилища',
-    afterSuccess: () => {
-      services.repositoryService.setLocked(target, objects.fullNames, true);
+    // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
+    afterSuccess: (result) => {
+      services.repositoryService.setLocked(target, resolveLockedFullNames(objects.fullNames, result.log), true);
     },
   }, services);
 }
@@ -286,7 +322,7 @@ function requireTarget(repositoryService: RepositoryService, node: RepositoryNod
 async function resolveDatabaseConnection(
   settingsPath: string,
   secrets: ProjectSecretStorage
-): Promise<ConnectionParams> {
+): Promise<ResolvedConnection> {
   if (!fs.existsSync(settingsPath)) {
     throw new Error(`Не найден env.json для подключения к базе: ${settingsPath}`);
   }
@@ -301,11 +337,13 @@ async function resolveDatabaseConnection(
     throw new Error(`В env.json отсутствует "--ibconnection": ${settingsPath}`);
   }
 
-  const connection = parseIbConnection(ibConnectionRaw);
-  connection.userName = asString(defaults['--db-user']) ?? '';
-  connection.password = await resolveDbPassword(secrets, asString(defaults['--db-pwd']) ?? '');
-  connection.v8Path = resolveV8PathFromSettings(defaults);
-  return connection;
+  return {
+    ...parseIbConnection(ibConnectionRaw),
+    userName: asString(defaults['--db-user']) ?? '',
+    password: await resolveDbPassword(secrets, asString(defaults['--db-pwd']) ?? ''),
+    v8Path: resolveV8PathFromSettings(defaults),
+    v8Version: asString(defaults['--v8version']),
+  };
 }
 
 function parseIbConnection(rawValue: string): ConnectionParams {
