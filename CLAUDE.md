@@ -181,8 +181,23 @@ src/
 │   │                                  # принадлежности staging-файла), CfeBatch* (пакетная
 │   │                                  # выгрузка/загрузка всех расширений: Naming/Manifest/
 │   │                                  # Plan/Report) — см. docs/architecture.md
+│   ├── agent/                        # агент конфигуратора (SSH /AgentMode): AgentOperationService (тонкий
+│   │                                  # фасад), AgentInfoBaseSession (жизненный цикл connect-ib),
+│   │                                  # BatchDesignerGuard (release перед пакетным запуском),
+│   │                                  # AgentConnectRetry/SshConnectErrorClassifier (политика готовности),
+│   │                                  # RemoteConnectionCheck (диагностика) — docs/architecture.md,
+│   │                                  # «Удалённый сервер 1С»; пользовательская часть — docs/remote-designer.md
+│   │   ├── files/                    # AgentFileStore: Local (каталог агента) и Sftp (отдельное SSH-соединение),
+│   │   │                              # AgentFileTransfer (конкурентная передача с отменой)
+│   │   └── sync/                     # движок синхронизации M/P/B: SyncPlanner (чистый), SyncManifest,
+│   │                                  # AgentImportFlow/AgentLoadFlow, ArchiveCodec/ZipContainer (zip/zip64)
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
-│   │                                  # SensitiveArgs (маскирование -Password в логах)
+│   │   │                              # SensitiveArgs (маскирование -Password в логах),
+│   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)
+│   │   ├── designer/                 # DesignerBatchExecutor (интерфейс пакетного 1cv8) +
+│   │   │                              # LocalDesignerBatchExecutor, InfoBaseConnectionArgs (/S|/F, /N, /P)
+│   │   └── remote/                   # хост PowerShell: PowerShellHostScript/Protocol/RemoteHost,
+│   │                                  # RemoteDesignerBatchExecutor (1cv8 на сервере через PSSession)
 │   ├── mcp/                          # McpServerIdentity/McpStartDecision/McpPortProbe/
 │   │                                  # McpConflictPrompt/McpHost — чистая логика жизненного цикла
 │   │                                  # встроенного MCP-сервера (bind/reuse/conflict, закрытие порта),
@@ -531,6 +546,23 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   staging-остаток опознаётся по маркеру `DUMP_STAGING_SUFFIX`, а не по форме суффикса; перенос staging —
   `moveStagingToTarget` из `cli/core/onecCommon.ts`, второй копии temp+rename не заводить. Подробности и
   обоснования — [architecture.md](./docs/architecture.md#пакетный-случай-все-расширения-базы-одной-операцией-dump-cfe-allload-cfe-all).
+- **Новая пакетная операция Конфигуратора** (любая, что запускает `1cv8 DESIGNER` отдельным процессом;
+  см. [architecture.md](./docs/architecture.md#удалённый-сервер-1с)). Запрос строится как
+  `DesignerBatchRequest` (аргументы БЕЗ исполняемого файла и БЕЗ `/Out`; входные и выходные файлы
+  объявляются именами, а не путями) и запускается ТОЛЬКО через `DesignerBatchExecutor` из
+  `designerExecutorRegistry` (`acquireDesignerBatchExecutor`: local/remote по `v8vscedit.agent.location`) —
+  так сделано для хранилища (`RepositoryCommandRunner`). Прямой `runProcess`/`spawn` 1cv8 из команды
+  заводить нельзя: в удалённом режиме операция пошла бы локальным 1cv8 в чужую базу. ПЕРЕД запуском
+  операция обязана освободить ИБ агента — `releaseAgentInfoBaseForBatch` (подключение ИБ агента держится
+  между операциями и блокирует базу для 1cv8; ошибка освобождения — отказ запуска, пакетная операция не
+  стартует). Мутирующая операция берёт `configurationOperationLock`; выходной файл (`/File`, выгрузка)
+  переносится на путь пользователя из staging исполнителя только при `exitCode === 0`; секреты — в
+  `secrets` запроса (маскирование в логах). Операции внутреннего CLI (`runInternalCliCommand`: CF/CFE,
+  пакеты расширений, список расширений) и интерактивный Конфигуратор остаются ЛОКАЛЬНЫМИ — для них
+  освобождение ИБ делает сам раннер, а допустимость в remote-режиме решает
+  `decideLocalDesignerInRemote` (`ui/commands/ext/agent/remoteLocalDesigner.ts`: файловая база и петлевой
+  сервер — отказ до побочных эффектов). Перевод такой операции на удалённый исполнитель — отдельная
+  задача по схеме хранилища, а не «правка раннера».
 - **Открытие BSL-модулей:** только реальные `file://` документы (виртуальная схема `onec://` удалена). Readonly — через `ui/readonly/BslReadonlyGuard.ts`.
 - **Изменение жизненного цикла/безопасности встроенного MCP-сервера** (порт, идентичность процесса,
   graceful shutdown, Host/Origin, отличается от «новый MCP-инструмент» из раздела выше): чистая логика —
@@ -607,6 +639,7 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
 16. **MCP-инструменты принимают только канон** (см. `./docs/mcp-paths.md`).
 17. **God-объектов быть не должно.** Порог-ориентир — **~800 строк** на файл производственного кода; превышение требует либо явного обоснования, либо декомпозиции. Дробить **по ответственности/домену, а не механически по строкам**. Каноничные приёмы: регистрация MCP-инструментов дробится по доменам (`src/ui/mcp/registration/*`, образец — `McpAddToolsRegistration`); диспетчер `switch (kind)` заменяется **таблицей** `Record<MetaKind, …>` — данные типа в `META_TYPES`, XML-литералы формата в спец-реестре `infra/` (параллельные словари вне `META_TYPES` запрещены, см. п.2); класс-фасад остаётся тонким, логика — в module-level функциях/подмодулях того же слоя. **Любое дробление XML-генератора обязано сохранять байт-в-байт выход** (BOM/EOL/порядок атрибутов/самозакрытие, см. п.12) и предваряться байт-golden-тестом; декомпозиция `MetadataXmlCreator`/`FormBuilders` без такого эталона — запрещена (идёт вслепую).
 18. **Внутри критической секции эксклюзивной операции (флаги вида `isUpdatingConfigurations`) уведомления показываются без `await`.** `await vscode.window.showInformationMessage(...)`/`showWarningMessage(...)` до закрытия секции держит флаг занятости выставленным до закрытия нотификации пользователем — любая параллельная операция всё это время отбивается сообщением «уже выполняется», хотя фактически ничего не выполняется.
+19. **Удаление файлов выгрузки — `fs.unlink`/`rmdir` своим обходом, не `fs.rmSync`.** На Windows с системным Node 24 `fs.rmSync` молча (без исключения) не удаляет файл с кириллицей в имени — ни файл, ни каталог рекурсивно; `unlinkSync` и `fs.promises.rm` удаляют. Файлы выгрузки 1С содержат кириллицу, поэтому в новом коде удаления файлов выгрузки `rmSync` запрещён. Существующие вызовы (`infra/agent/DirectorySnapshot.ts` и ещё ~20 в `src`) — долг Н37 плана `docs/plans/remote-designer-plan.md`.
 
 ## Ключевые принципы
 

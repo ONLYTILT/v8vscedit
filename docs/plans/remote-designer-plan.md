@@ -1,5 +1,16 @@
 # Архитектурный план: удалённый сервер 1С (агент по SSH/SFTP, хранилище через PSSession)
 
+## Состояние (2026-11-18)
+
+Этапы Э1–Э10 закрыты. Ветка `feature/remote-designer`, коммиты этапов: Э1 `220f0b9`, Э2 `2ee93a4`, Э3 `a859dbb`, Э4 `ba4845a`, Э5 `a4b1bad`, Э6 `e58d160`, Э7 `b01eff9`, Э8 `28ce4b8`, Э9 `9351c6b`; Э10 (документация: `docs/architecture.md` «Удалённый сервер 1С», `docs/remote-designer.md`, CLAUDE.md, README) — в рабочей копии, не закоммичена. Дополнительно: `b0dbcda` (гейт покрытия на Windows), `75e3821` (POSIX-тесты SIGTERM), `979cded` (скрытый прогон тестов).
+
+**Открытые гейты до слияния в `main`:**
+1. **Н50** — проверка ключа хоста SSH (TOFU); пароль ИБ по сети сейчас уходит без проверки сервера.
+2. **Пилот на стенде пользователя** — чек-лист в [remote-designer.md](./../remote-designer.md#8-чек-лист-пилота-на-стенде) (Н34, Н35, Н46, Н50 и «Пилот Э9»: PSSession, `Copy-Item -FromSession`, текст лога захвата, отмена/обрыв). Удалённая ветка PS-хоста (Н58) тестами не исполняется.
+
+Остальной бэклог (§6) — не блокирует слияние. Устройство и ограничения — [architecture.md](./../architecture.md#удалённый-сервер-1с).
+
+
 План сверен с CLAUDE.md (слои, «Инвариант изменений», запреты №6/7/9/17, TDD и 100% `coverage:changed`), с docs/architecture.md и docs/vscode-extension-best-practices.md. Код изучен: `infra/agent/*`, `domain/agent/*`, `ExtensionCommandRunner.ts`, `ExtensionCommands.ts`, `configurationOperationLock.ts`, `RepositoryCommandRunner.ts`, `RepositoryCommands.ts`, `RepositoryService.ts`, `cli/commands/repositoryCommands.ts`, `cli/core/onecCommon.ts`, `HashCache.ts`, `AtomicFileWriter.ts`, справка `tmp/Команды config агента конфигуратора.txt`, `tmp/agentbasedir.json`.
 
 ---
@@ -325,9 +336,10 @@
 - `infra/process/WindowsCommandLine.ts`, `infra/process/remote/{PowerShellHostScript,PowerShellHostProtocol,PowerShellRemoteHost,RemoteDesignerBatchExecutor}.ts`, `ui/commands/ext/designerExecutorRegistry.ts`, настройки `remote.*`, `ProjectSecretStorage.get/setRemotePassword`, вторая половина `checkConnection` (PS + путь к 1cv8).
 - `RepositoryCommands`: staging выходных файлов `dump`/`report`.
 
-**Э10. Документатор.**
+**Э10. Документатор. — ВЫПОЛНЕНО (2026-11-18).**
 - `docs/architecture.md`: раздел «Удалённый сервер 1С» — модель M/P/B, жизненный цикл ИБ, guard, обоснование «нет MCP для хранилища», протокол PS-хоста.
 - CLAUDE.md: пункт «Инварианта изменений» — «Новая пакетная операция Конфигуратора обязана идти через `DesignerBatchExecutor` + `runWithInfoBaseReleased`», раскладка `infra/agent/files|sync`, `infra/process/designer|remote`.
+- Фактически: раздел архитектуры + пользовательская инструкция `docs/remote-designer.md` (настройка, команды, ошибки, чек-лист пилота) + ссылки из README/architecture. В CLAUDE.md пункт сформулирован через `DesignerBatchExecutor` + `releaseAgentInfoBaseForBatch` (не `runWithInfoBaseReleased`, Н17), добавлен запрет №19 (`rmSync` и кириллица, §5b п.17). Расхождения плана с кодом: ветка `FullDump` импорта идёт архивом (рекомендация §5b п.9 про скачивание только `ConfigDumpInfo.xml` не реализована); CF/CFE и интерактивный Конфигуратор в remote остаются локальными (Н51), а не через `DesignerBatchExecutor`.
 
 **Обоснование порядка.** Сначала рефакторинги-швы без смены поведения (Э1, Э2). Затем изменения, полезные и в локальном режиме (Э3, Э4) — их проще проверить у пользователя локально. Потом инфраструктура файлов (Э5, Э6), которая не трогает UI до готовности. Затем самое рискованное и зависящее от образцов (Э7). Удалённая проводка (Э8) — после того как все части протестированы. PS-хост (Э9) последним: он независим по коду, но без удалённого агента смысла не имеет (disconnect удалённого агента нужен из Э8). Э9 можно вести параллельно с Э7, если два потока конвейера допустимы.
 
