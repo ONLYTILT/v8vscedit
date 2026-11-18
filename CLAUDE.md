@@ -158,14 +158,19 @@ src/
 │   │   ├── ProjectLayout.ts          # resolveConfigDir: src/cf, src/cfe/<имя> — общее
 │   │   │                              # для расширения и CLI (cli/core/projectLayout.ts —
 │   │   │                              # тонкий re-export)
-│   │   └── ConfigurationCleanWindow.ts # окно тишины по корню конфигурации после
-│   │                                  # импорта/обновления БД (Container.markConfigurationsClean,
-│   │                                  # см. docs/architecture.md)
+│   │   ├── ConfigurationCleanWindow.ts # окно тишины по корню конфигурации после
+│   │   │                              # импорта/обновления БД (Container.markConfigurationsClean,
+│   │   │                              # см. docs/architecture.md)
+│   │   └── ChangeDetectionRunner.ts  # single-flight фоновой проверки изменений: request/
+│   │                                  # invalidate/whenIdle/dispose (Container.changeDetection)
 │   ├── cfe/                          # расширения: CfeBorrowService, CfeDiffService, CfePatchMethodService
 │   ├── support/                      # ParentConfigurationsParser (чистый разбор bin), SupportMode,
 │   │                                  # SupportInfoService (кэш + режим по пути), Logger — см.
 │   │                                  # docs/metadata-navigator.md#поддержка-поставщика-parentconfigurationsbin
-│   ├── cache/                        # MetadataCache, hashCache (CLI)
+│   ├── cache/                        # MetadataCache; хеш-кэш выгрузки: HashCache (базовая линия
+│   │                                  # .v8vscedit/cache), HashStatMemo (stat-мемо .v8vscedit/hash-stat),
+│   │                                  # HashScanner (scanHashSnapshot — быстрый async-проход;
+│   │                                  # docs/architecture.md, «Хеш-кэш: базовая линия и stat-мемо»)
 │   ├── repository/                   # хранилище 1С, локальные захваты
 │   ├── git/                          # статус Git для узлов метаданных (GitMetadataStatusService,
 │   │                                  # декорации) + представление «Изменения метаданных»
@@ -494,6 +499,15 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   `ParentConfigurationsParser.ts` → запись в `SUPPORT_PRESENTATION` (`ui/support/supportPresentation.ts`) →
   иконка `src/icons/{light,dark}/support-<имя>.svg` → значение DTO в `src-ui/shared/types/tree.ts` и
   `src/ui/views/universal/_types.ts`. Гейты блокировок читают только `Locked` — новый режим их не меняет.
+- **Новый потребитель хешей выгрузки** (сравнение с базой, манифест синхронизации и т.п.): только
+  `scanHashSnapshot` (`infra/cache/HashScanner.ts`) с `projectRoot` — он не читает неизменённые файлы
+  благодаря stat-мемо. `buildHashSnapshot` — эталонный синхронный полный проход для тестов, в production
+  не вызывать (он читает всю выгрузку: 7,5 ГБ на БП блокировали Extension Host на минуты). Базовую линию
+  (`.v8vscedit/cache`) пишут только импорт/CLI/агент; `ConfigurationChangeDetector.detect` — лишь при
+  первичной инициализации, если линии нет. Stat-отпечатки в файл базовой линии не добавлять — гонка с CLI
+  за линию импорта, см. [architecture.md](./docs/architecture.md#хеш-кэш-базовая-линия-и-stat-мемо).
+  Проверку в расширении запускать через `Container.refreshChangedConfigurationState()`
+  (`ChangeDetectionRunner`), а не прямым `await detect`.
 - **Новая команда:** класс в `ui/commands/...` с `readonly id` → регистрация в `CommandRegistry.registerAll` → `package.json → contributes.commands` → при меню узла `contributes.menus` c `when: viewItem =~ /…/` → при хоткее `contributes.keybindings`.
 - **Новый потребитель пути формы** (MCP-инструмент или команда навигатора, которым нужно тело
   `Ext/Form.xml`, дескриптор формы или XML владельца по узлу дерева): только через
