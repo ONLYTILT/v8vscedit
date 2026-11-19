@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { readPorcelainEntries, resolveGitRoot } from '../../infra/git/GitStatusReader';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * `GitStatusReader` — тонкий раннер git-процесса поверх `GitPorcelainReader`.
@@ -29,7 +30,7 @@ suite('GitStatusReader — раннер git status/rev-parse', () => {
       assert.strictEqual(entries[0].worktree, '?');
       assert.strictEqual(entries[0].relPath, 'новый.txt');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -38,7 +39,7 @@ suite('GitStatusReader — раннер git status/rev-parse', () => {
     try {
       assert.deepStrictEqual(readPorcelainEntries(outsideAnyRepo), []);
     } finally {
-      fs.rmSync(outsideAnyRepo, { recursive: true, force: true });
+      removeTreeSync(outsideAnyRepo);
     }
   });
 
@@ -49,9 +50,18 @@ suite('GitStatusReader — раннер git status/rev-parse', () => {
       const nested = path.join(repo, 'src', 'cf');
       fs.mkdirSync(nested, { recursive: true });
 
-      assert.strictEqual(resolveGitRoot(nested), repo, 'из вложенного каталога должен резолвиться корень репозитория');
+      const root = resolveGitRoot(nested);
+      assert.ok(root, 'из вложенного каталога должен резолвиться корень репозитория');
+      // git на Windows печатает корень с прямыми слешами и в фактическом регистре
+      // (`C:/Windows/Temp/...`), а os.tmpdir() под SYSTEM — `C:\WINDOWS\TEMP`:
+      // сравниваем каталоги, приведённые ОС к каноническому виду, а не строки.
+      assert.strictEqual(
+        fs.realpathSync.native(root),
+        fs.realpathSync.native(repo),
+        'из вложенного каталога должен резолвиться корень репозитория'
+      );
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -60,7 +70,7 @@ suite('GitStatusReader — раннер git status/rev-parse', () => {
     try {
       assert.strictEqual(resolveGitRoot(outsideAnyRepo), null);
     } finally {
-      fs.rmSync(outsideAnyRepo, { recursive: true, force: true });
+      removeTreeSync(outsideAnyRepo);
     }
   });
 });

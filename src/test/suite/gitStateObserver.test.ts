@@ -21,8 +21,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { GitStateObserver } from '../../ui/git/GitStateObserver';
 import type { GitApiLike, RepositoryLike } from '../../ui/git/gitExtensionApi';
-import { buildChangesBaselineRepo, removeFixtureRepo, type ChangesFixture } from './support/changesFixtures';
-import { skipWithoutCorpus } from './support/corpus';
+import { buildChangesBaselineRepo, removeFixtureRepo, skipWithoutChangesFixture, type ChangesFixture } from './support/changesFixtures';
 
 /** Один репозиторий Git Extension API — верная in-memory реализация формы `RepositoryLike`. */
 function createFakeRepository(root: string): RepositoryLike {
@@ -81,7 +80,7 @@ suite('GitStateObserver — подписка на события встроен�
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;

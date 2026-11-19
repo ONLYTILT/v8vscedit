@@ -35,12 +35,53 @@ export const EXAMPLE_GENERATIONS = {
 } as const;
 
 /**
- * Доступен ли корпус. Без аргументов — проверяется только корень `example/`
- * (этого достаточно для «клон без корпуса»); дополнительные пути позволяют
- * сьюту потребовать конкретную генерацию/файл.
+ * Маркеры ЭТАЛОННОГО корпуса: корни всех трёх поколений и по файлу-образцу в
+ * каждом, на которые опираются корпусные тесты (golden-сверки, пины замеров).
+ *
+ * Почему мало корня `example/`: каталог может существовать, но содержать НЕ
+ * эталон — неполный (только одно поколение) или вовсе выгрузку другой
+ * конфигурации под тем же именем `2.20`. Тесты корпуса пиннят точные числа и
+ * конкретные объекты эталона, поэтому на чужом корпусе они падают ENOENT и
+ * расхождением замеров — то есть сообщают о свойстве машины, а не о дефекте кода.
+ * Отсутствие любого маркера трактуется как «корпуса нет»; на полном эталоне все
+ * проверки работают в прежнюю силу.
+ */
+export const REFERENCE_CORPUS_MARKERS: readonly string[] = [
+  path.join(EXAMPLE_GENERATIONS.cf20, 'Configuration.xml'),
+  path.join(EXAMPLE_GENERATIONS.cf20, 'Catalogs', 'Регионы.xml'),
+  path.join(EXAMPLE_GENERATIONS.cf20, 'ExchangePlans', 'Мобильные.xml'),
+  path.join(EXAMPLE_GENERATIONS.cf21, 'Configuration.xml'),
+  path.join(EXAMPLE_GENERATIONS.cf21, 'HTTPServices', 'ServiceEntry.xml'),
+  path.join(EXAMPLE_GENERATIONS.cf21, 'Catalogs', 'ПричиныВозврата.xml'),
+  path.join(EXAMPLE_GENERATIONS.cfe21, 'Configuration.xml'),
+];
+
+// Наличие эталона не меняется за время прогона — проверяем один раз.
+let referenceCorpusPresent: boolean | undefined;
+
+function isReferenceCorpusPresent(): boolean {
+  if (referenceCorpusPresent === undefined) {
+    const missing = REFERENCE_CORPUS_MARKERS.filter((marker) => !fs.existsSync(marker));
+    referenceCorpusPresent = missing.length === 0;
+    // Каталог есть, а эталона нет — пропуск корпусных гейтов (порядок свойств, формат, golden) иначе
+    // виден лишь как «pending», и зелёный прогон выглядел бы полным. Чистый клон (нет example/) — не повод.
+    if (!referenceCorpusPresent && fs.existsSync(EXAMPLE_ROOT)) {
+      console.warn(
+        `[corpus] example/ есть, но это не эталонный корпус — корпусные сьюты пропущены. Нет: ${missing
+          .map((marker) => path.relative(EXAMPLE_ROOT, marker))
+          .join(', ')}`
+      );
+    }
+  }
+  return referenceCorpusPresent;
+}
+
+/**
+ * Доступен ли эталонный корпус (см. {@link REFERENCE_CORPUS_MARKERS});
+ * дополнительные пути позволяют сьюту потребовать конкретный файл/каталог.
  */
 export function hasCorpus(...requiredPaths: readonly string[]): boolean {
-  return fs.existsSync(EXAMPLE_ROOT) && requiredPaths.every((candidate) => fs.existsSync(candidate));
+  return isReferenceCorpusPresent() && requiredPaths.every((candidate) => fs.existsSync(candidate));
 }
 
 /**

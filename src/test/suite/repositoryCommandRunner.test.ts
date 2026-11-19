@@ -84,8 +84,16 @@ suite('RepositoryCommandRunner', () => {
     return Promise.resolve({ exitCode: 0, log: '', outputs: new Map(), ...partial });
   }
 
+  // Монотонный сдвиг mtime env.json: RepositoryService кэширует env.json по mtime,
+  // а saveBinding в setup и writeEnv ниже пишут файл в одном тике таймера ФС —
+  // без сдвига mtime совпадает, и сервис читает устаревшую копию (нестабильный тест).
+  let envMtimeSeconds = Math.floor(Date.now() / 1000) + 1000;
+
   function writeEnv(defaults: Record<string, unknown>): void {
-    fs.writeFileSync(path.join(root, 'env.json'), JSON.stringify({ default: defaults }), 'utf-8');
+    const envPath = path.join(root, 'env.json');
+    fs.writeFileSync(envPath, JSON.stringify({ default: defaults }), 'utf-8');
+    envMtimeSeconds += 10;
+    fs.utimesSync(envPath, envMtimeSeconds, envMtimeSeconds);
   }
 
   function validEnv(extra: Record<string, unknown> = {}): Record<string, unknown> {

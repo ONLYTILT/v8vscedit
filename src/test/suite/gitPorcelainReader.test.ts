@@ -7,6 +7,7 @@ import * as path from 'path';
 // Модуль ещё не реализован — импорт обязан провалиться до появления
 // `src/infra/git/GitPorcelainReader.ts` (компонент №1 плана).
 import { parsePorcelain, type PorcelainEntry } from '../../infra/git/GitPorcelainReader';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * Готовит временный git-репозиторий с полным набором сочетаний
@@ -81,7 +82,7 @@ suite('GitPorcelainReader', () => {
   });
 
   suiteTeardown(() => {
-    fs.rmSync(repo, { recursive: true, force: true });
+    removeTreeSync(repo);
   });
 
   function findByRelPath(relPath: string): PorcelainEntry {
@@ -152,9 +153,14 @@ suite('GitPorcelainReader', () => {
    * ветки `switch` в `unquotePorcelainPath`.
    */
   suite('unquotePorcelainPath — C-style escape-последовательности реального git', () => {
-    let escRepo: string;
+    let escRepo = '';
 
-    suiteSetup(() => {
+    suiteSetup(function () {
+      // Таб, перевод строки, CR, обратный слеш, кавычка и 0x07 недопустимы в
+      // именах файлов Windows — создать такой репозиторий там нельзя вовсе.
+      if (process.platform === 'win32') {
+        this.skip();
+      }
       escRepo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-porcelain-escapes-')));
       execFileSync('git', ['-C', escRepo, 'init', '-q']);
       fs.writeFileSync(path.join(escRepo, 'file\twith\ttab.txt'), '', 'utf-8');
@@ -169,7 +175,9 @@ suite('GitPorcelainReader', () => {
     });
 
     suiteTeardown(() => {
-      fs.rmSync(escRepo, { recursive: true, force: true });
+      if (escRepo) {
+        removeTreeSync(escRepo);
+      }
     });
 
     test('таб/перевод строки/CR/обратный слеш/кавычка декодируются в исходные символы', () => {

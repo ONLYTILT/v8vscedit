@@ -32,7 +32,7 @@ import * as path from 'node:path';
 import { globSync } from 'glob';
 import { branchRangesOfSource } from './patch-coverage/branchFacts.mjs';
 import { parseLcov, summarizeBranchCoverage, buildVerdict, lcovKeyRelativeToRoot } from './patch-coverage/verdict.mjs';
-import { planShards, verifyShardReports } from './patch-coverage/shards.mjs';
+import { planShards, selectGateTestFiles, verifyShardReports } from './patch-coverage/shards.mjs';
 import { resolveDiffBase, addedLines } from './patch-coverage/diffBase.mjs';
 
 const ROOT = process.cwd();
@@ -290,7 +290,18 @@ if (pretest.status !== 0) {
 // 2. Планирование шардов по скомпилированным тестовым файлам (тот же glob, что
 // в src/test/suite/index.ts, — имена в манифесте обязаны совпадать буквально).
 const testsRoot = path.join(ROOT, 'out', 'test', 'suite');
-const allTestFiles = globSync('**/*.test.js', { cwd: testsRoot }).sort();
+const discoveredTestFiles = globSync('**/*.test.js', { cwd: testsRoot }).sort();
+// COVERAGE_TESTS — отбор тестов задачи (см. selectGateTestFiles): гейт за минуты вместо получаса.
+const testsFilter = process.env.COVERAGE_TESTS;
+let allTestFiles;
+try {
+  allTestFiles = selectGateTestFiles(discoveredTestFiles, testsFilter);
+} catch (error) {
+  fail(error.message, 2);
+}
+if (testsFilter) {
+  console.log(`[coverage:changed] Отбор COVERAGE_TESTS=${testsFilter}: ${allTestFiles.length} из ${discoveredTestFiles.length} тестовых файлов.`);
+}
 const shards = planShards(allTestFiles, SHARD_COUNT);
 if (shards.length === 0) {
   fail('не найдено ни одного скомпилированного *.test.js — прогон бессмыслен.', 2);
@@ -342,7 +353,11 @@ for (let i = 0; i < shards.length; i += 1) {
   reports.push(existsSync(reportPath) ? JSON.parse(readFileSync(reportPath, 'utf-8')) : undefined);
 }
 
-const shardProblems = verifyShardReports(reports, { shardTotal: shards.length, allFiles: allTestFiles });
+const shardProblems = verifyShardReports(reports, {
+  shardTotal: shards.length,
+  allFiles: allTestFiles,
+  discoveredCount: discoveredTestFiles.length,
+});
 if (shardProblems.length > 0) {
   console.error('\n[coverage:changed] RED — прогон шардов рассогласован, данным покрытия верить нельзя:');
   for (const p of shardProblems) console.error('  ✗', p);
@@ -394,15 +409,24 @@ const verdict = buildVerdict({
   allowEmptyChanged: process.env.COVERAGE_ALLOW_EMPTY === '1',
 });
 
+// Вердикт на подмножестве тестов помечается явно и в GREEN, и в RED: «зелёный» тогда значит «тесты
+// задачи покрывают её код», а «красный» может означать слишком узкий отбор, а не нехватку тестов.
+const subsetNote = testsFilter
+  ? ` (только тесты COVERAGE_TESTS: ${String(allTestFiles.length)} из ${String(discoveredTestFiles.length)} файлов)`
+  : '';
+
 if (verdict.exitCode !== 0) {
-  console.error(`\n[coverage:changed] RED (код ${String(verdict.exitCode)}) — ${verdict.summary}:`);
+  console.error(`\n[coverage:changed] RED (код ${String(verdict.exitCode)}) — ${verdict.summary}${subsetNote}:`);
   for (const o of verdict.offenders) console.error('  ✗', o);
   console.error(
     verdict.exitCode === 2
       ? '\nКод 2 — данным нельзя верить: проверь базу диффа (COVERAGE_BASE), наличие lcov.info и достоверность записей BRDA.'
       : '\nПокрой эти строки/ветки тестом либо (для осознанно недостижимой защиты) пометь /* c8 ignore */ с обоснованием.'
   );
+  if (testsFilter) {
+    console.error('Отбор COVERAGE_TESTS: строку может покрывать тест вне отбора — сначала проверь, не узок ли шаблон.');
+  }
   process.exit(verdict.exitCode);
 }
 
-console.log(`\n[coverage:changed] GREEN — ${verdict.summary}.`);
+console.log(`\n[coverage:changed] GREEN — ${verdict.summary}${subsetNote}.`);

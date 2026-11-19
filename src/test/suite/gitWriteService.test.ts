@@ -7,6 +7,7 @@ import * as path from 'path';
 // файлов, без vscode. `push`/`pull` добавлены для вариантов кнопки «Фиксация»
 // (Фиксация и отправка / Фиксация и синхронизация).
 import { stage, unstage, discard, commit, push, pull, type DiscardEntry } from '../../infra/git/GitWriteService';
+import { removeTreeSync } from './support/tempTree';
 
 const TRACKED_CONTENT = 'исходное содержимое\n';
 const DELETED_CONTENT = 'будет удалён\n';
@@ -32,6 +33,9 @@ function buildBaselineRepo(): string {
   git(repo, ['init', '-q', '-b', 'main']);
   git(repo, ['config', 'user.email', 'test@test.local']);
   git(repo, ['config', 'user.name', 'test']);
+  // Тест сверяет байты восстановленного файла: при системном core.autocrlf=true
+  // (умолчание Git for Windows, действует и под SYSTEM) checkout дал бы CRLF.
+  git(repo, ['config', 'core.autocrlf', 'false']);
 
   fs.writeFileSync(path.join(repo, 'tracked.txt'), TRACKED_CONTENT, 'utf-8');
   fs.writeFileSync(path.join(repo, 'deleted.txt'), DELETED_CONTENT, 'utf-8');
@@ -64,7 +68,7 @@ suite('GitWriteService — мутации git над набором файлов
   });
 
   teardown(() => {
-    fs.rmSync(repo, { recursive: true, force: true });
+    removeTreeSync(repo);
   });
 
   test('stage() индексирует переданные файлы: untracked → "A "', () => {
@@ -174,7 +178,7 @@ suite('GitWriteService — мутации git над набором файлов
       assert.throws(() => discard(outsideAnyRepo, [{ absPath: somePath, status: 'modified' }]));
       assert.throws(() => commit(outsideAnyRepo, 'сообщение'));
     } finally {
-      fs.rmSync(outsideAnyRepo, { recursive: true, force: true });
+      removeTreeSync(outsideAnyRepo);
     }
   });
 
@@ -201,7 +205,7 @@ suite('GitWriteService — мутации git над набором файлов
         'сам bare-remote должен принять коммит'
       );
     } finally {
-      fs.rmSync(remote, { recursive: true, force: true });
+      removeTreeSync(remote);
     }
   });
 
@@ -229,8 +233,8 @@ suite('GitWriteService — мутации git над набором файлов
         'после pull файл из remote должен появиться в рабочем дереве'
       );
     } finally {
-      fs.rmSync(remote, { recursive: true, force: true });
-      fs.rmSync(otherClone, { recursive: true, force: true });
+      removeTreeSync(remote);
+      removeTreeSync(otherClone);
     }
   });
 

@@ -28,9 +28,9 @@ import {
   removeFixtureRepo,
   removeHistoryRepo,
   type ChangesFixture,
+  skipWithoutChangesFixture,
   type HistoryFixture,
 } from './support/changesFixtures';
-import { skipWithoutCorpus } from './support/corpus';
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -60,12 +60,6 @@ function findByLabel(section: ChangesSectionDto, label: string): TreeNodeDto | u
 }
 
 suite('ChangesHistorySection — состояние графа истории панели «Изменения метаданных» (склейка historyGraphController)', () => {
-  // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
-  // (единый гейт: support/corpus.ts).
-  suiteSetup(function () {
-    skipWithoutCorpus(this);
-  });
-
   // ─── load/refresh/loadMore — ленивость и пересчёт состояния графа ──────
   suite('load/refresh/loadMore — на реальном ветвлении+merge (buildHistoryRepo, configRoots не нужны)', () => {
     let fixture: HistoryFixture;
@@ -143,6 +137,12 @@ suite('ChangesHistorySection — состояние графа истории п
   suite('selectCommit/resolveDiff — на реальном объекте метаданных (buildChangesBaselineRepo)', () => {
     let fixture: ChangesFixture;
     let getConfigRoots: () => readonly ConfigEntry[];
+
+    // Корпусом пользуется только этот блок (фикстура из `example/`); ветвление+merge
+    // выше собирается синтетически и от корпуса не зависит, поэтому гейт — здесь.
+    suiteSetup(function () {
+      skipWithoutChangesFixture(this);
+    });
 
     setup(() => {
       fixture = buildChangesBaselineRepo();

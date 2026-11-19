@@ -35,6 +35,33 @@ export function planShards(files, total) {
 }
 
 /**
+ * Отбор тестовых файлов гейта по регулярному выражению пути (`COVERAGE_TESTS`).
+ *
+ * Полный прогон — ~30 минут, а задаче нужны тесты её модулей: гейт остаётся строгим
+ * (100% на изменённых файлах, дробление на свежие процессы), но покрытие засчитывается
+ * только от отобранных тестов — это и требование к задаче («её тесты покрывают её код»).
+ * Пустой шаблон — весь набор (прежнее поведение). Ошибочный шаблон и пустой отбор —
+ * исключение: молча прогнать ноль тестов значило бы получить вердикт без данных.
+ */
+export function selectGateTestFiles(files, pattern) {
+  if (pattern === undefined || pattern === '') {
+    return files;
+  }
+  let matcher;
+  try {
+    matcher = new RegExp(pattern);
+  } catch (error) {
+    throw new Error(`COVERAGE_TESTS: некорректное регулярное выражение «${pattern}»: ${error.message}`, { cause: error });
+  }
+  // Разделитель пути нормализуется: шаблон пишется одинаково на Windows и POSIX.
+  const selected = files.filter((file) => matcher.test(file.replace(/\\/g, '/')));
+  if (selected.length === 0) {
+    throw new Error(`COVERAGE_TESTS: шаблон «${pattern}» не выбрал ни одного тестового файла из ${files.length}`);
+  }
+  return selected;
+}
+
+/**
  * Семь видов рассогласования отчётов шардов. Возвращает список проблем
  * (пустой — всё согласовано); любая проблема обязана останавливать гейт ДО
  * сборки отчёта c8, иначе частичный lcov выглядит валидным.
@@ -53,9 +80,12 @@ export function verifyShardReports(reports, expected) {
     if (report.shardTotal !== expected.shardTotal) {
       problems.push(`Шард ${i}: shardTotal=${report.shardTotal} не совпал с запрошенным ${expected.shardTotal}`);
     }
-    if (report.allFilesCount !== expected.allFiles.length) {
+    // allFilesCount — сколько файлов раннер НАШЁЛ (весь набор), а allFiles — сколько гейт ВЫБРАЛ;
+    // при отборе COVERAGE_TESTS это разные числа, без отбора — одно (discoveredCount не задан).
+    const discovered = expected.discoveredCount ?? expected.allFiles.length;
+    if (report.allFilesCount !== discovered) {
       problems.push(
-        `Шард ${i}: расхождение allFilesCount=${report.allFilesCount} с ожидаемым количеством файлов ${expected.allFiles.length}`
+        `Шард ${i}: расхождение allFilesCount=${report.allFilesCount} с ожидаемым количеством файлов ${discovered}`
       );
     }
     if (report.stats.failures > 0) {

@@ -42,8 +42,8 @@ import {
   removeFixtureRepo,
   statusOf,
   type ChangesFixture,
+  skipWithoutChangesFixture,
 } from './support/changesFixtures';
-import { skipWithoutCorpus } from './support/corpus';
 
 // Корень расширения нужен реальный — WebviewHtmlFactory читает настоящий
 // dist/ui/manifest.json, собранный шагом pretest (см. treeSearchViewProvider.test.ts).
@@ -189,7 +189,7 @@ suite('MetadataChangesViewProvider — webview-презентация предс
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;
@@ -197,15 +197,19 @@ suite('MetadataChangesViewProvider — webview-презентация предс
   let fakeWebview: ReturnType<typeof createFakeWebview>;
   let services: MetadataChangesViewServices;
   let treeProvider: MetadataTreeProvider;
-  let disposeTreeProvider: () => void;
+  let disposeTreeProvider: (() => void) | undefined;
   // Позволяет отдельным тестам подменить состав корней выгрузки (updateConfigRoots)
   // без переприсваивания readonly-поля services.getConfigRoots.
   let configRootsOverride: ChangesFixture['configRoots'] | undefined;
 
-  let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
-  let originalShowErrorMessage: typeof vscode.window.showErrorMessage;
-  let originalShowInputBox: typeof vscode.window.showInputBox;
-  let originalExecuteCommand: typeof vscode.commands.executeCommand;
+  // Оригиналы захватываются один раз при определении сьюта, а не в `setup`: если
+  // `setup` упадёт до захвата (например, на сборке фикстуры), `teardown` иначе
+  // присвоил бы `undefined` глобальному `vscode.commands.executeCommand`, и каскадом
+  // падали бы все последующие сьюты прогона («executeCommand is not a function»).
+  const originalShowWarningMessage = vscode.window.showWarningMessage;
+  const originalShowErrorMessage = vscode.window.showErrorMessage;
+  const originalShowInputBox = vscode.window.showInputBox;
+  const originalExecuteCommand = vscode.commands.executeCommand;
   const windowRef = vscode.window as {
     showWarningMessage: typeof vscode.window.showWarningMessage;
     showErrorMessage: typeof vscode.window.showErrorMessage;
@@ -237,11 +241,6 @@ suite('MetadataChangesViewProvider — webview-презентация предс
     inputBoxCalls = 0;
     executeCommandCalls = [];
 
-    originalShowWarningMessage = vscode.window.showWarningMessage;
-    originalShowErrorMessage = vscode.window.showErrorMessage;
-    originalShowInputBox = vscode.window.showInputBox;
-    originalExecuteCommand = vscode.commands.executeCommand;
-
     windowRef.showWarningMessage = ((message: string, ...rest: unknown[]) => {
       warningCalls.push([message, ...rest]);
       return Promise.resolve(warningResolution);
@@ -271,7 +270,7 @@ suite('MetadataChangesViewProvider — webview-презентация предс
     windowRef.showErrorMessage = originalShowErrorMessage;
     windowRef.showInputBox = originalShowInputBox;
     commandsRef.executeCommand = originalExecuteCommand;
-    disposeTreeProvider();
+    disposeTreeProvider?.();
     removeFixtureRepo(fixture);
   });
 

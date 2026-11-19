@@ -26,6 +26,8 @@ $allowedScripts = @('test', 'test:fast', 'coverage:changed')
 # как «1»); [0-9], а не \d: \d в .NET совпадает с цифрами любых письменностей.
 $allowedEnv = @{
   'MOCHA_GREP'            = '\A[^\r\n\x00]{0,500}\z'
+  # Попадает только в new RegExp гейта (отбор тестовых файлов), не в git и не в командную строку.
+  'COVERAGE_TESTS'        = '\A[^\r\n\x00]{1,500}\z'
   'COVERAGE_SHARDS'       = '\A[0-9]{1,3}\z'
   'COVERAGE_BASE'         = '\A[A-Za-z0-9._/~^@{}][A-Za-z0-9._/~^@{}-]{0,199}\z'
   'COVERAGE_ALLOW_EMPTY'  = '\A[01]\z'

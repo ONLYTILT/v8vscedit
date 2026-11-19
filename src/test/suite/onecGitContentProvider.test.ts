@@ -9,8 +9,8 @@ import {
   git,
   removeFixtureRepo,
   type ChangesFixture,
+  skipWithoutChangesFixture,
 } from './support/changesFixtures';
-import { skipWithoutCorpus } from './support/corpus';
 
 /**
  * `OnecGitContentProvider` даёт левую сторону diff — содержимое файла из
@@ -22,7 +22,7 @@ suite('OnecGitContentProvider — содержимое HEAD/index для diff', 
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;

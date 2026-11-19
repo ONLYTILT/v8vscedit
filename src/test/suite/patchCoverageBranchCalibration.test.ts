@@ -110,7 +110,9 @@ suite('калибровка канарейки деградации — реал
     // Проверяем саму фикстуру независимо от детектора — если она пуста/повреждена,
     // остальные проверки калибровки не имеют смысла.
     const text = fs.readFileSync(FIXTURE_LCOV, 'utf-8');
-    const sfCount = text.split('\n').filter((l) => l.startsWith('SF:')).length;
+    // /\r?\n/: при core.autocrlf=true рабочая копия фикстуры — CRLF, и по '\n'
+    // в путь SF-записи попадал бы хвостовой '\r'.
+    const sfCount = text.split(/\r?\n/).filter((l) => l.startsWith('SF:')).length;
     assert.strictEqual(sfCount, 30, 'фикстура должна содержать ровно 30 SF-записей (снимок 10 «здоровых» + 20 «деградировавших» файлов)');
   });
 
@@ -120,7 +122,7 @@ suite('калибровка канарейки деградации — реал
     // молча получить summary.totalFiles < 30 из-за branchRangesOf(null).
     const text = fs.readFileSync(FIXTURE_LCOV, 'utf-8');
     const relPaths = text
-      .split('\n')
+      .split(/\r?\n/)
       .filter((l) => l.startsWith('SF:'))
       .map((l) => l.slice(3));
     assert.strictEqual(relPaths.length, 30);

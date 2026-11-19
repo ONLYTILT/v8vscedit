@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { findConfigurations, type ConfigEntry } from '../../../infra/fs/ConfigLocator';
+import { removeTreeSync } from './tempTree';
 
 /**
  * Общий фундамент фикстур для тестов ВЕХИ 2 (UI-слой представления «Изменения
@@ -22,6 +23,35 @@ const CONFIGURATION_XML = path.resolve(__dirname, '../../../../example/2.21/src/
 // используется тестами дерева представления «Изменения метаданных» (ВЕХА 2),
 // не нужен агрегатору ВЕХИ 1, поэтому вынесен отдельной константой.
 const COMMON_MODULES_FIXTURES_DIR = path.resolve(__dirname, '../../../../example/2.21/src/cf/CommonModules');
+
+/**
+ * Все входные пути корпуса, без которых {@link buildChangesBaselineRepo} не собрать.
+ * Проверяются именно они, а не корень `example/`: корпус у разработчика может быть
+ * неполным (например, только поколение 2.20), и тогда безусловное копирование
+ * падало ENOENT в КАЖДОМ тесте каждого git-сьюта, маскируя реальные регрессии.
+ */
+export const CHANGES_FIXTURE_INPUTS: readonly string[] = [
+  CONFIGURATION_XML,
+  path.join(FIXTURES_DIR, 'ПричиныВозврата.xml'),
+  path.join(FIXTURES_DIR, 'ПричиныВозврата'),
+  path.join(FIXTURES_DIR, 'РолиКонтактныхЛиц.xml'),
+  path.join(FIXTURES_DIR, 'РолиКонтактныхЛиц'),
+  path.join(COMMON_MODULES_FIXTURES_DIR, 'GoogleПереводчик.xml'),
+  path.join(COMMON_MODULES_FIXTURES_DIR, 'GoogleПереводчик'),
+];
+
+/**
+ * Пропуск сьюта, если фикстуры {@link buildChangesBaselineRepo} недоступны.
+ * Вызывать из `suiteSetup(function () { skipWithoutChangesFixture(this); })` —
+ * при пропуске Mocha не запускает ни тесты, ни их `setup`/`teardown`.
+ */
+export function skipWithoutChangesFixture(context: Mocha.Context): void {
+  // Только собственные входы фикстуры (поколение 2.21), без маркеров всего эталона: чужой или
+  // неполный 2.20 не должен гасить git-сьюты, которым он не нужен.
+  if (!CHANGES_FIXTURE_INPUTS.every((input) => fs.existsSync(input))) {
+    context.skip();
+  }
+}
 
 export function git(repo: string, args: string[]): string {
   return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf-8' });
@@ -116,8 +146,24 @@ export function buildChangesBaselineRepo(): ChangesFixture {
   };
 }
 
-export function removeFixtureRepo(fixture: ChangesFixture): void {
-  fs.rmSync(fixture.workspaceRoot, { recursive: true, force: true });
+/**
+ * Уборка терпима к неинициализированной фикстуре: если сборка упала в `setup`,
+ * `teardown` не должен добавлять второе, вводящее в заблуждение падение
+ * («Cannot read properties of undefined») поверх настоящей причины.
+ */
+export function removeFixtureRepo(fixture: ChangesFixture | undefined): void {
+  if (fixture) {
+    removeTempDir(fixture.workspaceRoot);
+  }
+}
+
+/**
+ * Удаление временного каталога-репозитория: фикстуры содержат кириллические имена
+ * файлов и read-only объекты git — `fs.rmSync` на Windows с ними не справляется
+ * (см. {@link removeTreeSync}).
+ */
+export function removeTempDir(dir: string): void {
+  removeTreeSync(dir);
 }
 
 /**
@@ -218,6 +264,8 @@ export function buildHistoryRepo(): HistoryFixture {
   return { repoRoot, root, branchPoint, featureCommit, mainCommit, mergeCommit, renameCommit };
 }
 
-export function removeHistoryRepo(fixture: HistoryFixture): void {
-  fs.rmSync(fixture.repoRoot, { recursive: true, force: true });
+export function removeHistoryRepo(fixture: HistoryFixture | undefined): void {
+  if (fixture) {
+    removeTempDir(fixture.repoRoot);
+  }
 }

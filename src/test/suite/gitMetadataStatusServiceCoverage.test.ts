@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { GitMetadataStatusService } from '../../infra/git/GitMetadataStatusService';
 import { skipWithoutCorpus } from './support/corpus';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * Дополняет `gitMetadataStatusServiceCharacterization.test.ts` (сфокусирован на
@@ -71,7 +72,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const fresh = service.getStatus({ kind: 'paths', ownerXmlPath: xmlPath, childKind: 'Attribute', paths: [xmlPath] });
       assert.strictEqual(fresh, 'modified', 'после clear() статус должен быть пересчитан по актуальному git status');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -83,7 +84,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
 
       assert.doesNotThrow(() => { service.invalidate([]); });
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -100,7 +101,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const after = service.getStatus({ kind: 'paths', ownerXmlPath: xmlPath, childKind: 'Attribute', paths: [xmlPath] });
       assert.strictEqual(after, 'modified', 'invalidate() должен форсировать перечитывание batch-карты');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -111,7 +112,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Attribute', name: 'Описание' });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -123,7 +124,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Attribute' });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -142,7 +143,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, 'added');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -167,7 +168,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Attribute', name: 'ОписаниеДоп' });
       assert.strictEqual(status, 'added', 'реквизит присутствует только в текущей версии файла');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -185,7 +186,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Attribute', name: 'Описание' });
       assert.strictEqual(status, 'deleted', 'реквизит присутствовал в HEAD, в текущей версии файла отсутствует');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -198,7 +199,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Attribute', name: 'Описание' });
       assert.strictEqual(status, 'deleted');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -222,7 +223,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'group', ownerXmlPath: xmlPath, childKind: 'Attribute' });
       assert.strictEqual(status, undefined, 'группа «Реквизиты» не изменилась — правка была вне ChildObjects');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -236,7 +237,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'group', ownerXmlPath: neverCommitted, childKind: 'Attribute' });
       assert.strictEqual(status, 'modified');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -251,7 +252,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'group', ownerXmlPath: xmlPath, childKind: 'Attribute' });
       assert.strictEqual(status, 'modified');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -264,7 +265,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'group', ownerXmlPath: xmlPath, childKind: 'Attribute' });
       assert.strictEqual(status, 'modified');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -309,7 +310,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, 'modified');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -344,7 +345,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, 'modified');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -362,7 +363,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(outsideAnyRepo, { recursive: true, force: true });
+      removeTreeSync(outsideAnyRepo);
     }
   });
 
@@ -378,7 +379,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -398,7 +399,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, undefined, 'изменения в Documents не должны отражаться на агрегате Catalogs');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -418,7 +419,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, 'added');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -442,7 +443,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       });
       assert.strictEqual(status, 'deleted');
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -455,7 +456,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'paths', ownerXmlPath: xmlPath, childKind: 'Attribute' });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -470,7 +471,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Column', name: 'СостояниеЗадачи' });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -484,7 +485,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
       const status = service.getStatus({ kind: 'child', ownerXmlPath: xmlPath, childKind: 'Method', name: 'POST' });
       assert.strictEqual(status, undefined);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 
@@ -506,7 +507,7 @@ suite('GitMetadataStatusService — дополнительное покрыти�
         assert.strictEqual(after, undefined, 'после исчезновения репозитория git status падает — карта остаётся пустой');
       });
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      removeTreeSync(repo);
     }
   });
 });

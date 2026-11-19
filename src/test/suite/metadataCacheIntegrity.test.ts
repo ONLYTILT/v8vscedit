@@ -406,9 +406,10 @@ suite('MetadataCache — целостность (C3/M4/M5)', () => {
       // Единственный обоснованный mock в этом наборе: реальный сбой ФС при записи
       // временного файла нельзя детерминированно воспроизвести без порчи диска
       // (нет прав/нет места). Проверяем, что catch-ветка saveMetadataCache
-      // (fs.rmSync(tempPath) + throw error) действительно вызывается: подделываем
+      // (fs.unlinkSync(tempPath) + throw error) действительно вызывается: подделываем
       // именно временный путь (содержащий ".tmp"), оставляя реальную запись
-      // в остальные пути нетронутой.
+      // в остальные пути нетронутой. Уборка — именно unlink, а не rmSync (запрет
+      // №19: rmSync Node 24 на Windows не удаляет файл с кириллицей в имени).
       const configRoot = makeTempConfigRoot('v8vscedit-cache-atomic-catch-');
       try {
         const entry: ConfigEntry = { rootPath: configRoot, kind: 'cf' };
@@ -421,8 +422,8 @@ suite('MetadataCache — целостность (C3/M4/M5)', () => {
 
         const fsModule = require('fs') as Record<string, unknown>;
         const originalWriteFileSync = fs.writeFileSync;
-        let rmSyncCalledForTemp = false;
-        const originalRmSync = fs.rmSync;
+        let unlinkCalledForTemp = false;
+        const originalUnlinkSync = fs.unlinkSync;
         fsModule.writeFileSync = (
           targetPath: fs.PathOrFileDescriptor,
           data: Parameters<typeof fs.writeFileSync>[1],
@@ -433,11 +434,11 @@ suite('MetadataCache — целостность (C3/M4/M5)', () => {
           }
           originalWriteFileSync(targetPath, data, options);
         };
-        fsModule.rmSync = (targetPath: fs.PathLike, options?: fs.RmOptions): void => {
+        fsModule.unlinkSync = (targetPath: fs.PathLike): void => {
           if (String(targetPath).endsWith('.tmp')) {
-            rmSyncCalledForTemp = true;
+            unlinkCalledForTemp = true;
           }
-          originalRmSync(targetPath, options);
+          originalUnlinkSync(targetPath);
         };
 
         try {
@@ -448,10 +449,10 @@ suite('MetadataCache — целостность (C3/M4/M5)', () => {
           );
         } finally {
           fsModule.writeFileSync = originalWriteFileSync;
-          fsModule.rmSync = originalRmSync;
+          fsModule.unlinkSync = originalUnlinkSync;
         }
 
-        assert.strictEqual(rmSyncCalledForTemp, true, 'catch-ветка должна подчищать временный файл через fs.rmSync перед повторным throw');
+        assert.strictEqual(unlinkCalledForTemp, true, 'catch-ветка должна подчищать временный файл через fs.unlinkSync перед повторным throw');
         assert.strictEqual(fs.existsSync(targetFile), false, 'Целевой файл кэша не должен появиться при сбое записи временного файла');
         const leftoverTmp = fs.existsSync(cacheDir)
           ? fs.readdirSync(cacheDir).filter((name) => name.endsWith('.tmp'))

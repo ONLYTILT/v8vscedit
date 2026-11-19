@@ -143,9 +143,14 @@ suite('DesignerAgentProcess', () => {
   // Волна 2 (C2): describeSpawnError переводит EACCES (запуск файла без прав
   // на выполнение) в понятную причину — самостоятельная ветка switch, не
   // покрытая ENOEXEC-сценарием выше (там файл именно исполняемый, но "битый").
-  test('spawn-ошибка EACCES (файл без права на выполнение) отражается в getExitDescription', async () => {
+  test('spawn-ошибка EACCES (файл без права на выполнение) отражается в getExitDescription', async function () {
+    // На Windows нет бита исполнения: chmod 0644 не запрещает запуск, и EACCES от
+    // spawn() воспроизвести так нельзя — сценарий существует только на POSIX.
+    if (process.platform === 'win32') {
+      this.skip();
+    }
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-eacces-v8-'));
-    const executableName = process.platform === 'win32' ? '1cv8.exe' : '1cv8';
+    const executableName = '1cv8';
     const noExecPath = path.join(dir, executableName);
     fs.writeFileSync(noExecPath, '#!/bin/sh\nexit 0\n');
     fs.chmodSync(noExecPath, 0o644); // без бита +x — реальный EACCES при spawn()
@@ -202,9 +207,15 @@ suite('DesignerAgentProcess', () => {
   // должен пройти через один и тот же exit-обработчик с guard'ом alreadyExited —
   // без этого теста ветка нормального onExit (без предшествующей spawn-ошибки)
   // осталась бы непокрытой.
-  test('штатный запуск и нормальное завершение процесса: код/сигнал попадают в getExitDescription', async () => {
+  test('штатный запуск и нормальное завершение процесса: код/сигнал попадают в getExitDescription', async function () {
+    // «Исполняемый файл» здесь — shell-скрипт с shebang: Windows не запускает
+    // такой файл как 1cv8.exe (spawn даёт ошибку, а не код выхода 7), поэтому
+    // штатный путь завершения проверяется только на POSIX.
+    if (process.platform === 'win32') {
+      this.skip();
+    }
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-real-v8-'));
-    const executableName = process.platform === 'win32' ? '1cv8.exe' : '1cv8';
+    const executableName = '1cv8';
     const scriptPath = path.join(dir, executableName);
     fs.writeFileSync(scriptPath, '#!/bin/sh\necho stdout-строка\necho stderr-строка 1>&2\nexit 7\n');
     fs.chmodSync(scriptPath, 0o755);

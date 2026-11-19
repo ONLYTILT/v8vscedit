@@ -32,8 +32,9 @@ interface ShardsModule {
   planShards(files: string[], total: number): string[][];
   verifyShardReports(
     reports: (ShardReport | undefined)[],
-    expected: { shardTotal: number; allFiles: string[] }
+    expected: { shardTotal: number; allFiles: string[]; discoveredCount?: number }
   ): string[];
+  selectGateTestFiles(files: string[], pattern: string | undefined): string[];
 }
 
 const MODULE_PATH = path.resolve(__dirname, '../../../scripts/patch-coverage/shards.mjs');
@@ -181,5 +182,43 @@ suite('shards.mjs — planShards/verifyShardReports (T-coverage-gate)', () => {
       problems.some((p) => p.toLowerCase().includes('shardtotal') || p.includes('запрошенн')),
       `не найдена проблема «shardTotal не совпал»: ${JSON.stringify(problems)}`
     );
+  });
+
+  // ---- COVERAGE_TESTS: отбор тестов задачи ------------------------------
+
+  const DISCOVERED = ['agentSync.test.js', 'nested\\repo.test.js', 'nested/form.test.js', 'other.test.js'];
+
+  for (const empty of [undefined, '']) {
+    test(`selectGateTestFiles: шаблон ${JSON.stringify(empty)} — весь набор без изменений (прежнее поведение)`, () => {
+      assert.deepStrictEqual(m().selectGateTestFiles(DISCOVERED, empty), DISCOVERED);
+    });
+  }
+
+  test('selectGateTestFiles: отбирает по регулярному выражению пути, порядок сохраняется', () => {
+    assert.deepStrictEqual(m().selectGateTestFiles(DISCOVERED, 'agent|form'), ['agentSync.test.js', 'nested/form.test.js']);
+  });
+
+  test('selectGateTestFiles: разделитель пути нормализуется — шаблон с / находит путь с обратным слэшем', () => {
+    assert.deepStrictEqual(m().selectGateTestFiles(DISCOVERED, '^nested/repo'), ['nested\\repo.test.js']);
+  });
+
+  test('selectGateTestFiles: некорректное регулярное выражение — исключение с шаблоном в тексте', () => {
+    assert.throws(() => m().selectGateTestFiles(DISCOVERED, '(unclosed'), /COVERAGE_TESTS.*\(unclosed/);
+  });
+
+  test('selectGateTestFiles: шаблон без совпадений — исключение (ноль тестов дал бы вердикт без данных)', () => {
+    assert.throws(() => m().selectGateTestFiles(DISCOVERED, 'нетТакого'), /не выбрал ни одного.*из 4/);
+  });
+
+  test('verifyShardReports: при отборе allFilesCount сверяется с discoveredCount, полнота — с отобранными', () => {
+    const reports: ShardReport[] = [
+      { shardIndex: 0, shardTotal: 1, allFilesCount: 10, selectedFiles: ['a.test.js', 'c.test.js'], stats: { tests: 3, passes: 3, failures: 0 } },
+    ];
+    const expected = { shardTotal: 1, allFiles: ['a.test.js', 'c.test.js'], discoveredCount: 10 };
+    assert.deepStrictEqual(m().verifyShardReports(reports, expected), []);
+    const mismatch = m().verifyShardReports(reports, { ...expected, discoveredCount: 11 });
+    assert.ok(mismatch.some((p) => p.includes('allFilesCount=10') && p.includes('11')), JSON.stringify(mismatch));
+    const lost = m().verifyShardReports(reports, { ...expected, allFiles: ['a.test.js', 'b.test.js', 'c.test.js'] });
+    assert.ok(lost.some((p) => p.includes('b.test.js')), JSON.stringify(lost));
   });
 });

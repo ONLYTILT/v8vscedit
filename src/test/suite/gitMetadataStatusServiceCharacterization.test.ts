@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { GitMetadataStatusService } from '../../infra/git/GitMetadataStatusService';
 import { skipWithoutCorpus } from './support/corpus';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * ХАРАКТЕРИЗАЦИОННЫЙ тест (ВЕХА 1 «Изменения метаданных», компонент №2 плана).
@@ -80,7 +81,10 @@ suite('GitMetadataStatusService — характеризация текущег�
   });
 
   suiteTeardown(() => {
-    fs.rmSync(repo, { recursive: true, force: true });
+    // suiteTeardown выполняется и при пропуске сьюта — репозитория тогда нет.
+    if (repo) {
+      removeTreeSync(repo);
+    }
   });
 
   test('модифицированный файл объекта получает статус modified', () => {

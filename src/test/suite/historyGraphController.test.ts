@@ -28,6 +28,7 @@ import {
   removeHistoryRepo,
   type ChangesFixture,
   type HistoryFixture,
+  skipWithoutChangesFixture,
 } from './support/changesFixtures';
 import { skipWithoutCorpus } from './support/corpus';
 
@@ -101,7 +102,7 @@ suite('historyGraphController — loadCommitChanges: агрегирует readCo
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;

@@ -65,7 +65,9 @@ suite('infra/xml — вынос чтения источников EventSubscript
     assert.strictEqual(resolveConfigurationXml(orphanXmlPath), null);
   });
 
-  test('readDefinedTypeInnerXml читает реальный DefinedType (КонтактноеЛицо) и возвращает inner блока <Type>', () => {
+  test('readDefinedTypeInnerXml читает реальный DefinedType (КонтактноеЛицо) и возвращает inner блока <Type>', function () {
+    // Тест работает на эталоне `example/` (не в git) — без корпуса пропускается.
+    skipWithoutCorpus(this);
     const definedTypeXmlPath = path.join(DEFINED_TYPES_DIR, 'КонтактноеЛицо.xml');
     assert.ok(fs.existsSync(definedTypeXmlPath), 'фикстура DefinedType.КонтактноеЛицо должна существовать');
 

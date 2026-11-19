@@ -31,8 +31,8 @@ import {
   git,
   removeFixtureRepo,
   type ChangesFixture,
+  skipWithoutChangesFixture,
 } from './support/changesFixtures';
-import { skipWithoutCorpus } from './support/corpus';
 
 /**
  * Фейковый резолвер иконок — единственная внешняя зависимость builder'а
@@ -65,7 +65,7 @@ suite('changesDtoBuilder — buildObjectNode/buildPartNode строят TreeNode
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;
@@ -312,7 +312,7 @@ suite('changesDtoBuilder — buildOtherSection строит плоскую се�
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;
@@ -385,7 +385,7 @@ suite('changesDtoBuilder — resolveChangeAddress восстанавливает
   // `example/` не отслеживается git — без корпуса сьют пропускается, а не падает
   // (единый гейт: support/corpus.ts).
   suiteSetup(function () {
-    skipWithoutCorpus(this);
+    skipWithoutChangesFixture(this);
   });
 
   let fixture: ChangesFixture;

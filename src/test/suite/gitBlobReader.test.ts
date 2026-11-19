@@ -12,6 +12,7 @@ import * as path from 'path';
 // HEAD/индексе. `readBlobAtRef` ещё не реализован — импорт обязан провалиться.
 import { readBlobAtHead, readBlobAtIndex, readBlobAtRef } from '../../infra/git/GitBlobReader';
 import { skipWithoutCorpus } from './support/corpus';
+import { removeTreeSync } from './support/tempTree';
 
 const FIXTURE_BSL = path.resolve(
   __dirname,
@@ -59,7 +60,10 @@ suite('GitBlobReader — чтение содержимого blob из HEAD и �
   });
 
   suiteTeardown(() => {
-    fs.rmSync(repo, { recursive: true, force: true });
+    // suiteTeardown выполняется и при пропуске сьюта — репозитория тогда нет.
+    if (repo) {
+      removeTreeSync(repo);
+    }
   });
 
   test('readBlobAtHead возвращает содержимое baseline-коммита, не рабочей копии', () => {
@@ -97,7 +101,7 @@ suite('GitBlobReader — чтение содержимого blob из HEAD и �
       assert.strictEqual(readBlobAtHead(outsideAnyRepo, path.join(outsideAnyRepo, 'файл.bsl')), null);
       assert.strictEqual(readBlobAtIndex(outsideAnyRepo, path.join(outsideAnyRepo, 'файл.bsl')), null);
     } finally {
-      fs.rmSync(outsideAnyRepo, { recursive: true, force: true });
+      removeTreeSync(outsideAnyRepo);
     }
   });
 });
@@ -137,7 +141,10 @@ suite('GitBlobReader — readBlobAtRef: чтение содержимого на
   });
 
   suiteTeardown(() => {
-    fs.rmSync(repo, { recursive: true, force: true });
+    // suiteTeardown выполняется и при пропуске сьюта — репозитория тогда нет.
+    if (repo) {
+      removeTreeSync(repo);
+    }
   });
 
   test('по хешу первого коммита возвращает содержимое V1, не текущее HEAD', () => {

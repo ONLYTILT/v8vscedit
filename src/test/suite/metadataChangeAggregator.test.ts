@@ -17,6 +17,7 @@ import {
   type RawChange,
 } from '../../infra/git/MetadataChangeAggregator';
 import { skipWithoutCorpus } from './support/corpus';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * Реальный временный git-репозиторий со штатной структурой `src/cf`, собранной
@@ -131,9 +132,13 @@ suite('MetadataChangeAggregator — агрегация изменений на �
 
   let fixture: Fixture;
   let model: ChangesModel;
+  // Отдельная строка, а не `fixture`: suiteTeardown выполняется и при пропуске
+  // сьюта, когда фикстура так и не собрана.
+  let fixtureRoot = '';
 
   suiteSetup(() => {
     fixture = buildFixtureRepo();
+    fixtureRoot = fixture.workspaceRoot;
     const output = git(fixture.workspaceRoot, ['status', '--porcelain', '--untracked-files=all']);
     const entries = parsePorcelain(output);
     const configRoots = findConfigurations(fixture.workspaceRoot);
@@ -143,7 +148,9 @@ suite('MetadataChangeAggregator — агрегация изменений на �
   });
 
   suiteTeardown(() => {
-    fs.rmSync(fixture.workspaceRoot, { recursive: true, force: true });
+    if (fixtureRoot) {
+      removeTreeSync(fixtureRoot);
+    }
   });
 
   function findGroup(list: readonly ObjectChangeGroup[], canonicalPath: string): ObjectChangeGroup {
@@ -268,7 +275,7 @@ suite('MetadataChangeAggregator — агрегация изменений на �
         'удаление полностью застейджено — в unstaged объект появляться не должен'
       );
     } finally {
-      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      removeTreeSync(workspaceRoot);
     }
   });
 
