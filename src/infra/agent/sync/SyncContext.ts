@@ -2,9 +2,10 @@ import type { AgentCommandExecutor } from '../AgentInfoBaseSession';
 import type { AgentConfigurationOperationTarget, AgentOperationHooks } from '../AgentOperationService';
 import type { AgentWorkspacePaths, AgentWorkspaceService } from '../AgentWorkspaceService';
 import type { AgentFileStore } from '../files/AgentFileStore';
-import { AgentTransferCancelledError } from '../files/AgentFileTransfer';
+import { AgentTransferCancelledError, type AgentTransferOptions } from '../files/AgentFileTransfer';
 import type { LocalExchange } from './LocalExchange';
 import type { SyncManifest, SyncMirrorCoverage } from './SyncManifest';
+import type { SyncProgress } from './SyncProgress';
 
 /** Операция синхронизации прервана по запросу пользователя. */
 export class AgentSyncCancelledError extends Error {
@@ -56,6 +57,8 @@ export interface SyncOperationContext {
   readonly exec: AgentCommandExecutor;
   readonly target: AgentConfigurationOperationTarget;
   readonly hooks: AgentOperationHooks | undefined;
+  /** Этапы и счётчики операции — в журнал и в UI одним текстом (`SyncProgress`). */
+  readonly progress: SyncProgress;
   readonly workspace: AgentWorkspacePaths;
   readonly workspaceService: AgentWorkspaceService;
   /** Имя расширения для `--extension` (у основной конфигурации — `undefined`). */
@@ -80,6 +83,11 @@ export function throwIfCancelled(context: Pick<SyncOperationContext, 'hooks'>): 
   if (context.hooks?.cancellation?.isCancellationRequested) {
     throw new AgentSyncCancelledError();
   }
+}
+
+/** Пул передачи операции: конкурентность из настроек и отмена из хуков. */
+export function transferOptionsOf(context: Pick<SyncOperationContext, 'hooks' | 'transferConcurrency'>): AgentTransferOptions {
+  return { concurrency: context.transferConcurrency, cancellation: context.hooks?.cancellation };
 }
 
 /**
@@ -114,6 +122,13 @@ export const EXCHANGE_DUMP_INFO_DIR = 'cdi';
 /** Архив свежего файла версий: zip в разы меньше XML (6 МБ против 34 МБ на большой конфигурации, §5b п.9). */
 export const EXCHANGE_DUMP_INFO_ARCHIVE = 'cdi.zip';
 
+/**
+ * Суффикс метки времени сервера (пустой файл `exchange/<op>.marker`): её mtime по часам хранилища — порог
+ * отбора дельты импорта по времени изменения файлов M (`MirrorChangeWindow`). Рядом с каталогом обмена, а
+ * не внутри: каталог обмена — `--dir` архивной полной выгрузки, и чужой файл в нём агенту не нужен.
+ */
+export const EXCHANGE_MIRROR_MARKER_SUFFIX = '.marker';
+
 /** Суффикс первого списка изменений — рядом с каталогом обмена. */
 export const EXCHANGE_CHANGES_SUFFIX = '.changes';
 
@@ -125,4 +140,5 @@ export const EXCHANGE_SIDE_SUFFIXES: readonly string[] = [
   EXCHANGE_CHANGES_SUFFIX,
   EXCHANGE_CHANGES_RETRY_SUFFIX,
   EXCHANGE_RESTORE_LIST_SUFFIX,
+  EXCHANGE_MIRROR_MARKER_SUFFIX,
 ];

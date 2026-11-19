@@ -177,7 +177,7 @@ suite('ChangedObjectFiles: collectOwnerFiles с конкурентностью',
   });
 
   test('пустой список владельцев → пустой результат', async () => {
-    assert.deepStrictEqual(await collectOwnerFiles(store, '', [], { concurrency: 4 }), { files: [], missingOwners: [] });
+    assert.deepStrictEqual(await collectOwnerFiles(store, '', [], { concurrency: 4 }), { files: [], missingOwners: [], entries: new Map() });
   });
 
   test('отмена до старта → AgentTransferCancelledError (неполный список владельцев нельзя отдавать как результат)', async () => {

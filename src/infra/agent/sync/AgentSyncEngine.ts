@@ -9,7 +9,8 @@ import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
 import { createLocalExchange, pruneStaleLocalExchanges } from './LocalExchange';
 import { fingerprintProjectDumpInfo } from './ProjectDumpInfo';
-import { EXCHANGE_SIDE_SUFFIXES, throwIfCancelled, type SyncOperationContext } from './SyncContext';
+import { AgentSyncCancelledError, EXCHANGE_SIDE_SUFFIXES, throwIfCancelled, type SyncOperationContext } from './SyncContext';
+import { createSyncProgress } from './SyncProgress';
 import {
   buildSyncManifestFiles,
   loadSyncManifest,
@@ -21,7 +22,7 @@ import {
   type SyncMirrorState,
 } from './SyncManifest';
 
-export { AgentSyncCancelledError } from './SyncContext';
+export { AgentSyncCancelledError };
 export type { AgentImportResult } from './AgentImportFlow';
 export type { AgentLoadMode, AgentLoadResult } from './AgentLoadFlow';
 
@@ -46,7 +47,19 @@ export interface AgentSyncEngineOptions {
    * тот же диск, что у P, и `.zip` не попадает под watcher `src/**\/*.xml`).
    */
   readonly localExchangeRoot?: string;
+  /**
+   * Часы троттлинга прогресса (по умолчанию `Date.now`). Не `now`: тот — источник имени операции, и
+   * тестовый стенд тикает его на каждый вызов, а прогресс тестам нужен с постоянными часами.
+   */
+  readonly progressClock?: () => number;
 }
+
+type OperationKind = 'import' | 'load';
+
+const INTERRUPTED_TEXT: Record<OperationKind, string> = {
+  import: 'Импорт прерван',
+  load: 'Загрузка прервана',
+};
 
 interface OperationBaseline {
   files: Record<string, string>;
@@ -81,8 +94,9 @@ export class AgentSyncEngine {
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentImportResult> {
-    return this.runOperation(target, exec, hooks, async (context) => {
+    return this.runOperation('import', target, exec, hooks, async (context) => {
       const { result, mirrorCoverage } = await runImport(context);
+      context.progress.step('Сохранение базовой линии синхронизации…');
       return {
         result,
         baseline: {
@@ -102,7 +116,7 @@ export class AgentSyncEngine {
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentLoadResult> {
-    return this.runOperation(target, exec, hooks, async (context) => {
+    return this.runOperation('load', target, exec, hooks, async (context) => {
       const outcome = await runLoad(context, mode);
       return outcome.result.skipped
         ? { result: outcome.result }
@@ -114,6 +128,7 @@ export class AgentSyncEngine {
   }
 
   private async runOperation<T>(
+    kind: OperationKind,
     target: AgentConfigurationOperationTarget,
     exec: AgentCommandExecutor,
     hooks: AgentOperationHooks | undefined,
@@ -145,6 +160,7 @@ export class AgentSyncEngine {
       exec,
       target,
       hooks,
+      progress: createSyncProgress(hooks, this.options.progressClock ?? Date.now),
       workspace,
       workspaceService,
       extensionName,
@@ -168,6 +184,13 @@ export class AgentSyncEngine {
       await this.removeExchange(context);
       return outcome.result;
     } catch (error) {
+      if (mirror.mutated && error instanceof AgentSyncCancelledError) {
+        // Отмена после мутации M стоит дорого (переподготовка зеркала): пользователь должен знать почему.
+        context.progress.step(
+          `${INTERRUPTED_TEXT[kind]} после изменения зеркала агента: следующий импорт заново подготовит зеркало ` +
+          '(посев из выгрузки проекта или полная выгрузка).'
+        );
+      }
       if (mirror.mutated) {
         // M уже изменён, а P и B — нет: следующий импорт обязан идти полным путём. Полнота — текущая,
         // а не из старого манифеста: начатый посев делает M разреженным, и прежнее `full` позволило бы

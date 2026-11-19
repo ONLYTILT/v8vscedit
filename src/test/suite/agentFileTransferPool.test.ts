@@ -135,7 +135,9 @@ suite('AgentFileTransfer: statFiles', () => {
   test('файл, каталог и отсутствующий путь: запись или undefined по каждому запрошенному пути', async () => {
     const map = await statFiles(store, ['dir/a.txt', 'dir/sub', 'dir/нет.txt', 'dir/Кириллица.txt']);
     assert.deepStrictEqual([...map.keys()], ['dir/a.txt', 'dir/sub', 'dir/нет.txt', 'dir/Кириллица.txt']);
-    assert.deepStrictEqual(map.get('dir/a.txt'), { path: 'dir/a.txt', type: 'file', size: 3 });
+    const entry = map.get('dir/a.txt');
+    assert.strictEqual(typeof entry?.mtimeMs, 'number');
+    assert.deepStrictEqual({ path: entry?.path, type: entry?.type, size: entry?.size }, { path: 'dir/a.txt', type: 'file', size: 3 });
     assert.strictEqual(map.get('dir/sub')?.type, 'dir');
     assert.ok(map.has('dir/нет.txt') && map.get('dir/нет.txt') === undefined);
     assert.strictEqual(map.get('dir/Кириллица.txt')?.type, 'file');

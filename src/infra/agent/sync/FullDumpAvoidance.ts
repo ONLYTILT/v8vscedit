@@ -122,10 +122,14 @@ async function pruneMirror(context: SyncOperationContext, owners: readonly Chang
   const { store } = context;
   const mirror = context.workspace.targetAgentDir;
   context.markMirrorMutated();
+  const counter = context.progress.counter(
+    (done, total) => `Очистка зеркала: объектов ${String(done)} из ${String(total)}`, owners.length);
   for (const owner of owners) {
     await store.remove(`${mirror}/${owner.xmlRel}`);
     await store.remove(`${mirror}/${owner.dirRel}`, { recursive: true });
+    counter.advance();
   }
+  counter.finish();
   // Закачка хранилища — временный файл и подмена (temp+rename): обрыв не оставляет файл версий наполовину.
   // Исключение — SFTP-режим `direct` (сервер без RENAME поверх файла): там запись идёт прямо в цель, и
   // обрыв может оставить файл версий неполным; это покрывает пометка `markMirrorMutated` выше —
@@ -164,6 +168,7 @@ async function afterPrune(
     return rewriteMirror(context, consent, editedIndex, pruned);
   }
   if (plan.action === 'update') {
+    context.progress.step('Обновление зеркала агента на сервере…');
     await context.exec.execute(buildDumpConfigToFilesCommand(context.workspace.targetAgentDir, {
       extensionName: context.extensionName,
       update: true,
@@ -199,6 +204,7 @@ async function rewriteMirror(
 ): Promise<FullDumpResolution> {
   await confirmFullDumpOrThrow(context, 'mirror-rewrite', consent);
   const mirror = context.workspace.targetAgentDir;
+  context.progress.step('Перезапись зеркала агента на сервере (долго)…');
   context.markMirrorMutated();
   await context.exec.execute(buildDumpConfigToFilesCommand(mirror, {
     extensionName: context.extensionName,

@@ -211,7 +211,11 @@ src/
 │   │                                  # ProjectSeed (посев M из проекта, «сироты»), SparseRestore (точечная выгрузка
 │   │                                  # `dump --list-file`), ProjectDumpInfo (отпечаток CDI проекта), FullDumpAvoidance +
 │   │                                  # FreshDumpInfo + ChangeSet (импорт при FullDump без архива, только cf; `FULL_DUMP_AVOIDANCE_BY_TARGET`); причины полной
-│   │                                  # выгрузки — таблица `ARCHIVE_REASON_POLICY` в SyncPlanner (docs/architecture.md)
+│   │                                  # выгрузки — таблица `ARCHIVE_REASON_POLICY` в SyncPlanner (docs/architecture.md); MirrorChangeWindow +
+│   │                                  # DeltaImport (дельта импорта скачивает только файлы с mtime ≥ метки сервера; метка —
+│   │                                  # ПЕРВАЯ операция `importChanges`, мутации M в импорте — только после неё; грязные, вне B
+│   │                                  # и restore скачиваются всегда), SyncProgress (один источник прогресса для журнала и окна
+│   │                                  # `withProgress` с «Отмена» у импорта; docs/architecture.md, «Прогресс операций агента»)
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
 │   │   │                              # SensitiveArgs (маскирование -Password в логах),
 │   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)

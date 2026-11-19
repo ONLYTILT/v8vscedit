@@ -11,6 +11,7 @@ import {
   updateConfigurationOperationStatus,
 } from '../configurationOperationStatus';
 import { getAgentOperationService, logAgentDiagnostics } from './AgentServiceRegistry';
+import { agentQuestionText, isSecretQuestion, withQuestionJournal } from './agentQuestionJournal';
 
 export interface RunAgentOptions {
   readonly progressTitle: string;
@@ -29,46 +30,94 @@ export interface RunAgentOptions {
   readonly confirmFullDump?: AgentOperationHooks['confirmFullDump'];
   /** Вопрос об удалении «осиротевших» файлов выгрузки проекта; без него — только сообщение. */
   readonly confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
+  /**
+   * Кнопка «Отмена» в уведомлении и токен в хуках операции. Только у импорта: его отмена проверяется в
+   * безопасных точках и не оставляет P наполовину записанным; загрузка без аудита отмены (бэклог Б3).
+   */
+  readonly cancellable?: boolean;
 }
 
+/** Хуки, которые операция получает от обёртки: журнал, вопросы, прогресс и (у отменяемых) токен отмены. */
+export interface AgentOperationUiHooks {
+  readonly onMessage: (message: string) => void;
+  readonly onProgress?: AgentOperationHooks['onProgress'];
+  readonly onProjectFilesWillChange?: (filePaths: string[]) => void;
+  readonly onQuestion: (message: AgentMessage) => Promise<string | undefined>;
+  readonly cancellation?: vscode.CancellationToken;
+  readonly confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
+  readonly confirmFullDump?: AgentOperationHooks['confirmFullDump'];
+  readonly confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
+}
+
+const CANCEL_REQUESTED_MESSAGE =
+  'Запрошена отмена: операция остановится в ближайшей безопасной точке; начатая команда агента и запись в проект доводятся до конца';
+
+/**
+ * Операция идёт внутри уведомления `withProgress`: этап и счётчики из infra (`hooks.onProgress`) — его
+ * текст. Полоса `increment` не используется: она монотонна на всё уведомление, а у этапов независимые
+ * total — процент стоит в тексте. Модальные вопросы ожидаются намеренно (без ответа операции некуда
+ * идти), а итоговые тосты — без `await` (запрет №18): `withProgress` и есть сама операция.
+ */
 export async function runAgentConfigurationOperation(
   options: RunAgentOptions,
-  operation: (
-    service: AgentOperationService,
-    hooks: {
-      onMessage: (message: string) => void;
-      onProjectFilesWillChange?: (filePaths: string[]) => void;
-      onQuestion: (message: AgentMessage) => Promise<string | undefined>;
-      confirmMirrorSeed?: AgentOperationHooks['confirmMirrorSeed'];
-      confirmFullDump?: AgentOperationHooks['confirmFullDump'];
-      confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
-    }
-  ) => Promise<void>
+  operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<void>
 ): Promise<boolean> {
   options.outputChannel.appendLine(`[agent] Старт: ${options.progressTitle}`);
   beginConfigurationOperationStatus(options.progressTitle, options.progressStartMessage);
   options.hooks?.onProgressMessage?.(options.progressStartMessage);
   options.onProgressMessage?.(options.progressStartMessage);
 
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: options.progressTitle, cancellable: options.cancellable === true },
+    (progress, token) => runInProgress(options, operation, progress, options.cancellable === true ? token : undefined)
+  );
+}
+
+async function runInProgress(
+  options: RunAgentOptions,
+  operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<void>,
+  progress: vscode.Progress<{ message?: string }>,
+  cancellation: vscode.CancellationToken | undefined
+): Promise<boolean> {
   const importHooks = isImportHooks(options.hooks) ? options.hooks : undefined;
-  const buildOperationHooks = () => ({
-    onMessage: (message: string) => {
-      options.outputChannel.appendLine(`[agent] ${message}`);
-      const statusMessage = getAgentStatusMessage(message);
-      if (statusMessage) {
-        updateConfigurationOperationStatus(options.progressTitle, statusMessage);
-        options.hooks?.onProgressMessage?.(statusMessage);
-        options.onProgressMessage?.(statusMessage);
+  const showStatus = (statusMessage: string): void => {
+    updateConfigurationOperationStatus(options.progressTitle, statusMessage);
+    options.hooks?.onProgressMessage?.(statusMessage);
+    options.onProgressMessage?.(statusMessage);
+  };
+  // `SyncProgress` шлёт веху в оба канала (журнал и UI), а итог счётчика UI мог показать раньше журнала: тот
+  // же текст второй раз в уведомление и статус не повторяем — сравнение с последним показанным.
+  let lastShown: string | undefined;
+  const onMessage = (message: string): void => {
+    options.outputChannel.appendLine(`[agent] ${message}`);
+    const statusMessage = getAgentStatusMessage(message);
+    if (statusMessage && message !== lastShown) {
+      lastShown = message;
+      showStatus(statusMessage);
+      progress.report({ message: statusMessage });
+    }
+  };
+  const buildOperationHooks = (): AgentOperationUiHooks => withQuestionJournal({
+    onMessage,
+    // Журнал пишет только onMessage: здесь — живой UI для промежуточных значений счётчиков.
+    onProgress: (event) => {
+      if (event.text === lastShown) {
+        return;
       }
+      lastShown = event.text;
+      showStatus(trimStatusMessage(event.text));
+      progress.report({ message: event.text });
     },
     onProjectFilesWillChange: importHooks
       ? (filePaths: string[]) => importHooks.beforeProjectFilesChanged?.(filePaths)
       : undefined,
     onQuestion: showAgentQuestion,
+    cancellation,
     confirmMirrorSeed: options.confirmMirrorSeed,
     confirmFullDump: options.confirmFullDump,
     confirmOrphanRemoval: options.confirmOrphanRemoval,
-  });
+  }, onMessage);
+  const cancelSubscription = cancellation?.onCancellationRequested(() => { onMessage(CANCEL_REQUESTED_MESSAGE); });
 
   try {
     const service = await getAgentOperationService(options.workspaceFolder, options.rootPath, options.outputChannel);
@@ -113,16 +162,14 @@ export async function runAgentConfigurationOperation(
       }
     });
     return false;
+  } finally {
+    cancelSubscription?.dispose();
   }
 }
 
 export async function showAgentQuestion(message: AgentMessage): Promise<string | undefined> {
-  const text = typeof message.message === 'string' && message.message.trim()
-    ? message.message.trim()
-    : typeof message.body === 'string'
-      ? message.body
-      : JSON.stringify(message.body ?? message);
-  if (/(парол|password)/i.test(text)) {
+  const text = agentQuestionText(message);
+  if (isSecretQuestion(text)) {
     return vscode.window.showInputBox({
       title: 'Пароль информационной базы',
       prompt: text,

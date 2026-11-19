@@ -10,6 +10,7 @@ import { exchangeDirOf, type SyncOperationContext } from './SyncContext';
  */
 export async function fetchChangeSet(context: SyncOperationContext, suffix: string): Promise<DumpChangeSet> {
   const changesFile = `${exchangeDirOf(context)}${suffix}`;
+  context.progress.step('Запрос списка изменений базы у агента…');
   await context.exec.execute(buildDumpConfigToFilesCommand(context.workspace.targetAgentDir, {
     extensionName: context.extensionName,
     update: true,

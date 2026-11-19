@@ -55,3 +55,43 @@ export class CountingAgentFileStore extends DelegatingAgentFileStore {
     return this.calls.filter((call) => call.method === method && pathPattern.test(call.path)).length;
   }
 }
+
+export interface MtimeShapingOptions {
+  /** Срезать `mtimeMs` у всех записей `stat`/`list` (хранилище не сообщает времена). */
+  readonly stripMtime?: boolean;
+  /** Запись пути, содержащего эту подстроку, отказывает (метка времени сервера недоступна). */
+  readonly failWriteIncluding?: string;
+}
+
+/**
+ * Хранилище, которое искажает метаданные времени или отказывает на записи метки: проверка откатов отбора по
+ * времени изменения. Остальное делегируется настоящему хранилищу.
+ */
+export class MtimeShapingAgentFileStore extends DelegatingAgentFileStore {
+  constructor(inner: AgentFileStore, private readonly options: MtimeShapingOptions) {
+    super(inner);
+  }
+
+  override async stat(rel: string): Promise<AgentFileEntry | undefined> {
+    const entry = await super.stat(rel);
+    return entry && this.shape(entry);
+  }
+
+  override async list(relDir: string, options?: { readonly recursive?: boolean }): Promise<AgentFileEntry[]> {
+    return (await super.list(relDir, options)).map((entry) => this.shape(entry));
+  }
+
+  override writeFile(rel: string, data: Uint8Array | string): Promise<void> {
+    if (this.options.failWriteIncluding !== undefined && rel.includes(this.options.failWriteIncluding)) {
+      return Promise.reject(new Error('запись метки отказала'));
+    }
+    return super.writeFile(rel, data);
+  }
+
+  private shape(entry: AgentFileEntry): AgentFileEntry {
+    if (this.options.stripMtime !== true) {
+      return entry;
+    }
+    return { path: entry.path, type: entry.type, size: entry.size };
+  }
+}

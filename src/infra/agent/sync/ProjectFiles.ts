@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { writeFileAtomic } from '../../fs/AtomicFileWriter';
+import type { SyncProgress } from './SyncProgress';
 
 /**
  * Запись результата синхронизации в выгрузку проекта P. Единая точка для всех стратегий импорта
@@ -27,6 +28,8 @@ export interface ProjectChanges {
   readonly deletes: readonly string[];
   readonly read: ProjectDataReader;
   readonly onWillChange?: (filePaths: string[]) => void;
+  /** Этап «Запись в проект» и счётчик записанных файлов; без него запись молчит, как прежде. */
+  readonly onProgress?: SyncProgress;
 }
 
 /** Применяет изменения к P и возвращает абсолютные пути изменённых, новых и удалённых файлов. */
@@ -39,6 +42,8 @@ export async function applyProjectChanges(changes: ProjectChanges): Promise<stri
     return changedProjectFiles;
   }
   changes.onWillChange?.(changedProjectFiles);
+  changes.onProgress?.step(`Запись в проект: изменено ${String(writes.length)}, удалено ${String(deletes.length)}`);
+  const counter = changes.onProgress?.counter((done, total) => `Запись в проект: ${String(done)} из ${String(total)} файлов`, writes.length);
 
   for (const rel of deletes) {
     const target = toProjectPath(projectDir, rel);
@@ -55,11 +60,14 @@ export async function applyProjectChanges(changes: ProjectChanges): Promise<stri
       return;
     }
     writeProjectFile(projectDir, rel, data);
+    counter?.advance();
   });
   if (configuration !== undefined) {
     changes.onWillChange?.(changedProjectFiles);
     writeProjectFile(projectDir, CONFIGURATION_XML, configuration);
+    counter?.advance();
   }
+  counter?.finish();
   changes.onWillChange?.(changedProjectFiles);
   return changedProjectFiles;
 }
@@ -93,6 +101,15 @@ export function listProjectFiles(rootDir: string, relDir = ''): string[] {
 
 export function projectFileExists(projectDir: string, rel: string): boolean {
   return fs.existsSync(toProjectPath(projectDir, rel));
+}
+
+/** Размер файла проекта в байтах; отсутствующий файл — `undefined`. */
+export function projectFileSize(projectDir: string, rel: string): number | undefined {
+  try {
+    return fs.statSync(toProjectPath(projectDir, rel)).size;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Совпадает ли файл проекта с данными; отсутствующий файл — не совпадает. */

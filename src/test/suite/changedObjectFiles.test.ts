@@ -270,7 +270,39 @@ suite('ChangedObjectFiles: collectOwnerFiles (Э7)', () => {
     const exploding = new Proxy({}, {
       get: () => () => { throw new Error('хранилище не должно вызываться'); },
     }) as unknown as AgentFileStore;
-    assert.deepStrictEqual(await collectOwnerFiles(exploding, TARGET, []), { files: [], missingOwners: [] });
+    assert.deepStrictEqual(await collectOwnerFiles(exploding, TARGET, []), { files: [], missingOwners: [], entries: new Map() });
+  });
+
+  test('entries: ключи — ровно files (пути от каталога цели), у каждой записи размер и mtimeMs файла; XML — из STAT, поддерево — из LIST', async () => {
+    put('Catalogs/Товары/Ext/ObjectModule.bsl', 'модуль');
+    const { owners } = resolveChangedOwners([line('modified', 'Catalog.Товары'), line('modified', 'Catalog.Клиенты')]);
+    const result = await collectOwnerFiles(store, TARGET, owners);
+    assert.deepStrictEqual([...result.entries.keys()].sort(), [...result.files].sort());
+    for (const rel of result.files) {
+      const recorded = result.entries.get(rel);
+      const real = fs.statSync(path.join(tempRoot, ...TARGET.split('/'), ...rel.split('/')));
+      assert.strictEqual(recorded?.type, 'file', rel);
+      assert.strictEqual(recorded.size, real.size, rel);
+      assert.ok(recorded.mtimeMs !== undefined && Math.abs(recorded.mtimeMs - real.mtimeMs) < 1000, rel);
+      assert.ok(recorded.path.endsWith(rel), 'путь записи — путь хранилища, оканчивается относительным');
+    }
+    assert.strictEqual(result.entries.get('Catalogs/Товары/Ext/ObjectModule.bsl')?.size, Buffer.byteLength('модуль'));
+  });
+
+  test('entries: порядок files прежний — XML владельца первым; отсутствующий владелец записей не даёт; каталоги в entries не попадают', async () => {
+    const { owners } = resolveChangedOwners([line('modified', 'Role.Админ'), line('modified', 'Catalog.Нет')]);
+    const result = await collectOwnerFiles(store, TARGET, owners);
+    assert.deepStrictEqual(result.files, ['Roles/Админ.xml', 'Roles/Админ/Ext/Rights.xml']);
+    assert.deepStrictEqual([...result.entries.keys()], result.files);
+    assert.ok([...result.entries.values()].every((recorded) => recorded.type === 'file'));
+  });
+
+  test('entries: каталог цели — корень хранилища (пустой targetRel): ключи без префикса', async () => {
+    const rootStore = new LocalAgentFileStore(path.join(tempRoot, ...TARGET.split('/')));
+    const { owners } = resolveChangedOwners([line('modified', 'Role.Админ')]);
+    const result = await collectOwnerFiles(rootStore, '', owners);
+    assert.deepStrictEqual([...result.entries.keys()].sort(), ['Roles/Админ.xml', 'Roles/Админ/Ext/Rights.xml']);
+    assert.strictEqual(result.entries.get('Roles/Админ.xml')?.path, 'Roles/Админ.xml');
   });
 
   test('каталог цели — сам корень хранилища (пустой targetRel): пути без префикса, от корня', async () => {

@@ -29,6 +29,7 @@ import {
 import { buildScopeKey } from '../../../infra/cache/HashCache';
 import { AgentConfigEmulator } from './agentConfigEmulator';
 import { AgentSshTestServer } from './agentSshTestServer';
+import { removeTreeSync } from './tempTree';
 import type { SftpTestBackend } from './agentSftpTestBackend';
 
 export type HarnessKind = 'sftp' | 'local';
@@ -44,6 +45,8 @@ export interface HarnessOptions {
   readonly wrapStore?: (store: AgentFileStore) => AgentFileStore;
   /** Цель: основная конфигурация (по умолчанию) или расширение `Расш`. */
   readonly targetKind?: HarnessTargetKind;
+  /** Часы прогресса движка; по умолчанию постоянные (0): троттлинг по времени не вмешивается в точные последовательности. */
+  readonly progressClock?: () => number;
 }
 
 export interface SyncHarness {
@@ -166,6 +169,7 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     transferConcurrency: options.transferConcurrency,
     localExchangeRoot,
     now: clock.now,
+    progressClock: options.progressClock ?? ((): number => 0),
   });
   const emulator = new AgentConfigEmulator(userRoot);
   const mirrorDir = targetKind === 'cf' ? `workspace/${projectId}/cf` : `workspace/${projectId}/cfe/${HARNESS_EXTENSION_NAME}`;
@@ -297,7 +301,7 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     dispose: async () => {
       await rawStore.dispose();
       await server?.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      removeTreeSync(base);
     },
   };
 }

@@ -683,9 +683,12 @@ function joinRel(parent: string, child: string): string {
 }
 
 function toEntry(rel: string, stats: Stats): AgentFileEntry {
+  // Тип ssh2 обещает число, но без флага ACMODTIME в ответе (SFTP v3 это допускает) поле не заполнено.
+  const mtime: unknown = stats.mtime;
+  const times = typeof mtime === 'number' ? { mtimeMs: mtime * 1000 } : {};
   return stats.isDirectory()
-    ? { path: rel, type: 'dir', size: 0 }
-    : { path: rel, type: 'file', size: stats.size };
+    ? { path: rel, type: 'dir', size: 0, ...times }
+    : { path: rel, type: 'file', size: stats.size, ...times };
 }
 
 /** Ошибка с относительным путём агента: по нему пользователь найдёт файл в персональном корне. */

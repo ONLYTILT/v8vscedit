@@ -55,10 +55,10 @@ async function importArchive(context: SyncOperationContext, reason: ImportArchiv
   }));
   const zipPath = await context.localExchange.file(EXCHANGE_ARCHIVE);
   context.hooks?.onMessage?.('Скачивание архива выгрузки…');
-  const onMessage = context.hooks?.onMessage;
+  // Вехи архива — в оба канала (журнал и уведомление) через `step`: тексты и шаги прежние.
   await context.store.downloadToFile(`${exchangeDir}/${EXCHANGE_ARCHIVE}`, zipPath, {
     cancellation,
-    onProgress: onMessage && downloadProgressReporter(onMessage),
+    onProgress: downloadProgressReporter((message) => { context.progress.step(message); }),
   });
   throwIfCancelled(context);
 
@@ -89,6 +89,7 @@ async function importArchive(context: SyncOperationContext, reason: ImportArchiv
       // Отмены здесь нет: запись в проект, начавшись, доводится до конца.
       read: (rels, sink) => reader.read(new Set(rels), (entry) => sink(entry.path, entry.data)),
       onWillChange: context.hooks?.onProjectFilesWillChange,
+      onProgress: context.progress,
     });
     return { changedProjectFiles, strategy: 'archive', reason, ...(seeded ? { seededFrom: 'archive' as const } : {}) };
   } finally {

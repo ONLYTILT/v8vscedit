@@ -13,6 +13,7 @@ import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
 import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type { MirrorSeedCandidate } from './sync/MirrorSeed';
+import type { AgentProgressEvent } from './sync/SyncProgress';
 import type { ServerDumpReason } from './sync/SyncPlanner';
 import type {
   DesignerAgentTransportFactory,
@@ -73,6 +74,11 @@ export interface AgentOrphanFilesRequest {
 
 export interface AgentOperationHooks {
   readonly onMessage?: (message: string) => void;
+  /**
+   * Этап и счётчик для живого UI (уведомление). Тот же текст, что в `onMessage`, но чаще: журнал получает
+   * только вехи (`SyncProgress`). Сообщения вне `SyncProgress` идут только в `onMessage`.
+   */
+  readonly onProgress?: (event: AgentProgressEvent) => void;
   readonly onProjectFilesWillChange?: (filePaths: string[]) => void;
   readonly onQuestion?: (message: AgentMessage) => Promise<string | undefined>;
   /** Отмена синхронизации (структурно совместима с `vscode.CancellationToken`). */

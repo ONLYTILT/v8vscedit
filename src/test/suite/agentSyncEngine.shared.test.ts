@@ -181,7 +181,8 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
           assert.strictEqual(dumps[1].options.update, true);
           assert.ok(!dumps[1].options['get-changes'] && !dumps[1].options.archive);
           // Скачано ровно: файл списка + файлы владельца изменённого объекта; ConfigDumpInfo.xml — нет.
-          const opened = (h.sftp?.ops('OPEN') ?? []).map((e) => e.path ?? '');
+          // Метка времени сервера (`exchange/<op>.marker`) — запись, а не скачивание: в счёт не идёт.
+          const opened = (h.sftp?.ops('OPEN') ?? []).map((e) => e.path ?? '').filter((p) => !/^exchange\/[^/]+\.marker/.test(p));
           const changesFiles = opened.filter((p) => /^exchange\/[^/]+\.changes$/.test(p));
           assert.strictEqual(changesFiles.length, 1, opened.join(' | '));
           assert.deepStrictEqual(opened.filter((p) => !changesFiles.includes(p)).sort(), [

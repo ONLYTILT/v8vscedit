@@ -1,10 +1,11 @@
 import type { DumpChangedObject } from '../../../domain/agent/DumpChangesParser';
 import { META_TYPES, type MetaTypeDef } from '../../../domain/MetaTypes';
-import type { AgentFileStore } from '../files/AgentFileStore';
+import type { AgentFileEntry, AgentFileStore } from '../files/AgentFileStore';
 import {
   AgentTransferCancelledError,
   forEachConcurrent,
   type AgentTransferCancellation,
+  type AgentTransferProgress,
 } from '../files/AgentFileTransfer';
 
 /**
@@ -39,6 +40,12 @@ export interface OwnerFilesResult {
   readonly files: string[];
   /** Владельцы, которых нет в M ни XML, ни каталогом. */
   readonly missingOwners: ChangedOwner[];
+  /**
+   * Записи хранилища по файлам `files` (ключ — путь от каталога цели): XML — из STAT, поддерево — из
+   * LIST. Размер и время изменения приходят этими же запросами бесплатно, отбор дельты по времени
+   * изменения (`MirrorChangeWindow`) лишних STAT не делает.
+   */
+  readonly entries: ReadonlyMap<string, AgentFileEntry>;
 }
 
 const CONFIGURATION_KIND = META_TYPES.configuration.englishKind;
@@ -136,6 +143,8 @@ function resolveOwners(items: readonly { readonly kind: string; readonly name: s
 export interface CollectOwnerFilesOptions {
   readonly concurrency?: number;
   readonly cancellation?: AgentTransferCancellation;
+  /** Владельцев просмотрено / всего — для счётчика «Просмотр зеркала». */
+  readonly onProgress?: (progress: AgentTransferProgress) => void;
 }
 
 /**
@@ -151,7 +160,7 @@ export async function collectOwnerFiles(
   options: CollectOwnerFilesOptions = {}
 ): Promise<OwnerFilesResult> {
   const prefix = targetRel ? `${targetRel}/` : '';
-  const perOwner = new Map<ChangedOwner, string[] | undefined>();
+  const perOwner = new Map<ChangedOwner, OwnerEntry[] | undefined>();
   const { cancelled } = await forEachConcurrent(owners, async (owner) => {
     perOwner.set(owner, await ownerFilesInStore(store, prefix, owner));
   }, { ...options, action: 'list' }, (owner) => owner.fullName);
@@ -159,25 +168,34 @@ export async function collectOwnerFiles(
     throw new AgentTransferCancelledError();
   }
   const files: string[] = [];
+  const entries = new Map<string, AgentFileEntry>();
   const missingOwners: ChangedOwner[] = [];
   for (const owner of owners) {
     const found = perOwner.get(owner);
     if (found === undefined) {
       missingOwners.push(owner);
-    } else {
-      files.push(...found);
+      continue;
+    }
+    for (const { rel, entry } of found) {
+      files.push(rel);
+      entries.set(rel, entry);
     }
   }
-  return { files, missingOwners };
+  return { files, missingOwners, entries };
 }
 
-/** Файлы одного владельца в M; `undefined` — нет ни XML, ни каталога. */
-async function ownerFilesInStore(store: AgentFileStore, prefix: string, owner: ChangedOwner): Promise<string[] | undefined> {
-  const files: string[] = [];
+interface OwnerEntry {
+  readonly rel: string;
+  readonly entry: AgentFileEntry;
+}
+
+/** Файлы одного владельца в M с их записями; `undefined` — нет ни XML, ни каталога. */
+async function ownerFilesInStore(store: AgentFileStore, prefix: string, owner: ChangedOwner): Promise<OwnerEntry[] | undefined> {
+  const files: OwnerEntry[] = [];
   let found = false;
   const xml = await store.stat(prefix + owner.xmlRel);
   if (xml?.type === 'file') {
-    files.push(owner.xmlRel);
+    files.push({ rel: owner.xmlRel, entry: xml });
     found = true;
   }
   const dir = await store.stat(prefix + owner.dirRel);
@@ -185,7 +203,7 @@ async function ownerFilesInStore(store: AgentFileStore, prefix: string, owner: C
     found = true;
     for (const entry of await store.list(prefix + owner.dirRel, { recursive: true })) {
       if (entry.type === 'file') {
-        files.push(entry.path.slice(prefix.length));
+        files.push({ rel: entry.path.slice(prefix.length), entry });
       }
     }
   }

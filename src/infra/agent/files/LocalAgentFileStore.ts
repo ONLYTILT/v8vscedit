@@ -314,8 +314,8 @@ async function copyChunks(
 
 function toEntry(rel: string, stats: fs.Stats): AgentFileEntry {
   return stats.isDirectory()
-    ? { path: rel, type: 'dir', size: 0 }
-    : { path: rel, type: 'file', size: stats.size };
+    ? { path: rel, type: 'dir', size: 0, mtimeMs: stats.mtimeMs }
+    : { path: rel, type: 'file', size: stats.size, mtimeMs: stats.mtimeMs };
 }
 
 function isMissingPathError(error: unknown): boolean {

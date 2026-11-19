@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { AgentMirrorSeedRequest } from '../../infra/agent/AgentOperationService';
+import type { AgentFullDumpRequest, AgentMirrorSeedRequest, AgentOrphanFilesRequest } from '../../infra/agent/AgentOperationService';
 import {
   disposeCachedAgentOperationServices,
   ensureAgentService,
@@ -195,6 +195,34 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
   const restores: (() => void)[] = [];
   const captured: { hooks: Record<string, unknown>; target: Record<string, unknown> }[] = [];
 
+  const seedRequest = (): AgentMirrorSeedRequest => request();
+  const fullDumpRequest = (): AgentFullDumpRequest => ({
+    targetKind: 'cf', targetName: 'Основная', projectDir: path.join(os.tmpdir(), 'p'), operation: 'import',
+    reason: 'full-dump', reasonText: 'причина', download: true,
+  });
+  const orphansRequest = (): AgentOrphanFilesRequest => ({ targetName: 'Основная', owners: ['Catalog.А'], files: ['Catalogs/А.xml'] });
+
+  /**
+   * Хук операции обёрнут (журнал ожидания ответа), поэтому тождество с диалогом проверяется поведением: при
+   * одном и том же ответе пользователя (Esc) обёртка возвращает то же решение, что сам диалог, и показывает
+   * тот же диалог — тот же текст вопроса.
+   */
+  async function assertWrapsPrompt(
+    name: 'confirmMirrorSeed' | 'confirmFullDump' | 'confirmOrphanRemoval',
+    req: unknown,
+    prompt: (request: never) => Promise<unknown>
+  ): Promise<void> {
+    const shown: unknown[][] = [];
+    restores.push(stubWindow('showWarningMessage', (...args) => { shown.push(args); return Promise.resolve(undefined); }));
+    const wrapped = captured[0].hooks[name] as (request: unknown) => Promise<unknown>;
+    assert.strictEqual(typeof wrapped, 'function', name);
+    const viaHook = await wrapped(req);
+    const direct = await (prompt as (request: unknown) => Promise<unknown>)(req);
+    assert.deepStrictEqual(viaHook, direct);
+    assert.strictEqual(shown.length, 2, 'диалог показан и через хук, и напрямую');
+    assert.strictEqual(shown[0][0], shown[1][0], 'тот же текст вопроса');
+  }
+
   async function setOperationMode(value: string | undefined): Promise<void> {
     await vscode.workspace.getConfiguration('v8vscedit.configuration').update('operationMode', value, vscode.ConfigurationTarget.Global);
   }
@@ -232,7 +260,7 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
     assert.strictEqual(ok, true);
     assert.strictEqual(captured.length, 1);
     assert.deepStrictEqual(captured[0].target, { kind: 'cf', name: 'Основная', rootPath: path.join(tmp, 'src', 'cf') });
-    assert.strictEqual(captured[0].hooks.confirmMirrorSeed, promptMirrorSeed);
+    await assertWrapsPrompt('confirmMirrorSeed', seedRequest(), promptMirrorSeed);
   });
 
   test('runDecompileExtension: importFromDatabase получает хук promptMirrorSeed', async () => {
@@ -241,7 +269,7 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
     assert.strictEqual(captured.length, 1);
     assert.strictEqual(captured[0].target.kind, 'cfe');
     assert.strictEqual(captured[0].target.extensionName, 'Расш');
-    assert.strictEqual(captured[0].hooks.confirmMirrorSeed, promptMirrorSeed);
+    await assertWrapsPrompt('confirmMirrorSeed', seedRequest(), promptMirrorSeed);
   });
 
   test('runAgentConfigurationOperation: confirmMirrorSeed из опций попадает в хуки; без опции хука нет (импорт без диалога)', async () => {
@@ -249,32 +277,36 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
       progressTitle: 'Импорт', progressStartMessage: 'старт', successMessage: 'Готово', errorTitle: 'Сбой',
       showSuccessMessage: false, workspaceFolder: folder, outputChannel: channel, rootPath: tmp,
     };
-    const custom = (): Promise<'full'> => Promise.resolve('full');
+    const received: unknown[] = [];
+    const custom = (req: AgentMirrorSeedRequest): Promise<'full'> => { received.push(req); return Promise.resolve('full'); };
+    const answers: unknown[] = [];
     const seen: unknown[] = [];
-    await runAgentConfigurationOperation({ ...base, confirmMirrorSeed: custom }, (_service, hooks) => {
-      seen.push((hooks as unknown as Record<string, unknown>).confirmMirrorSeed);
-      return Promise.resolve();
+    await runAgentConfigurationOperation({ ...base, confirmMirrorSeed: custom }, async (_service, hooks) => {
+      // Хук обёрнут (журнал ожидания), но вызывает именно переданный и возвращает его ответ.
+      answers.push(await hooks.confirmMirrorSeed?.(request()));
     });
     await runAgentConfigurationOperation(base, (_service, hooks) => {
       seen.push((hooks as unknown as Record<string, unknown>).confirmMirrorSeed);
       return Promise.resolve();
     });
-    assert.strictEqual(seen[0], custom);
-    assert.strictEqual(seen[1], undefined);
+    assert.deepStrictEqual(answers, ['full']);
+    assert.strictEqual(received.length, 1);
+    assert.strictEqual((received[0] as AgentMirrorSeedRequest).targetName, request().targetName);
+    assert.strictEqual(seen[0], undefined);
   });
 
   test('runDecompileMainConfiguration: importFromDatabase получает хуки promptFullDump и promptOrphanRemoval', async () => {
     const ok = await runDecompileMainConfiguration('Основная', path.join(tmp, 'src', 'cf'), folder, channel);
     assert.strictEqual(ok, true);
-    assert.strictEqual(captured[0].hooks.confirmFullDump, promptFullDump);
-    assert.strictEqual(captured[0].hooks.confirmOrphanRemoval, promptOrphanRemoval);
+    await assertWrapsPrompt('confirmFullDump', fullDumpRequest(), promptFullDump);
+    await assertWrapsPrompt('confirmOrphanRemoval', orphansRequest(), promptOrphanRemoval);
   });
 
   test('runDecompileExtension: importFromDatabase получает хуки promptFullDump и promptOrphanRemoval', async () => {
     const ok = await runDecompileExtension('Расш', path.join(tmp, 'src', 'cfe', 'Расш'), folder, channel);
     assert.strictEqual(ok, true);
-    assert.strictEqual(captured[0].hooks.confirmFullDump, promptFullDump);
-    assert.strictEqual(captured[0].hooks.confirmOrphanRemoval, promptOrphanRemoval);
+    await assertWrapsPrompt('confirmFullDump', fullDumpRequest(), promptFullDump);
+    await assertWrapsPrompt('confirmOrphanRemoval', orphansRequest(), promptOrphanRemoval);
   });
 
   test('runAgentConfigurationOperation: confirmFullDump/confirmOrphanRemoval из опций попадают в хуки; без опций хуков нет', async () => {
@@ -282,16 +314,19 @@ suite('Проброс confirmMirrorSeed в хуки агентской опер�
       progressTitle: 'Импорт', progressStartMessage: 'старт', successMessage: 'Готово', errorTitle: 'Сбой',
       showSuccessMessage: false, workspaceFolder: folder, outputChannel: channel, rootPath: tmp,
     };
-    const fullDump = (): Promise<'dump'> => Promise.resolve('dump');
-    const orphans = (): Promise<boolean> => Promise.resolve(true);
+    const calls: string[] = [];
+    const fullDump = (): Promise<'dump'> => { calls.push('fullDump'); return Promise.resolve('dump'); };
+    const orphans = (): Promise<boolean> => { calls.push('orphans'); return Promise.resolve(true); };
+    const answers: unknown[] = [];
+    await runAgentConfigurationOperation({ ...base, confirmFullDump: fullDump, confirmOrphanRemoval: orphans }, async (_service, hooks) => {
+      answers.push(await hooks.confirmFullDump?.(fullDumpRequest()), await hooks.confirmOrphanRemoval?.(orphansRequest()));
+    });
     const seen: Record<string, unknown>[] = [];
-    const record = (_service: unknown, hooks: unknown): Promise<void> => { seen.push(hooks as Record<string, unknown>); return Promise.resolve(); };
-    await runAgentConfigurationOperation({ ...base, confirmFullDump: fullDump, confirmOrphanRemoval: orphans }, record);
-    await runAgentConfigurationOperation(base, record);
-    assert.strictEqual(seen[0].confirmFullDump, fullDump);
-    assert.strictEqual(seen[0].confirmOrphanRemoval, orphans);
-    assert.strictEqual(seen[1].confirmFullDump, undefined);
-    assert.strictEqual(seen[1].confirmOrphanRemoval, undefined);
+    await runAgentConfigurationOperation(base, (_service, hooks) => { seen.push(hooks as unknown as Record<string, unknown>); return Promise.resolve(); });
+    assert.deepStrictEqual(calls, ['fullDump', 'orphans']);
+    assert.deepStrictEqual(answers, ['dump', true]);
+    assert.strictEqual(seen[0].confirmFullDump, undefined);
+    assert.strictEqual(seen[0].confirmOrphanRemoval, undefined);
   });
 
   test('отказ от полной выгрузки (AgentFullDumpDeclinedError): информационное сообщение с инструкцией, без тоста ошибки и диагностики, возврат false', async () => {

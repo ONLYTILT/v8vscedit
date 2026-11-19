@@ -18,6 +18,7 @@ import { AgentWorkspaceService, buildAgentProjectId } from '../../../infra/agent
 import type { AgentFileEntry } from '../../../infra/agent/files/AgentFileStore';
 import { createLocalExchange, type LocalExchange } from '../../../infra/agent/sync/LocalExchange';
 import type { SyncOperationContext } from '../../../infra/agent/sync/SyncContext';
+import { createSyncProgress } from '../../../infra/agent/sync/SyncProgress';
 import type { AgentConfigEmulator } from './agentConfigEmulator';
 import { DelegatingAgentFileStore } from './delegatingAgentFileStore';
 import { HARNESS_EXTENSION_NAME, type SyncHarness } from './agentSyncHarness';
@@ -218,6 +219,7 @@ export async function makeContext(
     exec: h.exec,
     target: h.target,
     hooks: options.hooks,
+    progress: createSyncProgress(options.hooks, () => 0),
     workspace,
     workspaceService,
     extensionName,

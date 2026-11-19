@@ -89,7 +89,8 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
   teardown(async () => { await h.dispose(); });
 
   function sftpOpens(): string[] {
-    return (h.sftp?.ops('OPEN') ?? []).map((entry) => entry.path ?? '');
+    // Метка времени сервера (`exchange/<op>.marker`) — запись, а не скачивание: в счёт не идёт.
+    return (h.sftp?.ops('OPEN') ?? []).map((entry) => entry.path ?? '').filter((p) => !/^exchange\/[^/]+\.marker/.test(p));
   }
 
   for (const kind of ['cf', 'cfe'] as const) {

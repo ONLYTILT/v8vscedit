@@ -122,6 +122,7 @@ export async function runDecompileExtension(
       confirmMirrorSeed: promptMirrorSeed,
       confirmFullDump: promptFullDump,
       confirmOrphanRemoval: promptOrphanRemoval,
+      cancellable: true,
     },
     async (service, operationHooks) => {
       await service.importFromDatabase(
@@ -157,6 +158,7 @@ export async function runDecompileMainConfiguration(
       confirmMirrorSeed: promptMirrorSeed,
       confirmFullDump: promptFullDump,
       confirmOrphanRemoval: promptOrphanRemoval,
+      cancellable: true,
     },
     async (service, operationHooks) => {
       await service.importFromDatabase(

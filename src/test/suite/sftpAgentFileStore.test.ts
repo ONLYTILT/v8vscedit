@@ -802,3 +802,46 @@ suite('SftpAgentFileStore: общий бюджет открытых катало
     assert.strictEqual(fs.existsSync(path.join(env.root, 'rm01')), true);
   });
 });
+
+suite('SftpAgentFileStore: время изменения', () => {
+  let env: Env;
+  let store: SftpAgentFileStore;
+
+  setup(async () => {
+    env = await createEnv();
+    store = await env.open();
+    fs.mkdirSync(path.join(env.root, 'd'));
+    fs.writeFileSync(path.join(env.root, 'd', 'f.txt'), 'x');
+  });
+  teardown(async () => { await env.dispose(); });
+
+  function backend(): NonNullable<AgentSshTestServer['sftp']> {
+    assert.ok(env.server.sftp);
+    return env.server.sftp;
+  }
+
+  test('сервер без ACMODTIME (attrsWithoutTimes): mtimeMs не задан у stat, list (файл и каталог), размер и тип сохранены', async () => {
+    backend().attrsWithoutTimes = true;
+    const file = await store.stat('d/f.txt');
+    assert.deepStrictEqual({ path: file?.path, type: file?.type, size: file?.size }, { path: 'd/f.txt', type: 'file', size: 1 });
+    assert.strictEqual(file?.mtimeMs, undefined);
+    assert.strictEqual((await store.stat('d'))?.mtimeMs, undefined);
+    for (const entry of await store.list('', { recursive: true })) {
+      assert.strictEqual(entry.mtimeMs, undefined, entry.path);
+    }
+  });
+
+  test('mtimeMs у SFTP — целые секунды, умноженные на 1000', async () => {
+    const entry = await store.stat('d/f.txt');
+    assert.ok(entry?.mtimeMs !== undefined);
+    assert.strictEqual(entry.mtimeMs % 1000, 0);
+  });
+
+  test('сдвиг серверных времён (mtimeShiftSec) виден в mtimeMs ровно на сдвиг: хранилище отдаёт время сервера как есть', async () => {
+    const before = (await store.stat('d/f.txt'))?.mtimeMs;
+    backend().mtimeShiftSec = -3600;
+    const shifted = (await store.stat('d/f.txt'))?.mtimeMs;
+    assert.ok(before !== undefined && shifted !== undefined);
+    assert.strictEqual(before - shifted, 3_600_000);
+  });
+});

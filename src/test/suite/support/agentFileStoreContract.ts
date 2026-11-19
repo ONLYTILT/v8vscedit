@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AgentFileStore } from '../../../infra/agent/files/AgentFileStore';
+import type { AgentFileEntry, AgentFileStore } from '../../../infra/agent/files/AgentFileStore';
 import { AgentTransferCancelledError } from '../../../infra/agent/files/AgentFileTransfer';
 import { IO_CHUNK, IO_WINDOW } from '../../../infra/agent/files/SftpChunkedIo';
 import { patternBytes } from './zipFixtures';
@@ -22,6 +22,18 @@ export interface AgentFileStoreFixture {
   /** Журнал запросов к серверу (SFTP): граничные проверки обязаны отвергать путь ДО обращения. */
   readonly requestCount?: () => number;
   dispose(): Promise<void>;
+}
+
+/**
+ * Запись без времени изменения: форма (путь, тип, размер) сверяется как прежде, а наличие числового `mtimeMs`
+ * проверяется здесь же — ослабления прежних ассёртов нет.
+ */
+export function withoutMtime(entry: AgentFileEntry | undefined): Omit<AgentFileEntry, 'mtimeMs'> | undefined {
+  if (entry === undefined) {
+    return undefined;
+  }
+  assert.ok(typeof entry.mtimeMs === 'number' && Number.isFinite(entry.mtimeMs), `у ${entry.path} нет mtimeMs`);
+  return { path: entry.path, type: entry.type, size: entry.size };
 }
 
 export function defineAgentFileStoreContract(label: string, create: () => Promise<AgentFileStoreFixture>): void {
@@ -53,7 +65,7 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
       test('пустой файл: пишется, читается пустым, stat.size = 0', async () => {
         await store.writeFile('e/empty.txt', '');
         assert.strictEqual((await store.readFile('e/empty.txt')).length, 0);
-        assert.deepStrictEqual(await store.stat('e/empty.txt'), { path: 'e/empty.txt', type: 'file', size: 0 });
+        assert.deepStrictEqual(withoutMtime(await store.stat('e/empty.txt')), { path: 'e/empty.txt', type: 'file', size: 0 });
         await store.writeFile('e/empty.bin', new Uint8Array(0));
         assert.strictEqual((await store.readFile('e/empty.bin')).length, 0);
       });
@@ -63,7 +75,7 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
         await store.writeFile(rel, 'содержимое');
         assert.strictEqual(fs.readFileSync(path.join(root, ...rel.split('/')), 'utf-8'), 'содержимое');
         assert.strictEqual((await store.readFile(rel)).toString('utf-8'), 'содержимое');
-        assert.deepStrictEqual(await store.stat(rel), { path: rel, type: 'file', size: Buffer.byteLength('содержимое') });
+        assert.deepStrictEqual(withoutMtime(await store.stat(rel)), { path: rel, type: 'file', size: Buffer.byteLength('содержимое') });
       });
 
       test('перезапись существующего файла заменяет содержимое и не оставляет временных файлов', async () => {
@@ -94,7 +106,7 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
     suite('stat', () => {
       test('файл: type=file, size в байтах, path как передан (POSIX)', async () => {
         await store.writeFile('d/Файл.txt', 'абв');
-        assert.deepStrictEqual(await store.stat('d/Файл.txt'), { path: 'd/Файл.txt', type: 'file', size: 6 });
+        assert.deepStrictEqual(withoutMtime(await store.stat('d/Файл.txt')), { path: 'd/Файл.txt', type: 'file', size: 6 });
       });
 
       test('каталог: type=dir; хвостовой слэш не мешает', async () => {
@@ -106,7 +118,7 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
       });
 
       test('корень ("" и ".") — каталог с пустым путём', async () => {
-        assert.deepStrictEqual(await store.stat(''), { path: '', type: 'dir', size: 0 });
+        assert.deepStrictEqual(withoutMtime(await store.stat('')), { path: '', type: 'dir', size: 0 });
         assert.strictEqual((await store.stat('.'))?.type, 'dir');
       });
 
@@ -122,6 +134,39 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
       test('файл как промежуточный каталог → undefined', async () => {
         await store.writeFile('f.txt', '1');
         assert.strictEqual(await store.stat('f.txt/child'), undefined);
+      });
+    });
+
+    suite('время изменения (mtimeMs)', () => {
+      test('stat и list отдают числовой mtimeMs файла и каталога; значения совпадают с точностью до секунды', async () => {
+        await store.writeFile('t/f.txt', '1');
+        const fromStat = await store.stat('t/f.txt');
+        const listed = (await store.list('t')).find((entry) => entry.path === 't/f.txt');
+        assert.ok(typeof fromStat?.mtimeMs === 'number' && typeof listed?.mtimeMs === 'number');
+        assert.strictEqual(Math.floor(fromStat.mtimeMs / 1000), Math.floor(listed.mtimeMs / 1000));
+        assert.ok(Math.abs(fromStat.mtimeMs - fs.statSync(path.join(root, 't', 'f.txt')).mtimeMs) < 1000, 'время хранилища = времени ФС до секунды');
+        assert.strictEqual(typeof (await store.stat('t'))?.mtimeMs, 'number');
+        assert.strictEqual(typeof (await store.list('', { recursive: true })).find((entry) => entry.path === 't')?.mtimeMs, 'number');
+      });
+
+      test('файл, записанный после записи метки, имеет секунду mtime не меньше секунды метки', async () => {
+        await store.writeFile('m/marker', '');
+        const marker = await store.stat('m/marker');
+        await store.writeFile('m/after.txt', 'x');
+        const after = await store.stat('m/after.txt');
+        assert.ok(marker?.mtimeMs !== undefined && after?.mtimeMs !== undefined);
+        assert.ok(Math.floor(after.mtimeMs / 1000) >= Math.floor(marker.mtimeMs / 1000));
+      });
+
+      test('файл со старым временем (utimes в прошлое) отличается от метки не менее чем на час, и это видно через хранилище', async () => {
+        await store.writeFile('m/marker', '');
+        await store.writeFile('m/old.txt', 'x');
+        const past = Date.now() / 1000 - 7200;
+        fs.utimesSync(path.join(root, 'm', 'old.txt'), past, past);
+        const marker = await store.stat('m/marker');
+        const old = await store.stat('m/old.txt');
+        assert.ok(marker?.mtimeMs !== undefined && old?.mtimeMs !== undefined);
+        assert.ok(marker.mtimeMs - old.mtimeMs > 3_000_000, `${String(marker.mtimeMs)} против ${String(old.mtimeMs)}`);
       });
     });
 
@@ -209,7 +254,7 @@ export function defineAgentFileStoreContract(label: string, create: () => Promis
       });
 
       test('нерекурсивный: прямые дети, пути от корня хранилища, сортировка по пути', async () => {
-        assert.deepStrictEqual(await store.list('w'), [
+        assert.deepStrictEqual((await store.list('w')).map(withoutMtime), [
           { path: 'w/a.txt', type: 'file', size: 2 },
           { path: 'w/b.txt', type: 'file', size: 1 },
           { path: 'w/sub', type: 'dir', size: 0 },

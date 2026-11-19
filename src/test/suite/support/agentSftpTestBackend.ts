@@ -84,6 +84,14 @@ export class SftpTestBackend {
   recursiveRmdir = true;
   /** Ответ READ не длиннее этого числа байт (SFTP разрешает серверу отвечать короче запроса). */
   readResponseLimit: number | undefined;
+  /** STAT/LSTAT/READDIR отвечают без времён (флаг ACMODTIME не выставлен — SFTP v3 это допускает). */
+  attrsWithoutTimes = false;
+  /**
+   * Сдвиг ВСЕХ отдаваемых времён, секунд: модель сервера, чьё «UTC» — местное время (факт Э23: сдвиг ~1 ч
+   * относительно клиента). Сдвигаются и метка, и файлы, поэтому сравнение с меткой остаётся верным, а
+   * сравнение с часами клиента — нет.
+   */
+  mtimeShiftSec = 0;
   /** FSTAT отвечает без размера (флаг SIZE не выставлен — SFTP v3 это допускает). */
   fstatWithoutSize = false;
   /**
@@ -273,7 +281,7 @@ export class SftpTestBackend {
           status(reqId, STATUS_CODE.FAILURE);
           return;
         }
-        const attrs = toAttributes(fs.fstatSync(open.fd));
+        const attrs = this.attrsOf(fs.fstatSync(open.fd));
         // Тип ssh2 требует size, но кодировщик ответа выставляет флаг SIZE только для числа —
         // так эмулируется сервер, не сообщающий размер.
         sftp.attrs(reqId, this.fstatWithoutSize ? { ...attrs, size: undefined as unknown as number } : attrs);
@@ -285,11 +293,11 @@ export class SftpTestBackend {
 
     sftp.on('STAT', (reqId, p) => {
       const rel = this.toRel(p);
-      handle(reqId, { op: 'STAT', path: rel }, () => sftp.attrs(reqId, toAttributes(fs.statSync(this.toAbs(rel)))));
+      handle(reqId, { op: 'STAT', path: rel }, () => sftp.attrs(reqId, this.attrsOf(fs.statSync(this.toAbs(rel)))));
     });
     sftp.on('LSTAT', (reqId, p) => {
       const rel = this.toRel(p);
-      handle(reqId, { op: 'LSTAT', path: rel }, () => sftp.attrs(reqId, toAttributes(fs.lstatSync(this.toAbs(rel)))));
+      handle(reqId, { op: 'LSTAT', path: rel }, () => sftp.attrs(reqId, this.attrsOf(fs.lstatSync(this.toAbs(rel)))));
     });
 
     sftp.on('MKDIR', (reqId, p) => {
@@ -359,7 +367,7 @@ export class SftpTestBackend {
         const entries: FileEntry[] = names.map((name) => ({
           filename: name,
           longname: name,
-          attrs: toAttributes(fs.lstatSync(path.join(abs, name))),
+          attrs: this.attrsOf(fs.lstatSync(path.join(abs, name))),
         }));
         this.openDirs += 1;
         this.maxOpenDirs = Math.max(this.maxOpenDirs, this.openDirs);
@@ -391,6 +399,15 @@ export class SftpTestBackend {
         sftp.name(reqId, [{ filename, longname: filename, attrs: { mode: 0, uid: 0, gid: 0, size: 0, atime: 0, mtime: 0 } }]);
       });
     });
+  }
+
+  private attrsOf(stats: fs.Stats): Attributes {
+    const attrs = toAttributes(stats);
+    if (this.attrsWithoutTimes) {
+      // Тип ssh2 требует числа, но кодировщик выставляет ACMODTIME только для чисел.
+      return { ...attrs, atime: undefined as unknown as number, mtime: undefined as unknown as number };
+    }
+    return { ...attrs, atime: attrs.atime + this.mtimeShiftSec, mtime: attrs.mtime + this.mtimeShiftSec };
   }
 
   /** Путь клиента → нормализованный относительный POSIX-путь внутри корня (выход наверх невозможен). */

@@ -140,6 +140,11 @@ export class AgentConfigEmulator {
   infoOnlyDumps = 0;
   /** Версия формата в заголовке ConfigDumpInfo.xml и `MetaDataObject version` Configuration.xml. */
   formatVersion = '2.20';
+  /**
+   * Модель «платформа не обновила время изменения»: после `dump --update` (без `--get-changes`) все файлы M
+   * получают mtime в прошлом, хотя содержимое переписано. Нужна проверке растяжки отбора по времени.
+   */
+  preserveMtimeOnUpdate = false;
   /** Если возвращает Error — команда падает с ним. */
   failWhen: ((command: ParsedAgentCommand) => Error | undefined) | undefined;
 
@@ -306,6 +311,9 @@ export class AgentConfigEmulator {
     switch (cmd.command) {
       case 'config dump-config-to-files':
         this.dump(cmd);
+        if (this.preserveMtimeOnUpdate && cmd.options.update === true && !hasOption(cmd, 'get-changes')) {
+          ageAgentTree(this.abs(this.requireOption(cmd, 'dir')));
+        }
         return;
       case 'config load-config-from-files':
         this.load(cmd);
@@ -767,6 +775,21 @@ function fileSubobjects(owner: string, object: EmulatedObject): [string, string[
     }
   }
   return [...groups].sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : 0));
+}
+
+/**
+ * Состаривает все файлы дерева: mtime и atime уходят на `seconds` секунд в прошлое. M в тестах пишется
+ * настоящей ФС, поэтому «нетронутый файл» моделируется старением, а не подменой часов: метка и переписанные
+ * после неё файлы получают реальное «сейчас».
+ */
+export function ageAgentTree(root: string, seconds = 3600): void {
+  if (!fs.existsSync(root)) {
+    return;
+  }
+  const past = Date.now() / 1000 - seconds;
+  walkFiles(root, '', (rel) => {
+    fs.utimesSync(path.join(root, ...rel.split('/')), past, past);
+  });
 }
 
 /** Удаление дерева без fs.rmSync: на Windows с Node 24 rmSync молча не удаляет файлы с кириллицей в имени. */

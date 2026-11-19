@@ -105,7 +105,8 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       const result = await doImport();
       assert.strictEqual(result.strategy, 'delta');
       assert.deepStrictEqual(result.changedProjectFiles, []);
-      const opened = (h.sftp?.ops('OPEN') ?? []).map((e) => e.path ?? '');
+      // Метка времени сервера (`exchange/<op>.marker`) — запись, а не скачивание: в счёт не идёт.
+      const opened = (h.sftp?.ops('OPEN') ?? []).map((e) => e.path ?? '').filter((p) => !/^exchange\/[^/]+\.marker/.test(p));
       assert.ok(opened.every((p) => /^exchange\/[^/]+\.changes$/.test(p)), opened.join(' | '));
     });
 
