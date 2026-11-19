@@ -13,6 +13,18 @@ export class DesignerAgentSessionManager implements ResettableDesignerAgentTrans
   ) {}
 
   async create(sessionKey: string): Promise<DesignerAgentTransport> {
+    const cached = this.sessions.get(sessionKey);
+    if (cached) {
+      const transport = await cached;
+      if (!transport.isClosed?.()) {
+        return transport;
+      }
+      // Соединение потеряно между командами: новый транспорт обязан пройти `options set`
+      // (иначе ответы агента не JSON). Запись снимаем, только если её не заменил параллельный вызов.
+      if (this.sessions.get(sessionKey) === cached) {
+        this.sessions.delete(sessionKey);
+      }
+    }
     let session = this.sessions.get(sessionKey);
     if (!session) {
       session = this.createConfiguredSession(sessionKey).catch((error: unknown) => {
@@ -48,15 +60,21 @@ export class DesignerAgentSessionManager implements ResettableDesignerAgentTrans
 
   private async createConfiguredSession(sessionKey: string): Promise<DesignerAgentTransport> {
     const transport = await this.innerFactory.create(sessionKey);
-    await transport.execute(
-      [
-        'options set',
-        '--output-format=json',
-        '--show-prompt=no',
-        '--notify-progress=yes',
-        `--notify-progress-interval=${String(this.options.notifyProgressInterval ?? 0.5)}`,
-      ].join(' ')
-    );
+    await transport.execute(buildAgentSessionOptionsCommand(this.options.notifyProgressInterval ?? 0.5));
     return transport;
   }
+}
+
+/**
+ * Настройка свежей SSH-сессии агента: без `--output-format=json` ответы агента не разбираются.
+ * Общая для менеджера сессий и разовой проверки подключения.
+ */
+export function buildAgentSessionOptionsCommand(notifyProgressInterval: number): string {
+  return [
+    'options set',
+    '--output-format=json',
+    '--show-prompt=no',
+    '--notify-progress=yes',
+    `--notify-progress-interval=${String(notifyProgressInterval)}`,
+  ].join(' ');
 }

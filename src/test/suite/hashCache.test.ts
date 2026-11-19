@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -6,6 +7,8 @@ import {
   buildHashSnapshot,
   buildScopeKey,
   diffHashSnapshots,
+  hasHashBaseline,
+  hashContent,
   loadHashCache,
   saveHashCache,
 } from '../../infra/cache/HashCache';
@@ -96,6 +99,27 @@ suite('HashCache', () => {
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  test('hashContent: sha1 содержимого в hex — тот же хеш, что пишет buildHashSnapshot', () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-hash-content-'));
+    try {
+      const content = Buffer.from('<Catalog>Тест</Catalog>', 'utf-8');
+      fs.writeFileSync(path.join(tempRoot, 'Тест.xml'), content);
+      const expected = createHash('sha1').update(content).digest('hex');
+      assert.strictEqual(hashContent(content), expected);
+      assert.strictEqual(buildHashSnapshot('cf::tmp', tempRoot).files['Тест.xml'], expected);
+      assert.strictEqual(hashContent(new Uint8Array()), createHash('sha1').update(Buffer.alloc(0)).digest('hex'));
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('hasHashBaseline: базовая линия есть, если задан generatedAt или есть хотя бы один файл', () => {
+    const base = { schemaVersion: 1 as const, scopeKey: 'cf::x', generatedAt: '', files: {} };
+    assert.strictEqual(hasHashBaseline(base), false, 'пустой снимок (loadHashCache без файла)');
+    assert.strictEqual(hasHashBaseline({ ...base, generatedAt: '2026-11-18T00:00:00.000Z' }), true, 'пустая выгрузка, но линия снята');
+    assert.strictEqual(hasHashBaseline({ ...base, files: { 'a.xml': 'h' } }), true, 'файлы без generatedAt');
   });
 });
 

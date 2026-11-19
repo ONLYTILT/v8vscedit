@@ -2,8 +2,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { globSync } from 'glob';
+import { assertNotOnecStarter } from './V8ExecutableGuard';
 
 const WINDOWS_EXECUTABLE = '1cv8.exe';
+const V8_PATH_SOURCE = 'Путь к платформе 1С (--path в env.json)';
 const UNIX_EXECUTABLES = ['1cv8', '1cv8c'] as const;
 
 export interface InstalledOnecPlatform {
@@ -18,6 +20,15 @@ export interface InstalledOnecPlatform {
  */
 export function resolveV8ExecutablePath(v8Path: string, platform: NodeJS.Platform = process.platform): string {
   const explicitPath = trimOuterQuotes(v8Path).trim();
+  // Стартер отвергается до разбора, чтобы пользователь получил объяснение, а не общее «не найден»;
+  // результат проверяется ещё раз: ветка PATH отдаёт найденный файл без сверки имени.
+  assertNotOnecStarter(explicitPath, V8_PATH_SOURCE);
+  const resolved = resolveV8ExecutablePathUnchecked(explicitPath, platform);
+  assertNotOnecStarter(resolved, V8_PATH_SOURCE);
+  return resolved;
+}
+
+function resolveV8ExecutablePathUnchecked(explicitPath: string, platform: NodeJS.Platform): string {
   if (explicitPath) {
     return resolveExplicitV8Path(explicitPath, platform);
   }
@@ -322,7 +333,9 @@ function isAllowedExecutable(filePath: string, platform: NodeJS.Platform): boole
   const executableNames = platform === 'win32'
     ? [WINDOWS_EXECUTABLE]
     : [...UNIX_EXECUTABLES];
-  return executableNames.includes(path.basename(filePath));
+  // Имена файлов Windows регистронезависимы: `1CV8.EXE` — тот же Конфигуратор.
+  const name = platform === 'win32' ? path.basename(filePath).toLowerCase() : path.basename(filePath);
+  return executableNames.includes(name);
 }
 
 function executablePriority(filePath: string): number {

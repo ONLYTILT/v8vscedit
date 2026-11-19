@@ -1,17 +1,36 @@
-import * as path from 'path';
+import * as fs from 'fs';
 import type { CliArgs } from '../core/types';
 import { resolveConnection } from '../core/connection';
-import {
-  appendRepositoryArgs,
-  createTempDir,
-  printLogFile,
-  type RepositoryConnection,
-  runDesignerAndPrintResult,
-  safeRemoveDir,
-} from '../core/onecCommon';
+import { moveStagingToTarget, printLogText } from '../core/onecCommon';
 import { getBool, getRequiredString, getString } from '../core/args';
+import type {
+  DesignerBatchExecutor,
+  DesignerBatchRequest,
+  DesignerBatchResult,
+} from '../../infra/process/designer/DesignerBatchExecutor';
+import { LocalDesignerBatchExecutor } from '../../infra/process/designer/LocalDesignerBatchExecutor';
+import {
+  buildRepositoryDesignerRequest,
+  repositoryOperationOutputName,
+  type RepositoryOperation,
+} from '../../infra/repository/RepositoryDesignerArgs';
+import type { RepositoryBinding } from '../../infra/repository/RepositoryService';
 
-function resolveRepositoryConnection(args: CliArgs): RepositoryConnection {
+export type RepositoryCliCommand =
+  | 'repository-create'
+  | 'repository-bind'
+  | 'repository-unbind'
+  | 'repository-lock'
+  | 'repository-unlock'
+  | 'repository-commit'
+  | 'repository-update'
+  | 'repository-add-user'
+  | 'repository-copy-users'
+  | 'repository-dump'
+  | 'repository-report'
+  | 'repository-set-label';
+
+function resolveRepositoryBinding(args: CliArgs): RepositoryBinding {
   const repoPath = getRequiredString(args, 'RepoPath');
   const repoUser = getRequiredString(args, 'RepoUser');
   return {
@@ -21,328 +40,273 @@ function resolveRepositoryConnection(args: CliArgs): RepositoryConnection {
   };
 }
 
-function appendRepositoryCommandArgs(args: string[], repository: RepositoryConnection): void {
-  appendRepositoryArgs(args, repository);
+/**
+ * Содержимое `-ObjectsFile` уходит в запрос БАЙТАМИ: чтение как UTF-8 испортило бы
+ * файл в UTF-16/cp1251 (BOM и кириллица), а кодировку файла задаёт вызывающий.
+ */
+function readObjectsXml(args: CliArgs): Uint8Array | undefined {
+  const objectsFile = getString(args, 'ObjectsFile', '');
+  return objectsFile ? fs.readFileSync(objectsFile) : undefined;
 }
 
-async function executeRepositoryCommand(
-  args: CliArgs,
-  commandArgs: string[],
-  successMessage: string,
-  errorMessage: string,
-  logFileName: string
-): Promise<number> {
+/**
+ * Разбор аргументов CLI в типизированную операцию. `-File` у dump/report
+ * обязателен, но в операцию не входит: выходной файл объявляет построитель, а
+ * перенос на `-File` делает CLI после успешного завершения.
+ */
+export function parseRepositoryOperation(command: RepositoryCliCommand, args: CliArgs): RepositoryOperation {
+  switch (command) {
+    case 'repository-create':
+      return {
+        kind: 'create',
+        allowConfigurationChanges: getBool(args, 'AllowConfigurationChanges'),
+        changesAllowedRule: getString(args, 'ChangesAllowedRule', ''),
+        changesNotRecommendedRule: getString(args, 'ChangesNotRecommendedRule', ''),
+        noBind: getBool(args, 'NoBind'),
+      };
+    case 'repository-bind':
+      return {
+        kind: 'bind',
+        forceBindAlreadyBindedUser: getBool(args, 'ForceBindAlreadyBindedUser'),
+        forceReplaceCfg: getBool(args, 'ForceReplaceCfg'),
+      };
+    case 'repository-unbind':
+      return { kind: 'unbind', force: getBool(args, 'Force') };
+    case 'repository-lock':
+      return { kind: 'lock', objectsXml: readObjectsXml(args), revised: getBool(args, 'Revised') };
+    case 'repository-unlock':
+      return { kind: 'unlock', objectsXml: readObjectsXml(args), force: getBool(args, 'Force') };
+    case 'repository-commit':
+      return {
+        kind: 'commit',
+        objectsXml: readObjectsXml(args),
+        comment: getString(args, 'Comment', ''),
+        keepLocked: getBool(args, 'KeepLocked'),
+        force: getBool(args, 'Force'),
+      };
+    case 'repository-update':
+      return {
+        kind: 'update',
+        objectsXml: readObjectsXml(args),
+        version: getString(args, 'Version', ''),
+        force: getBool(args, 'Force'),
+      };
+    case 'repository-add-user': {
+      const user = getRequiredString(args, 'User');
+      const password = getRequiredString(args, 'Pwd');
+      const rights = getRequiredString(args, 'Rights');
+      return { kind: 'addUser', user, password, rights, restoreDeletedUser: getBool(args, 'RestoreDeletedUser') };
+    }
+    case 'repository-copy-users': {
+      const sourcePath = getRequiredString(args, 'Path');
+      const user = getRequiredString(args, 'User');
+      const password = getRequiredString(args, 'Pwd');
+      return {
+        kind: 'copyUsers',
+        path: sourcePath,
+        user,
+        password,
+        restoreDeletedUser: getBool(args, 'RestoreDeletedUser'),
+      };
+    }
+    case 'repository-dump':
+      getRequiredString(args, 'File');
+      return { kind: 'dump', version: getString(args, 'Version', '') };
+    case 'repository-report':
+      getRequiredString(args, 'File');
+      return {
+        kind: 'report',
+        nBegin: getString(args, 'NBegin', ''),
+        nEnd: getString(args, 'NEnd', ''),
+        dateBegin: getString(args, 'DateBegin', ''),
+        dateEnd: getString(args, 'DateEnd', ''),
+        configurationVersion: getString(args, 'ConfigurationVersion', ''),
+        reportFormat: getString(args, 'ReportFormat', ''),
+        groupByObject: getBool(args, 'GroupByObject'),
+        groupByComment: getBool(args, 'GroupByComment'),
+        doNotIncludeVersionsWithLabels: getBool(args, 'DoNotIncludeVersionsWithLabels'),
+        includeOnlyVersionsWithLabels: getBool(args, 'IncludeOnlyVersionsWithLabels'),
+        includeCommentLinesWithDoubleSlash: getBool(args, 'IncludeCommentLinesWithDoubleSlash'),
+      };
+    case 'repository-set-label':
+      return {
+        kind: 'setLabel',
+        name: getRequiredString(args, 'LabelName'),
+        version: getString(args, 'Version', ''),
+        comment: getString(args, 'Comment', ''),
+      };
+  }
+}
+
+function buildRepositoryCliRun(
+  command: RepositoryCliCommand,
+  args: CliArgs
+): { request: DesignerBatchRequest; operation: RepositoryOperation } {
   const connection = resolveConnection(args);
-  const repository = resolveRepositoryConnection(args);
-  const extension = getString(args, 'Extension', '');
-  const verbose = getBool(args, 'Verbose');
-  const tempDir = createTempDir('repo_');
-  const outFile = path.join(tempDir, logFileName);
+  const binding = resolveRepositoryBinding(args);
+  const operation = parseRepositoryOperation(command, args);
+  const request = buildRepositoryDesignerRequest(connection, binding, operation, getString(args, 'Extension', ''));
+  return { request, operation };
+}
 
+/** Запрос пакетного конфигуратора из аргументов CLI — тем же построителем, что и в расширении. */
+export function buildRepositoryCliRequest(command: RepositoryCliCommand, args: CliArgs): DesignerBatchRequest {
+  return buildRepositoryCliRun(command, args).request;
+}
+
+/** Сообщения CLI по командам: успех — для человека, ошибка — для разбора вызывающим скриптом. */
+export const REPOSITORY_CLI_MESSAGES: Readonly<Record<RepositoryCliCommand, { success: string; error: string }>> = {
+  'repository-create': { success: 'Создание хранилища завершено', error: 'Error creating configuration repository' },
+  'repository-bind': { success: 'Подключение к хранилищу завершено', error: 'Error binding configuration repository' },
+  'repository-unbind': { success: 'Отключение от хранилища завершено', error: 'Error unbinding configuration repository' },
+  'repository-lock': { success: 'Захват объектов завершен', error: 'Error locking repository objects' },
+  'repository-unlock': { success: 'Освобождение объектов завершено', error: 'Error unlocking repository objects' },
+  'repository-commit': { success: 'Помещение изменений завершено', error: 'Error committing repository objects' },
+  'repository-update': {
+    success: 'Получение объектов из хранилища завершено',
+    error: 'Error updating configuration from repository',
+  },
+  'repository-add-user': { success: 'Добавление пользователя завершено', error: 'Error adding repository user' },
+  'repository-copy-users': { success: 'Копирование пользователей завершено', error: 'Error copying repository users' },
+  'repository-dump': { success: 'Выгрузка версии хранилища завершена', error: 'Error dumping configuration repository' },
+  'repository-report': { success: 'Построение отчета по хранилищу завершено', error: 'Error building repository report' },
+  'repository-set-label': { success: 'Установка метки завершена', error: 'Error setting repository label' },
+};
+
+/** Фабрика исполнителя: внедряется, чтобы прогнать CLI без установленной платформы 1С. */
+export type RepositoryCliExecutorFactory = (v8Path: string) => DesignerBatchExecutor;
+
+const createLocalExecutor: RepositoryCliExecutorFactory = (v8Path) => new LocalDesignerBatchExecutor(v8Path);
+
+export interface RepositoryCliFinishContext {
+  /** Имя выходного файла операции в `result.outputs` (dump/report); нет — операция без выходного файла. */
+  readonly outputName?: string;
+  /** Путь `-File`, на который переносится staging; обязателен при наличии `outputName`. */
+  readonly targetFile?: string;
+  readonly verbose: boolean;
+  readonly successMessage: string;
+  readonly errorMessage: string;
+  /** Строки stdout/stderr процесса — печатаются как детали ошибки. */
+  readonly outputLines: readonly string[];
+  /** Перенос staging; шов для теста, по умолчанию — общий `moveStagingToTarget`. */
+  readonly moveOutput?: (stagingPath: string, targetPath: string) => void;
+}
+
+/**
+ * Обработка результата исполнителя: перенос выходного файла, печать лога и деталей,
+ * код возврата процесса CLI. Отдельно от запуска, чтобы ветки проверялись без 1С.
+ */
+export function finishRepositoryCliRun(result: DesignerBatchResult, ctx: RepositoryCliFinishContext): number {
+  let exitCode = result.exitCode;
+  if (exitCode === 0) {
+    const staged = ctx.outputName ? result.outputs.get(ctx.outputName) : undefined;
+    if (ctx.outputName && !staged) {
+      // Код 0 без выходного файла — сбой: вызывающий скрипт иначе прочитал бы старый/пустой файл.
+      console.error(`${ctx.errorMessage}: платформа не создала выходной файл`);
+      exitCode = 1;
+    } else {
+      if (staged) {
+        if (!ctx.targetFile) {
+          throw new Error('Не задан путь -File для выходного файла');
+        }
+        (ctx.moveOutput ?? moveStagingToTarget)(staged, ctx.targetFile);
+      }
+      console.log(ctx.successMessage);
+    }
+  } else {
+    // В verbose лог печатается ниже в любом случае — не дублируем.
+    if (!ctx.verbose) {
+      printLogText(result.log);
+    }
+    const details = ctx.outputLines.join('\n').trim();
+    if (details) {
+      console.error(details);
+    }
+    console.error(`${ctx.errorMessage} (code: ${String(exitCode)})`);
+  }
+  if (ctx.verbose) {
+    printLogText(result.log);
+  }
+  return exitCode;
+}
+
+/**
+ * Полный цикл команды хранилища: разбор аргументов → запуск → обработка результата.
+ * Запрос и `-File` разбираются ДО создания исполнителя, чтобы ошибка аргументов не
+ * запускала платформу и не оставляла временных каталогов.
+ */
+export async function executeRepositoryCommand(
+  command: RepositoryCliCommand,
+  args: CliArgs,
+  createExecutor: RepositoryCliExecutorFactory = createLocalExecutor
+): Promise<number> {
+  // Имя выходного файла берётся из той же операции, что и вектор: у report оно зависит
+  // от формата, и отдельный расчёт мог бы разойтись с вектором.
+  const { request, operation } = buildRepositoryCliRun(command, args);
+  const outputName = repositoryOperationOutputName(operation);
+  const targetFile = outputName ? getRequiredString(args, 'File') : undefined;
+  const messages = REPOSITORY_CLI_MESSAGES[command];
+  const outputLines: string[] = [];
+  const executor = createExecutor(resolveConnection(args).v8Path);
   try {
-    const designerArgs: string[] = [];
-    appendRepositoryCommandArgs(designerArgs, repository);
-    designerArgs.push(...commandArgs);
-    if (extension) {
-      designerArgs.push('-Extension', extension);
-    }
-    designerArgs.push('/Out', outFile, '/DisableStartupDialogs');
-
-    const exitCode = await runDesignerAndPrintResult(
-      connection,
-      designerArgs,
-      successMessage,
-      errorMessage,
-      verbose ? undefined : outFile
-    );
-    if (verbose) {
-      printLogFile(outFile);
-    }
-    return exitCode;
+    const result = await executor.run({ ...request, onOutput: (line) => outputLines.push(line) });
+    return finishRepositoryCliRun(result, {
+      outputName,
+      targetFile,
+      verbose: getBool(args, 'Verbose'),
+      successMessage: messages.success,
+      errorMessage: messages.error,
+      outputLines,
+    });
   } finally {
-    safeRemoveDir(tempDir);
+    await executor.dispose();
   }
 }
 
-export async function createRepository(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryCreate'];
-  if (getBool(args, 'AllowConfigurationChanges')) {
-    commandArgs.push('-AllowConfigurationChanges');
-  }
-
-  const changesAllowedRule = getString(args, 'ChangesAllowedRule', '');
-  if (changesAllowedRule) {
-    commandArgs.push('-ChangesAllowedRule', changesAllowedRule);
-  }
-
-  const changesNotRecommendedRule = getString(args, 'ChangesNotRecommendedRule', '');
-  if (changesNotRecommendedRule) {
-    commandArgs.push('-ChangesNotRecommendedRule', changesNotRecommendedRule);
-  }
-
-  if (getBool(args, 'NoBind')) {
-    commandArgs.push('-NoBind');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Создание хранилища завершено',
-    'Error creating configuration repository',
-    'repository-create.log'
-  );
+export function createRepository(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-create', args);
 }
 
-export async function bindRepositoryConfiguration(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryBindCfg'];
-  if (getBool(args, 'ForceBindAlreadyBindedUser')) {
-    commandArgs.push('-forceBindAlreadyBindedUser');
-  }
-  if (getBool(args, 'ForceReplaceCfg')) {
-    commandArgs.push('-forceReplaceCfg');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Подключение к хранилищу завершено',
-    'Error binding configuration repository',
-    'repository-bind.log'
-  );
+export function bindRepositoryConfiguration(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-bind', args);
 }
 
-export async function unbindRepositoryConfiguration(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryUnbindCfg'];
-  if (getBool(args, 'Force')) {
-    commandArgs.push('-force');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Отключение от хранилища завершено',
-    'Error unbinding configuration repository',
-    'repository-unbind.log'
-  );
+export function unbindRepositoryConfiguration(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-unbind', args);
 }
 
-export async function lockRepositoryObjects(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryLock'];
-  const objectsFile = getString(args, 'ObjectsFile', '');
-  if (objectsFile) {
-    commandArgs.push('-Objects', objectsFile);
-  }
-  if (getBool(args, 'Revised')) {
-    commandArgs.push('-revised');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Захват объектов завершен',
-    'Error locking repository objects',
-    'repository-lock.log'
-  );
+export function lockRepositoryObjects(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-lock', args);
 }
 
-export async function unlockRepositoryObjects(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryUnLock'];
-  const objectsFile = getString(args, 'ObjectsFile', '');
-  if (objectsFile) {
-    commandArgs.push('-Objects', objectsFile);
-  }
-  if (getBool(args, 'Force')) {
-    commandArgs.push('-force');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Освобождение объектов завершено',
-    'Error unlocking repository objects',
-    'repository-unlock.log'
-  );
+export function unlockRepositoryObjects(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-unlock', args);
 }
 
-export async function commitRepositoryObjects(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryCommit'];
-  const objectsFile = getString(args, 'ObjectsFile', '');
-  if (objectsFile) {
-    commandArgs.push('-Objects', objectsFile);
-  }
-
-  const comment = getString(args, 'Comment', '');
-  if (comment) {
-    commandArgs.push('-comment', comment);
-  }
-
-  if (getBool(args, 'KeepLocked')) {
-    commandArgs.push('-keepLocked');
-  }
-  if (getBool(args, 'Force')) {
-    commandArgs.push('-force');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Помещение изменений завершено',
-    'Error committing repository objects',
-    'repository-commit.log'
-  );
+export function commitRepositoryObjects(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-commit', args);
 }
 
-export async function updateRepositoryConfiguration(args: CliArgs): Promise<number> {
-  const commandArgs = ['/ConfigurationRepositoryUpdateCfg'];
-  const objectsFile = getString(args, 'ObjectsFile', '');
-  if (objectsFile) {
-    commandArgs.push('-Objects', objectsFile);
-  }
-
-  const version = getString(args, 'Version', '');
-  if (version) {
-    commandArgs.push('-v', version);
-  }
-  if (getBool(args, 'Force')) {
-    commandArgs.push('-force');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Получение объектов из хранилища завершено',
-    'Error updating configuration from repository',
-    'repository-update.log'
-  );
+export function updateRepositoryConfiguration(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-update', args);
 }
 
-export async function addRepositoryUser(args: CliArgs): Promise<number> {
-  const userName = getRequiredString(args, 'User');
-  const password = getRequiredString(args, 'Pwd');
-  const rights = getRequiredString(args, 'Rights');
-  const commandArgs = [
-    '/ConfigurationRepositoryAddUser',
-    '-User',
-    userName,
-    '-Pwd',
-    password,
-    '-Rights',
-    rights,
-  ];
-  if (getBool(args, 'RestoreDeletedUser')) {
-    commandArgs.push('-RestoreDeletedUser');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Добавление пользователя завершено',
-    'Error adding repository user',
-    'repository-add-user.log'
-  );
+export function addRepositoryUser(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-add-user', args);
 }
 
-export async function copyRepositoryUsers(args: CliArgs): Promise<number> {
-  const sourcePath = getRequiredString(args, 'Path');
-  const userName = getRequiredString(args, 'User');
-  const password = getRequiredString(args, 'Pwd');
-  const commandArgs = [
-    '/ConfigurationRepositoryCopyUsers',
-    '-Path',
-    sourcePath,
-    '-User',
-    userName,
-    '-Pwd',
-    password,
-  ];
-  if (getBool(args, 'RestoreDeletedUser')) {
-    commandArgs.push('-RestoreDeletedUser');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Копирование пользователей завершено',
-    'Error copying repository users',
-    'repository-copy-users.log'
-  );
+export function copyRepositoryUsers(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-copy-users', args);
 }
 
-export async function dumpRepositoryConfiguration(args: CliArgs): Promise<number> {
-  const filePath = getRequiredString(args, 'File');
-  const commandArgs = ['/ConfigurationRepositoryDumpCfg', filePath];
-  const version = getString(args, 'Version', '');
-  if (version) {
-    commandArgs.push('-v', version);
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Выгрузка версии хранилища завершена',
-    'Error dumping configuration repository',
-    'repository-dump.log'
-  );
+export function dumpRepositoryConfiguration(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-dump', args);
 }
 
-export async function reportRepository(args: CliArgs): Promise<number> {
-  const filePath = getRequiredString(args, 'File');
-  const commandArgs = ['/ConfigurationRepositoryReport', filePath];
-  appendOptionalValue(commandArgs, '-NBegin', getString(args, 'NBegin', ''));
-  appendOptionalValue(commandArgs, '-NEnd', getString(args, 'NEnd', ''));
-  appendOptionalValue(commandArgs, '-DateBegin', getString(args, 'DateBegin', ''));
-  appendOptionalValue(commandArgs, '-DateEnd', getString(args, 'DateEnd', ''));
-  appendOptionalValue(commandArgs, '-ConfigurationVersion', getString(args, 'ConfigurationVersion', ''));
-  appendOptionalValue(commandArgs, '-ReportFormat', getString(args, 'ReportFormat', ''));
-  if (getBool(args, 'GroupByObject')) {
-    commandArgs.push('-GroupByObject');
-  }
-  if (getBool(args, 'GroupByComment')) {
-    commandArgs.push('-GroupByComment');
-  }
-  if (getBool(args, 'DoNotIncludeVersionsWithLabels')) {
-    commandArgs.push('-DoNotIncludeVersionsWithLabels');
-  }
-  if (getBool(args, 'IncludeOnlyVersionsWithLabels')) {
-    commandArgs.push('-IncludeOnlyVersionsWithLabels');
-  }
-  if (getBool(args, 'IncludeCommentLinesWithDoubleSlash')) {
-    commandArgs.push('-IncludeCommentLinesWithDoubleSlash');
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Построение отчета по хранилищу завершено',
-    'Error building repository report',
-    'repository-report.log'
-  );
+export function reportRepository(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-report', args);
 }
 
-export async function setRepositoryLabel(args: CliArgs): Promise<number> {
-  const labelName = getRequiredString(args, 'LabelName');
-  const commandArgs = ['/ConfigurationRepositorySetLabel', '-name', labelName];
-  const version = getString(args, 'Version', '');
-  if (version) {
-    commandArgs.push('-v', version);
-  }
-  const comment = getString(args, 'Comment', '');
-  if (comment) {
-    commandArgs.push('-comment', comment);
-  }
-
-  return executeRepositoryCommand(
-    args,
-    commandArgs,
-    'Установка метки завершена',
-    'Error setting repository label',
-    'repository-set-label.log'
-  );
-}
-
-function appendOptionalValue(target: string[], name: string, value: string): void {
-  if (!value) {
-    return;
-  }
-  target.push(name, value);
+export function setRepositoryLabel(args: CliArgs): Promise<number> {
+  return executeRepositoryCommand('repository-set-label', args);
 }

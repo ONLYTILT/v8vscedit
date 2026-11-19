@@ -2,12 +2,13 @@ import * as path from 'path';
 import type { ConfigEntry } from '../../domain/Configuration';
 import { parseConfigXml } from '../xml';
 import {
-  buildHashSnapshot,
   diffHashSnapshots,
+  hasHashBaseline,
   loadHashCache,
   saveHashCache,
 } from '../cache/HashCache';
-import { buildMetadataCacheScopeKey, loadMetadataCache, saveMetadataCacheForEntry } from '../cache/MetadataCache';
+import { scanHashSnapshot, type HashScanOptions } from '../cache/HashScanner';
+import { buildMetadataCacheScopeKey } from '../cache/MetadataCache';
 
 export interface ChangedConfiguration {
   kind: 'cf' | 'cfe';
@@ -16,11 +17,20 @@ export interface ChangedConfiguration {
   changedFilesCount: number;
 }
 
+export interface ConfigurationChangeDetectorOptions {
+  /** Шов быстрой проверки (ФС и часы) — для тестов; отчёт прохода детектор формирует сам. */
+  readonly scan?: Omit<HashScanOptions, 'onReport'>;
+  readonly log?: (line: string) => void;
+}
+
 /**
  * Определяет, в каких XML-исходниках есть изменения относительно локального хеш-кэша.
  */
 export class ConfigurationChangeDetector {
-  constructor(private readonly projectRoot: string) {}
+  constructor(
+    private readonly projectRoot: string,
+    private readonly options: ConfigurationChangeDetectorOptions = {}
+  ) {}
 
   describe(entry: ConfigEntry, changedFilesCount: number): ChangedConfiguration {
     const scope = this.resolveScope(entry);
@@ -33,44 +43,40 @@ export class ConfigurationChangeDetector {
   }
 
   /**
-   * Создаёт первичный хеш-кэш для конфигураций, у которых его ещё нет.
+   * Конфигурации проверяются последовательно, а не параллельно: проход и так нагружает диск, а
+   * параллельные проходы по нескольким выгрузкам вытеснили бы операции ФС остальных расширений.
+   *
+   * Первичная инициализация базовой линии (бывший `ensureCaches`) выполняется здесь же, в том же
+   * прогоне, — так порядок «кэш создан → сравнение» соблюдается по построению, а single-flight
+   * (`ChangeDetectionRunner`) исключает параллельный прогон, читающий недописанный кэш.
    */
-  ensureCaches(entries: ConfigEntry[], reportStatus?: (message: string) => void): number {
-    let created = 0;
+  async detect(entries: readonly ConfigEntry[]): Promise<ChangedConfiguration[]> {
+    const result: ChangedConfiguration[] = [];
+    const log = this.options.log;
+
     for (const entry of entries) {
       const scope = this.resolveScope(entry);
       const previous = loadHashCache(this.projectRoot, scope.scopeKey);
-      const metadata = loadMetadataCache(this.projectRoot, scope.scopeKey);
-      const hasHashCache = Boolean(previous.generatedAt || Object.keys(previous.files).length > 0);
-      if (hasHashCache && metadata) {
+      const current = await scanHashSnapshot(this.projectRoot, scope.scopeKey, entry.rootPath, {
+        ...this.options.scan,
+        onReport: (report) => {
+          log?.(
+            `[hash-cache] ${scope.name}: файлов ${String(report.files)}, перехешировано ${String(report.hashed)} `
+            + `(racy ${String(report.racy)}), ${String(report.elapsedMs)} мс`
+          );
+        },
+      });
+
+      if (!hasHashBaseline(previous)) {
+        // Базовую линию мог записать CLI (импорт) за время прохода — её нельзя затирать снимком,
+        // снятым до импорта. В обоих случаях этот проход изменений не сообщает: сравнивать не с чем.
+        if (!hasHashBaseline(loadHashCache(this.projectRoot, scope.scopeKey))) {
+          saveHashCache(this.projectRoot, current);
+          log?.(`Инициализация хеш-кэша: ${scope.name}`);
+        }
         continue;
       }
 
-      let entryCreated = false;
-      if (!hasHashCache) {
-        reportStatus?.(`Инициализация хеш-кэша: ${scope.name}`);
-        saveHashCache(this.projectRoot, buildHashSnapshot(scope.scopeKey, entry.rootPath));
-        entryCreated = true;
-      }
-      if (!metadata) {
-        reportStatus?.(`Инициализация дерева метаданных: ${scope.name}`);
-        saveMetadataCacheForEntry(this.projectRoot, scope.scopeKey, entry);
-        entryCreated = true;
-      }
-      if (entryCreated) {
-        created += 1;
-      }
-    }
-    return created;
-  }
-
-  detect(entries: ConfigEntry[]): ChangedConfiguration[] {
-    const result: ChangedConfiguration[] = [];
-
-    for (const entry of entries) {
-      const scope = this.resolveScope(entry);
-      const previous = loadHashCache(this.projectRoot, scope.scopeKey);
-      const current = buildHashSnapshot(scope.scopeKey, entry.rootPath);
       const diff = diffHashSnapshots(previous, current);
       const changedFilesCount = diff.added.length + diff.modified.length + diff.deleted.length;
 

@@ -31,7 +31,7 @@ import { tryRequireProductionModule } from './support/tryRequireProductionModule
 
 interface AtomicModule {
   resolveAtomicTempPath(targetPath: string, uniqueSuffix: string): string;
-  writeFileAtomic(targetPath: string, data: string): void;
+  writeFileAtomic(targetPath: string, data: string | Uint8Array): void;
 }
 
 function atomic(): AtomicModule {
@@ -216,6 +216,16 @@ suite('AtomicFileWriter.writeFileAtomic (T-B2.23-28)', function () {
       atomic().writeFileAtomic(path.join(dir, name), name);
     }
     assert.deepStrictEqual(fs.readdirSync(dir).sort(), [...names].sort());
+  });
+
+  test('Uint8Array пишется байт-в-байт (BOM, CRLF, нули и не-UTF-8 байты не искажаются), мусора нет', () => {
+    const dir = tmpDir();
+    const target = path.join(dir, 'Двоичный.xml');
+    fs.writeFileSync(target, 'прежнее', 'utf-8');
+    const data = new Uint8Array([0xef, 0xbb, 0xbf, 0x3c, 0x61, 0x2f, 0x3e, 0x0d, 0x0a, 0x00, 0xff, 0xfe, 0x80]);
+    atomic().writeFileAtomic(target, data);
+    assert.deepStrictEqual([...fs.readFileSync(target)], [...data]);
+    assert.deepStrictEqual(fs.readdirSync(dir), ['Двоичный.xml']);
   });
 });
 

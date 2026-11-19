@@ -462,6 +462,18 @@
         }
       },
       {
+        "command": "v8vscedit.agent.releaseInfoBase",
+        "title": "Агент конфигуратора: отключить информационную базу"
+      },
+      {
+        "command": "v8vscedit.remote.checkConnection",
+        "title": "Проверить подключение к серверу 1С"
+      },
+      {
+        "command": "v8vscedit.remote.resetPassword",
+        "title": "Сбросить пароль удалённого сервера"
+      },
+      {
         "command": "v8vscedit.repository.connect",
         "title": "Подключить к хранилищу",
         "icon": "$(plug)"
@@ -819,6 +831,19 @@
           "default": "batch",
           "description": "Режим выполнения операций с конфигурацией. По умолчанию используется пакетный режим из версии 0.3.5; агентский режим доступен как дополнительный."
         },
+        "v8vscedit.agent.location": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ],
+          "enumDescriptions": [
+            "Локальный агент: расширение само запускает конфигуратор в режиме агента на этой машине, файлы передаются через локальный каталог агента.",
+            "Удалённый агент: конфигуратор в режиме агента уже запущен на сервере; расширение подключается по SSH к v8vscedit.agent.host:port, файлы передаются по SFTP. Требует v8vscedit.configuration.operationMode = agent."
+          ],
+          "default": "local",
+          "description": "Где работает агент конфигуратора: на этой машине или на удалённом сервере 1С"
+        },
         "v8vscedit.agent.host": {
           "type": "string",
           "default": "localhost",
@@ -847,7 +872,7 @@
         "v8vscedit.agent.autoStart": {
           "type": "boolean",
           "default": true,
-          "description": "Автоматически запускать конфигуратор с параметром /AgentMode перед операциями с конфигурацией"
+          "description": "Автоматически запускать конфигуратор с параметром /AgentMode перед операциями с конфигурацией. В удалённом режиме (v8vscedit.agent.location = remote) игнорируется: агент на сервере запускается вне расширения"
         },
         "v8vscedit.agent.visible": {
           "type": "boolean",
@@ -868,6 +893,89 @@
           "type": "number",
           "default": 15000,
           "description": "Максимальное время ожидания открытия SSH-порта после запуска конфигуратора в режиме агента, в миллисекундах"
+        },
+        "v8vscedit.agent.authWarmupMs": {
+          "type": "number",
+          "default": 90000,
+          "minimum": 0,
+          "description": "Окно повтора ошибок аутентификации SSH после запуска агента конфигуратора или после отказа в соединении (агент открывает порт раньше, чем начинает принимать логин), в миллисекундах. Вне окна неверный логин или пароль сообщается сразу, без повторных входов"
+        },
+        "v8vscedit.agent.connectTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "Сколько ждать одну попытку SSH-подключения к агенту конфигуратора — TCP, обмен ключами и вход вместе, в миллисекундах. Удалённый агент проверяет логин и пароль обращением к базе, и вход может занимать десятки секунд"
+        },
+        "v8vscedit.agent.transferConcurrency": {
+          "type": "number",
+          "default": 16,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Сколько файлов передаётся агенту конфигуратора одновременно (для удалённого агента — параллельных запросов SFTP). Больше — быстрее на канале с высокой задержкой, но выше нагрузка на сервер"
+        },
+        "v8vscedit.agent.archiveThresholdFiles": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1,
+          "description": "Только удалённый агент: число изменённых файлов, начиная с которого импорт и загрузка идут полной выгрузкой/загрузкой архивом, а не передачей отдельных файлов. Ниже порога передаются только изменённые файлы"
+        },
+        "v8vscedit.agent.idleDisconnectMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Через сколько минут простоя агент конфигуратора сам отключает информационную базу (connect-ib держится между операциями и блокирует базу для коллег и пакетного Конфигуратора). 0 — не отключать по таймеру: база отпускается перед пакетными операциями и командой «Агент конфигуратора: отключить информационную базу». Применяется к агенту, запущенному после изменения настройки"
+        },
+        "v8vscedit.remote.computerName": {
+          "type": "string",
+          "default": "",
+          "description": "Имя сервера 1С для PowerShell-сессии (WinRM), через которую на сервере выполняются пакетные операции Конфигуратора (хранилище конфигурации) при v8vscedit.agent.location = remote. Пусто — v8vscedit.agent.host"
+        },
+        "v8vscedit.remote.authentication": {
+          "type": "string",
+          "enum": [
+            "Default",
+            "Negotiate",
+            "Kerberos"
+          ],
+          "enumDescriptions": [
+            "Способ проверки подлинности WinRM по умолчанию.",
+            "Negotiate: Kerberos, а при недоступности — NTLM.",
+            "Только Kerberos (сервер должен быть в домене и адресоваться DNS-именем)."
+          ],
+          "default": "Default",
+          "description": "Способ проверки подлинности PowerShell-сессии с сервером 1С (параметр -Authentication у New-PSSession)"
+        },
+        "v8vscedit.remote.user": {
+          "type": "string",
+          "default": "",
+          "description": "Учётная запись Windows для PowerShell-сессии с сервером 1С (например DOMAIN\\user). Обязательна для удалённого режима. Пароль спрашивается при первом подключении и хранится в SecretStorage VS Code, а не в настройках"
+        },
+        "v8vscedit.remote.useSsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Подключаться к WinRM сервера 1С по HTTPS (параметр -UseSSL у New-PSSession)"
+        },
+        "v8vscedit.remote.port": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Порт WinRM сервера 1С. 0 — стандартный порт (5985 для HTTP, 5986 для HTTPS)"
+        },
+        "v8vscedit.remote.v8Path": {
+          "type": "string",
+          "default": "",
+          "description": "Путь к 1cv8.exe НА СЕРВЕРЕ 1С — только 1cv8.exe конкретной версии, не стартер 1cestart.exe. Пусто — путь выводится из --v8version в env.json (стандартный каталог установки платформы) и проверяется на сервере"
+        },
+        "v8vscedit.repository.getRevisedOnLock": {
+          "type": "boolean",
+          "default": true,
+          "description": "Передавать ключ -revised при захвате объектов хранилища (получать версии захватываемых объектов из хранилища). Если захват получил новые версии объектов, изменившиеся объекты импортируются в файлы проекта"
+        },
+        "v8vscedit.remote.ibConnection": {
+          "type": "string",
+          "default": "",
+          "description": "Строка подключения к базе с точки зрения сервера 1С (например /Ssrv/base), если с сервера кластер адресуется иначе, чем в --ibconnection env.json. Пусто — --ibconnection из env.json"
         }
       }
     },
@@ -933,6 +1041,7 @@
     "lint": "eslint . --max-warnings=0",
     "test": "node ./out/test/runTests.js",
     "test:fast": "node ./out/test/runTests.js",
+    "test:hidden": "node scripts/test-hidden.mjs",
     "coverage": "c8 --check-coverage --100 npm test",
     "coverage:report": "c8 npm test",
     "coverage:changed": "node scripts/patch-coverage.mjs",
@@ -963,6 +1072,7 @@
     "@vscode-elements/elements": "^2.5.1",
     "@vscode/codicons": "^0.0.45",
     "fast-xml-parser": "^4.5.6",
+    "fflate": "0.8.3",
     "iconv-lite": "^0.7.2",
     "ssh2": "^1.17.0",
     "vscode-languageclient": "^9.0.1",

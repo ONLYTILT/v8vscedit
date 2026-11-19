@@ -82,6 +82,7 @@ npm run coverage:report  # покрытие без падения по поро�
   порядок чтения важен, не переставлять. Если версия ещё не скачана, `@vscode/test-electron` при
   первом запуске сам скачает её в `.vscode-test/` (нужна сеть); повторные запуски используют кэш.
 - **Отдельный тест — быстро и без `.only`.** Runner (`src/test/suite/index.ts`) читает `MOCHA_GREP` и применяет `mocha.grep()`. Итерация: правка теста → `npm run test:compile` → `MOCHA_GREP='<regex по имени suite/теста>' npm run test:fast` (`test:fast` НЕ запускает `pretest`, т.е. не пересобирает Vite — на порядок быстрее полного `npm test`). `.only` больше не нужен.
+- **Скрытый прогон на Windows (обязателен для агентов конвейера):** `npm run test:hidden -- <test:fast|test|coverage:changed>` вместо прямого `test:fast`/`npm test`/`coverage:changed` — тесты идут в задаче планировщика от SYSTEM (неинтерактивная сессия), окна тестового VS Code не появляются на экране пользователя; `MOCHA_GREP`/`COVERAGE_*` берутся из окружения, лог транслируется, код выхода возвращается. `test:compile` запускается как обычно (окон не создаёт). Задача регистрируется один раз от администратора (`scripts/hidden-tests/register.ps1`); исполнитель (`runner.ps1`) принимает только белый список скриптов и переменных — расширять его осознанно: задача исполняет код репозитория с правами SYSTEM. Если задача не зарегистрирована, `test:hidden` завершится кодом 2 с подсказкой — тогда допустим обычный прогон.
 - Перед любым коммитом: `npm run compile` и **`npm run lint`** должны проходить без ошибок и предупреждений.
 - Точки входа: `main` = `./dist/extension.js`; CLI — `dist/cli/onec-tools.js`. Целевая среда — VS Code API ≥ 1.85, TypeScript ≥ 5.3, strict, ES2020.
 
@@ -129,7 +130,7 @@ src/
 │   └── Ownership.ts                  # «свой/заимствованный» по namePrefix для CFE
 │
 ├── infra/                            # ФС, XML, окружение, git, хранилище, CFE, роли; vscode не импортировать
-│   ├── xml/                          # ридеры/эдиторы XML
+│   ├── xml/                          # ридеры/эдиторы XML (dumpInfo/ — заголовок ConfigDumpInfo.xml для посева M)
 │   │   ├── ConfigXmlReader.ts        # парсер Configuration.xml
 │   │   ├── ObjectXmlReader.ts        # парсер XML объекта + updateType/updateProperty
 │   │   ├── PropertySchema.ts         # декларативные схемы свойств по MetaKind
@@ -138,6 +139,7 @@ src/
 │   │   ├── ConfigurationXmlEditor.ts # редактирование Configuration.xml
 │   │   ├── MetadataXmlCreator.ts     # создание новых XML-объектов метаданных
 │   │   ├── MetadataXmlRemover.ts     # удаление XML-объектов метаданных
+│   │   ├── dumpInfo/                 # ConfigDumpInfoIndex: ЕДИНСТВЕННЫЙ разбор ConfigDumpInfo.xml (владельцы, версии)
 │   │   ├── childObjects/             # канон порядка <ChildObjects> (см. docs/xml-format-rulesets.md)
 │   │   │   ├── ChildObjectsOrder.ts  # ДАННЫЕ: CHILD_OBJECTS_ORDER (по MetaKind), childTagRank, hasOrderRule
 │   │   │   └── ChildObjectsEditor.ts # МЕХАНИКА: resolveInsertOffset — не знает ни одного вида метаданных
@@ -151,21 +153,27 @@ src/
 │   ├── fs/
 │   │   ├── ConfigLocator.ts          # рекурсивный поиск Configuration.xml
 │   │   ├── MetaPathResolver.ts       # единый resolver: XML + все модули по ModuleSlot
+│   │   ├── FileHandleWrite.ts        # writeFully: цикл дозаписи по bytesWritten (НЕ замена AtomicFileWriter)
 │   │   ├── AtomicFileWriter.ts       # writeFileAtomic/resolveAtomicTempPath: ЕДИНСТВЕННАЯ
 │   │   │                              # реализация temp+rename; через неё идёт любая запись файла
 │   │   │                              # выгрузки (docs/architecture.md, «Атомарная запись»)
 │   │   ├── ProjectLayout.ts          # resolveConfigDir: src/cf, src/cfe/<имя> — общее
 │   │   │                              # для расширения и CLI (cli/core/projectLayout.ts —
 │   │   │                              # тонкий re-export)
-│   │   └── ConfigurationCleanWindow.ts # окно тишины по корню конфигурации после
-│   │                                  # импорта/обновления БД (Container.markConfigurationsClean,
-│   │                                  # см. docs/architecture.md)
+│   │   ├── ConfigurationCleanWindow.ts # окно тишины по корню конфигурации после
+│   │   │                              # импорта/обновления БД (Container.markConfigurationsClean,
+│   │   │                              # см. docs/architecture.md)
+│   │   └── ChangeDetectionRunner.ts  # single-flight фоновой проверки изменений: request/
+│   │                                  # invalidate/whenIdle/dispose (Container.changeDetection)
 │   ├── cfe/                          # расширения: CfeBorrowService, CfeDiffService, CfePatchMethodService
 │   ├── support/                      # ParentConfigurationsParser (чистый разбор bin), SupportMode,
 │   │                                  # SupportInfoService (кэш + режим по пути), Logger — см.
 │   │                                  # docs/metadata-navigator.md#поддержка-поставщика-parentconfigurationsbin
-│   ├── cache/                        # MetadataCache, hashCache (CLI)
-│   ├── repository/                   # хранилище 1С, локальные захваты
+│   ├── cache/                        # MetadataCache; хеш-кэш выгрузки: HashCache (базовая линия
+│   │                                  # .v8vscedit/cache), HashStatMemo (stat-мемо .v8vscedit/hash-stat),
+│   │                                  # HashScanner (scanHashSnapshot — быстрый async-проход;
+│   │                                  # docs/architecture.md, «Хеш-кэш: базовая линия и stat-мемо»)
+│   ├── repository/                   # хранилище 1С, локальные захваты; RepositoryLockLog — разбор лога захвата
 │   ├── git/                          # статус Git для узлов метаданных (GitMetadataStatusService,
 │   │                                  # декорации) + представление «Изменения метаданных»
 │   │                                  # (GitPorcelainReader, MetadataChangeResolver,
@@ -182,8 +190,29 @@ src/
 │   │                                  # принадлежности staging-файла), CfeBatch* (пакетная
 │   │                                  # выгрузка/загрузка всех расширений: Naming/Manifest/
 │   │                                  # Plan/Report) — см. docs/architecture.md
+│   ├── agent/                        # агент конфигуратора (SSH /AgentMode): AgentOperationService (тонкий
+│   │                                  # фасад), AgentInfoBaseSession (жизненный цикл connect-ib),
+│   │                                  # BatchDesignerGuard (release перед пакетным запуском),
+│   │                                  # AgentConnectRetry/SshConnectErrorClassifier (политика готовности),
+│   │                                  # RemoteConnectionCheck (диагностика) — docs/architecture.md,
+│   │                                  # «Удалённый сервер 1С»; пользовательская часть — docs/remote-designer.md
+│   │   ├── files/                    # AgentFileStore: Local (каталог агента) и Sftp (отдельное SSH-соединение),
+│   │   │                              # AgentFileTransfer (конкурентная передача с отменой),
+│   │   │                              # SftpChunkedIo (потоковый обмен, IO_CHUNK 31 КиБ)
+│   │   └── sync/                     # движок синхронизации M/P/B: SyncPlanner (чистый), SyncManifest (+ mirrorCoverage full/sparse),
+│   │                                  # AgentImportFlow/AgentLoadFlow, ArchiveCodec/ZipContainer (zip/zip64, ZipByteSource/ZipStreamWriter),
+│   │                                  # ArchiveFile/ArchiveImport (потоковый архив без буфера целиком), MirrorSeed (посев
+│   │                                  # разреженного зеркала M), LocalExchange (.v8vscedit/agent-exchange),
+│   │                                  # ProjectSeed (посев M из проекта, «сироты»), SparseRestore (точечная выгрузка
+│   │                                  # `dump --list-file`), ProjectDumpInfo (отпечаток CDI проекта); причины полной
+│   │                                  # выгрузки — таблица `ARCHIVE_REASON_POLICY` в SyncPlanner (docs/architecture.md)
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
-│   │                                  # SensitiveArgs (маскирование -Password в логах)
+│   │   │                              # SensitiveArgs (маскирование -Password в логах),
+│   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)
+│   │   ├── designer/                 # DesignerBatchExecutor (интерфейс пакетного 1cv8) +
+│   │   │                              # LocalDesignerBatchExecutor, InfoBaseConnectionArgs (/S|/F, /N, /P)
+│   │   └── remote/                   # хост PowerShell: PowerShellHostScript/Protocol/RemoteHost,
+│   │                                  # RemoteDesignerBatchExecutor (1cv8 на сервере через PSSession)
 │   ├── mcp/                          # McpServerIdentity/McpStartDecision/McpPortProbe/
 │   │                                  # McpConflictPrompt/McpHost — чистая логика жизненного цикла
 │   │                                  # встроенного MCP-сервера (bind/reuse/conflict, закрытие порта),
@@ -467,6 +496,13 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   корпуса, а не снимается с вывода генератора (иначе фикстура закрепит ошибку). Не заявлять «снятым
   правилом» то, что в корпусе неоднородно. См.
   [xml-format-rulesets.md](./docs/xml-format-rulesets.md#графическая-схема-flowchartxml-и-макет-графическая-схема).
+- **Архив выгрузки агента (zip/zip64) и посев зеркала M:** любой новый писатель/читатель архива — только через
+  `ZipByteSource`/`ZipStreamWriter` и файловые потоки (`downloadToFile`/`uploadFromFile`), БЕЗ буфера размером
+  с архив (на БП КОРП это «Array buffer allocation failed»). Полнота M (`mirrorCoverage`) и посев живут в
+  `SyncManifest`/`MirrorSeed`/`SyncPlanner`: при `sparse` отсутствие файла в M ничего не значит;
+  согласие на посев из проекта даёт только человек (хук `confirmMirrorSeed`, у MCP его нет). Порция
+  SFTP — 31 КиБ, не 32 (лимит ssh2 для libssh-агента). Подробности —
+  [architecture.md](./docs/architecture.md#модель-синхронизации-m--p--b).
 - **Любой писатель файла выгрузки (и служебного кэша):** только через `infra/fs/AtomicFileWriter`
   (`writeFileAtomic`) либо `writeTextFilePreservingBomAndEol`, который делегирует туда. Собственный
   `fs.writeFileSync`/`rename` для файла выгрузки заводить нельзя — третьей копии temp+rename быть не
@@ -478,6 +514,15 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   `ParentConfigurationsParser.ts` → запись в `SUPPORT_PRESENTATION` (`ui/support/supportPresentation.ts`) →
   иконка `src/icons/{light,dark}/support-<имя>.svg` → значение DTO в `src-ui/shared/types/tree.ts` и
   `src/ui/views/universal/_types.ts`. Гейты блокировок читают только `Locked` — новый режим их не меняет.
+- **Новый потребитель хешей выгрузки** (сравнение с базой, манифест синхронизации и т.п.): только
+  `scanHashSnapshot` (`infra/cache/HashScanner.ts`) с `projectRoot` — он не читает неизменённые файлы
+  благодаря stat-мемо. `buildHashSnapshot` — эталонный синхронный полный проход для тестов, в production
+  не вызывать (он читает всю выгрузку: 7,5 ГБ на БП блокировали Extension Host на минуты). Базовую линию
+  (`.v8vscedit/cache`) пишут только импорт/CLI/агент; `ConfigurationChangeDetector.detect` — лишь при
+  первичной инициализации, если линии нет. Stat-отпечатки в файл базовой линии не добавлять — гонка с CLI
+  за линию импорта, см. [architecture.md](./docs/architecture.md#хеш-кэш-базовая-линия-и-stat-мемо).
+  Проверку в расширении запускать через `Container.refreshChangedConfigurationState()`
+  (`ChangeDetectionRunner`), а не прямым `await detect`.
 - **Новая команда:** класс в `ui/commands/...` с `readonly id` → регистрация в `CommandRegistry.registerAll` → `package.json → contributes.commands` → при меню узла `contributes.menus` c `when: viewItem =~ /…/` → при хоткее `contributes.keybindings`.
 - **Новый потребитель пути формы** (MCP-инструмент или команда навигатора, которым нужно тело
   `Ext/Form.xml`, дескриптор формы или XML владельца по узлу дерева): только через
@@ -539,6 +584,23 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   staging-остаток опознаётся по маркеру `DUMP_STAGING_SUFFIX`, а не по форме суффикса; перенос staging —
   `moveStagingToTarget` из `cli/core/onecCommon.ts`, второй копии temp+rename не заводить. Подробности и
   обоснования — [architecture.md](./docs/architecture.md#пакетный-случай-все-расширения-базы-одной-операцией-dump-cfe-allload-cfe-all).
+- **Новая пакетная операция Конфигуратора** (любая, что запускает `1cv8 DESIGNER` отдельным процессом;
+  см. [architecture.md](./docs/architecture.md#удалённый-сервер-1с)). Запрос строится как
+  `DesignerBatchRequest` (аргументы БЕЗ исполняемого файла и БЕЗ `/Out`; входные и выходные файлы
+  объявляются именами, а не путями) и запускается ТОЛЬКО через `DesignerBatchExecutor` из
+  `designerExecutorRegistry` (`acquireDesignerBatchExecutor`: local/remote по `v8vscedit.agent.location`) —
+  так сделано для хранилища (`RepositoryCommandRunner`). Прямой `runProcess`/`spawn` 1cv8 из команды
+  заводить нельзя: в удалённом режиме операция пошла бы локальным 1cv8 в чужую базу. ПЕРЕД запуском
+  операция обязана освободить ИБ агента — `releaseAgentInfoBaseForBatch` (подключение ИБ агента держится
+  между операциями и блокирует базу для 1cv8; ошибка освобождения — отказ запуска, пакетная операция не
+  стартует). Мутирующая операция берёт `configurationOperationLock`; выходной файл (`/File`, выгрузка)
+  переносится на путь пользователя из staging исполнителя только при `exitCode === 0`; секреты — в
+  `secrets` запроса (маскирование в логах). Операции внутреннего CLI (`runInternalCliCommand`: CF/CFE,
+  пакеты расширений, список расширений) и интерактивный Конфигуратор остаются ЛОКАЛЬНЫМИ — для них
+  освобождение ИБ делает сам раннер, а допустимость в remote-режиме решает
+  `decideLocalDesignerInRemote` (`ui/commands/ext/agent/remoteLocalDesigner.ts`: файловая база и петлевой
+  сервер — отказ до побочных эффектов). Перевод такой операции на удалённый исполнитель — отдельная
+  задача по схеме хранилища, а не «правка раннера». Путь к 1cv8 проходит единую проверку стартера (`infra/process/V8ExecutableGuard.ts`: локально `resolveV8ExecutablePath`, на сервере `assertServerDesignerExecutable` в `designerExecutorRegistry`) — третьей точки резолвинга не заводить; захват объектов хранилища — `ui/commands/repository/` (`repositoryLockFlow.ts`, `RepositoryLockCommand.ts`, `repositoryPostSync.ts`, `repositoryNodeTargets.ts`; см. architecture.md).
 - **Открытие BSL-модулей:** только реальные `file://` документы (виртуальная схема `onec://` удалена). Readonly — через `ui/readonly/BslReadonlyGuard.ts`.
 - **Изменение жизненного цикла/безопасности встроенного MCP-сервера** (порт, идентичность процесса,
   graceful shutdown, Host/Origin, отличается от «новый MCP-инструмент» из раздела выше): чистая логика —
@@ -615,6 +677,7 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
 16. **MCP-инструменты принимают только канон** (см. `./docs/mcp-paths.md`).
 17. **God-объектов быть не должно.** Порог-ориентир — **~800 строк** на файл производственного кода; превышение требует либо явного обоснования, либо декомпозиции. Дробить **по ответственности/домену, а не механически по строкам**. Каноничные приёмы: регистрация MCP-инструментов дробится по доменам (`src/ui/mcp/registration/*`, образец — `McpAddToolsRegistration`); диспетчер `switch (kind)` заменяется **таблицей** `Record<MetaKind, …>` — данные типа в `META_TYPES`, XML-литералы формата в спец-реестре `infra/` (параллельные словари вне `META_TYPES` запрещены, см. п.2); класс-фасад остаётся тонким, логика — в module-level функциях/подмодулях того же слоя. **Любое дробление XML-генератора обязано сохранять байт-в-байт выход** (BOM/EOL/порядок атрибутов/самозакрытие, см. п.12) и предваряться байт-golden-тестом; декомпозиция `MetadataXmlCreator`/`FormBuilders` без такого эталона — запрещена (идёт вслепую).
 18. **Внутри критической секции эксклюзивной операции (флаги вида `isUpdatingConfigurations`) уведомления показываются без `await`.** `await vscode.window.showInformationMessage(...)`/`showWarningMessage(...)` до закрытия секции держит флаг занятости выставленным до закрытия нотификации пользователем — любая параллельная операция всё это время отбивается сообщением «уже выполняется», хотя фактически ничего не выполняется.
+19. **Удаление файлов выгрузки — `fs.unlink`/`rmdir` своим обходом, не `fs.rmSync`.** На Windows с системным Node 24 `fs.rmSync` молча (без исключения) не удаляет файл с кириллицей в имени — ни файл, ни каталог рекурсивно; `unlinkSync` и `fs.promises.rm` удаляют. Файлы выгрузки 1С содержат кириллицу, поэтому в новом коде удаления файлов выгрузки `rmSync` запрещён. Существующие вызовы (`infra/agent/DirectorySnapshot.ts` и ещё ~20 в `src`) — долг Н37 плана `docs/plans/remote-designer-plan.md`.
 
 ## Ключевые принципы
 

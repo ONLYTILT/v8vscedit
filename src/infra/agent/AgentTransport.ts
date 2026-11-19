@@ -13,6 +13,11 @@ export interface DesignerAgentTransport {
   execute(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult>;
   reset?(): Promise<void>;
   dispose(): Promise<void>;
+  /**
+   * Транспорт непригоден для команд (соединение потеряно или выброшено). Фабрика сессий
+   * по этому признаку пересоздаёт транспорт вместо повторного использования мёртвого.
+   */
+  isClosed?(): boolean;
 }
 
 export interface DesignerAgentTransportFactory {

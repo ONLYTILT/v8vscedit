@@ -119,7 +119,7 @@ suite('RepositoryService', () => {
     assert.strictEqual(service.isMetadataEditRestricted(target), true);
     assert.strictEqual(service.isRootLocked(target), false);
 
-    const objects = service.createObjectsFileForNode({
+    const objects = service.buildObjectsSelectionForNode({
       nodeKind: 'configuration',
       label: 'Конфигурация',
       xmlPath: configXmlPath,

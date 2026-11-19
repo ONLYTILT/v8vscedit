@@ -27,8 +27,8 @@ export function registerDbCommands(
   );
 }
 
-async function confirmUpdateBeforeThinClient(services: CommandServices): Promise<boolean> {
-  const changed = services.getChangedConfigurations();
+export async function confirmUpdateBeforeThinClient(services: CommandServices): Promise<boolean> {
+  const changed = await services.getChangedConfigurations();
   if (changed.length === 0) {
     return true;
   }

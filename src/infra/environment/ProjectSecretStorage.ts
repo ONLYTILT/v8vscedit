@@ -9,7 +9,7 @@ import type { SecretStore } from '../ai/AiSecretStorage';
  * Ключи неймспейсятся так, чтобы:
  *  - пароль БД разных workspace-корней не пересекался (хэш корня в ключе);
  *  - пароли хранилища разных областей (scopeKey) не пересекались;
- *  - db- и repo-ключи не коллизировали между собой (разные префиксы).
+ *  - db-, repo- и remote-ключи не коллизировали между собой (разные префиксы).
  */
 export class ProjectSecretStorage {
   private readonly workspaceHash: string;
@@ -47,6 +47,29 @@ export class ProjectSecretStorage {
     return Boolean(await this.getRepoPassword(scopeKey));
   }
 
+  /** Пароль учётной записи PSSession (`v8vscedit.remote.user`) удалённого сервера 1С. */
+  async getRemotePassword(): Promise<string | undefined> {
+    return this.secrets.get(this.remotePasswordKey());
+  }
+
+  /**
+   * В отличие от прочих секретов проекта, пароль доменной учётки хранится КАК ЕСТЬ: пробелы по
+   * краям в нём значимы, и обрезка дала бы неверный пароль и неудачные входы (риск блокировки
+   * учётки политикой домена). Пустое и пробельное значение — удаление.
+   */
+  async setRemotePassword(value: string): Promise<void> {
+    const key = this.remotePasswordKey();
+    if (value.trim()) {
+      await this.secrets.store(key, value);
+    } else {
+      await this.secrets.delete(key);
+    }
+  }
+
+  async hasRemotePassword(): Promise<boolean> {
+    return Boolean(await this.getRemotePassword());
+  }
+
   private async writeSecret(key: string, value: string): Promise<void> {
     // Пустое значение (после trim) трактуем как удаление, чтобы не хранить
     // пустые записи и чтобы «стереть пароль» было явным действием.
@@ -60,6 +83,12 @@ export class ProjectSecretStorage {
 
   private dbPasswordKey(): string {
     return `v8vscedit.env.${this.workspaceHash}.dbPassword`;
+  }
+
+  // Пространство `v8vscedit.remote-` не пересекается с `v8vscedit.repository.<scope>.` ни при каком scopeKey
+  // (у repo-ключей после префикса всегда точка), а хэш корня изолирует проекты, как у пароля БД.
+  private remotePasswordKey(): string {
+    return `v8vscedit.remote-${this.workspaceHash}.password`;
   }
 
   private repoPasswordKey(scopeKey: string): string {

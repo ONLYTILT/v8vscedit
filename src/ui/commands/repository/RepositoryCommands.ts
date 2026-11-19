@@ -1,41 +1,47 @@
 ﻿import * as path from 'path';
 import * as vscode from 'vscode';
-import type { RepositoryBinding, RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import { REPOSITORY_DUMP_OUTPUT, repositoryReportOutputName } from '../../../infra/repository/RepositoryDesignerArgs';
 import type { CommandServices, NodeArg } from '../_shared';
+import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
 import {
-  runApplyDatabaseConfiguration,
-  runDecompileExtension,
-  runDecompileMainConfiguration,
-  runUpdateExtension,
-  runUpdateMainConfiguration,
-} from '../ext/ExtensionCommandRunner';
-import {
-  type RepositoryCliServices,
   runRepositoryCliCommand,
   runRepositoryCommitAction,
-  runRepositoryLockAction,
   runRepositoryUnlockAction,
   runRepositoryUpdateAction,
 } from './RepositoryCommandRunner';
+import {
+  buildAddUserOperation,
+  buildBindOperation,
+  buildCopyUsersOperation,
+  buildCreateOperation,
+  buildDumpOperation,
+  buildReportOperation,
+  buildSetLabelOperation,
+  normalizeUpdateVersion,
+  reportDefaultExtension,
+  sanitizeFileName,
+  validateBindingForm,
+} from './repositoryOperationBuilders';
+import {
+  askRecursiveMode,
+  pickBoolean,
+  pickReportFlags,
+  pickReportFormat,
+  pickRights,
+  promptOptionalText,
+  promptRequiredText,
+} from './repositoryPrompts';
+import { registerRepositoryLockCommand } from './RepositoryLockCommand';
+import {
+  requireConnectedRootTarget,
+  requireRepositoryNode,
+  requireRootTarget,
+  resolveRepositoryNode,
+  toCliServices,
+} from './repositoryNodeTargets';
+import { findChangedConfiguration, refreshRepositoryUi, runPostRepositorySync, updateTargetDatabase } from './repositoryPostSync';
 
-interface BooleanPickItem extends vscode.QuickPickItem {
-  value: boolean;
-}
-
-interface ReportFlagItem extends vscode.QuickPickItem {
-  flag:
-    | 'GroupByObject'
-    | 'GroupByComment'
-    | 'DoNotIncludeVersionsWithLabels'
-    | 'IncludeOnlyVersionsWithLabels'
-    | 'IncludeCommentLinesWithDoubleSlash';
-}
-
-interface RightsPickItem extends vscode.QuickPickItem {
-  value: 'ReadOnly' | 'LockObjects' | 'ManageConfigurationVersions' | 'Administration';
-}
-
-type RepositoryCommandNode = NodeArg & RepositoryNodeRef;
 
 /**
  * Регистрирует команды работы с хранилищем конфигурации.
@@ -44,6 +50,7 @@ export function registerRepositoryCommands(
   context: vscode.ExtensionContext,
   services: CommandServices
 ): void {
+  registerRepositoryLockCommand(context, services);
   context.subscriptions.push(
     vscode.commands.registerCommand('v8vscedit.repository.connect', async (node: NodeArg) => {
       const target = requireRootTarget(services, node);
@@ -68,29 +75,29 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runRepositoryCliCommand({
-        command: 'repository-bind',
-        target,
-        bindingOverride: validation.binding,
-        extraArgs: [
-          ...(formData.forceBindAlreadyBindedUser ? ['-ForceBindAlreadyBindedUser'] : []),
-          ...(formData.forceReplaceCfg ? ['-ForceReplaceCfg'] : []),
-        ],
-        progressTitle: `Подключение к хранилищу: ${target.displayName}`,
-        progressStartMessage: 'Подключаю конфигурацию к хранилищу...',
-        successMessage: `Конфигурация "${target.displayName}" подключена к хранилищу.`,
-        errorTitle: `Ошибка подключения "${target.displayName}" к хранилищу.`,
-        failureOperation: 'подключении к хранилищу',
-        afterSuccess: async () => {
-          await services.repositoryService.saveBinding(target, validation.binding);
-          services.repositoryService.setConnected(target, true);
-          refreshRepositoryUi(services);
-        },
-      }, toCliServices(services));
+      // Подключение и пост-синхронизация (обновление БД + импорт) — одна секция замка:
+      // иначе между ними могла бы вклиниться другая операция над той же базой.
+      await runWithConfigurationOperationLock(async () => {
+        const ok = await runRepositoryCliCommand({
+          operation: buildBindOperation(formData),
+          target,
+          bindingOverride: validation.binding,
+          progressTitle: `Подключение к хранилищу: ${target.displayName}`,
+          progressStartMessage: 'Подключаю конфигурацию к хранилищу...',
+          successMessage: `Конфигурация "${target.displayName}" подключена к хранилищу.`,
+          errorTitle: `Ошибка подключения "${target.displayName}" к хранилищу.`,
+          failureOperation: 'подключении к хранилищу',
+          afterSuccess: async () => {
+            await services.repositoryService.saveBinding(target, validation.binding);
+            services.repositoryService.setConnected(target, true);
+            refreshRepositoryUi(services);
+          },
+        }, toCliServices(services));
 
-      if (ok) {
-        void runPostRepositorySync(target, services);
-      }
+        if (ok) {
+          await runPostRepositorySync(target, services);
+        }
+      });
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.create', async (node: NodeArg) => {
@@ -116,36 +123,32 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runRepositoryCliCommand({
-        command: 'repository-create',
-        target,
-        bindingOverride: validation.binding,
-        extraArgs: [
-          ...(formData.allowConfigurationChanges ? ['-AllowConfigurationChanges'] : []),
-          ...(formData.changesAllowedRule ? ['-ChangesAllowedRule', formData.changesAllowedRule] : []),
-          ...(formData.changesNotRecommendedRule ? ['-ChangesNotRecommendedRule', formData.changesNotRecommendedRule] : []),
-          ...(formData.noBind ? ['-NoBind'] : []),
-        ],
-        progressTitle: `Создание хранилища: ${target.displayName}`,
-        progressStartMessage: 'Создаю хранилище конфигурации...',
-        successMessage: `Хранилище для "${target.displayName}" создано.`,
-        errorTitle: `Ошибка создания хранилища для "${target.displayName}".`,
-        failureOperation: 'создании хранилища',
-        afterSuccess: async () => {
-          await services.repositoryService.saveBinding(target, validation.binding);
-          services.repositoryService.setConnected(target, !formData.noBind);
-          refreshRepositoryUi(services);
-        },
-      }, toCliServices(services));
+      await runWithConfigurationOperationLock(async () => {
+        const ok = await runRepositoryCliCommand({
+          operation: buildCreateOperation(formData),
+          target,
+          bindingOverride: validation.binding,
+          progressTitle: `Создание хранилища: ${target.displayName}`,
+          progressStartMessage: 'Создаю хранилище конфигурации...',
+          successMessage: `Хранилище для "${target.displayName}" создано.`,
+          errorTitle: `Ошибка создания хранилища для "${target.displayName}".`,
+          failureOperation: 'создании хранилища',
+          afterSuccess: async () => {
+            await services.repositoryService.saveBinding(target, validation.binding);
+            services.repositoryService.setConnected(target, !formData.noBind);
+            refreshRepositoryUi(services);
+          },
+        }, toCliServices(services));
 
-      if (ok && !formData.noBind) {
-        void runPostRepositorySync(target, services);
-      }
+        if (ok && !formData.noBind) {
+          await runPostRepositorySync(target, services);
+        }
+      });
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.disconnect', async (node: NodeArg) => {
-      const target = requireRootTarget(services, node);
-      if (!target || !ensureConnected(services.repositoryService, target)) {
+      const target = requireConnectedRootTarget(services, node);
+      if (!target) {
         return;
       }
 
@@ -159,10 +162,9 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-unbind',
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: { kind: 'unbind', force },
         target,
-        extraArgs: force ? ['-Force'] : [],
         progressTitle: `Отключение от хранилища: ${target.displayName}`,
         progressStartMessage: 'Отключаю конфигурацию от хранилища...',
         successMessage: `Конфигурация "${target.displayName}" отключена от хранилища.`,
@@ -172,24 +174,7 @@ export function registerRepositoryCommands(
           await services.repositoryService.clearBinding(target);
           refreshRepositoryUi(services);
         },
-      }, toCliServices(services));
-    }),
-
-    vscode.commands.registerCommand('v8vscedit.repository.lock', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
-        return;
-      }
-
-      const recursive = await askRecursiveMode('Захват объектов', repositoryNode.label ?? 'выбранный узел');
-      if (recursive === undefined) {
-        return;
-      }
-
-      const ok = await runRepositoryLockAction(toCliServices(services), repositoryNode, recursive);
-      if (ok) {
-        refreshRepositoryUi(services);
-      }
+      }, toCliServices(services)));
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.unlock', async (node: NodeArg) => {
@@ -212,25 +197,26 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runRepositoryUnlockAction(toCliServices(services), repositoryNode, recursive, force);
+      const ok = await runWithConfigurationOperationLock(
+        () => runRepositoryUnlockAction(toCliServices(services), repositoryNode, recursive, force)
+      );
       if (ok) {
         refreshRepositoryUi(services);
       }
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.commit', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
+      const resolved = resolveRepositoryNode(services, node);
+      if (!resolved) {
         return;
       }
+      const { node: repositoryNode, target } = resolved;
 
-      const target = requireTarget(services.repositoryService, repositoryNode);
-      if (!target) {
-        return;
-      }
-
-      const updatedBeforeCommit = await ensureTargetUpdatedBeforeCommit(target, services);
-      if (!updatedBeforeCommit) {
+      // Все вопросы пользователю — ДО замка (иначе открытая форма держала бы «операция уже
+      // выполняется» для всех), а «обновить БД → поместить» — одна секция замка: помещается
+      // ровно то, что загружено в базу, без вклинившейся между шагами операции.
+      const updateBeforeCommit = await confirmUpdateBeforeCommit(target, services);
+      if (updateBeforeCommit === undefined) {
         return;
       }
 
@@ -248,7 +234,12 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runRepositoryCommitAction(toCliServices(services), repositoryNode, formData);
+      const ok = await runWithConfigurationOperationLock(async () => {
+        if (updateBeforeCommit && !await updateTargetDatabase(target, services)) {
+          return false;
+        }
+        return runRepositoryCommitAction(toCliServices(services), repositoryNode, formData);
+      });
       if (ok) {
         refreshRepositoryUi(services);
       }
@@ -283,11 +274,11 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runRepositoryUpdateAction(toCliServices(services), repositoryNode, {
+      const ok = await runWithConfigurationOperationLock(() => runRepositoryUpdateAction(toCliServices(services), repositoryNode, {
         recursive,
         force,
-        version: version.trim() || undefined,
-      });
+        version: normalizeUpdateVersion(version),
+      }));
       if (ok) {
         refreshRepositoryUi(services);
       }
@@ -321,21 +312,15 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-add-user',
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: buildAddUserOperation({ user: userName, password, rights, restoreDeletedUser }),
         target,
-        extraArgs: [
-          '-User', userName,
-          '-Pwd', password,
-          '-Rights', rights,
-          ...(restoreDeletedUser ? ['-RestoreDeletedUser'] : []),
-        ],
         progressTitle: `Пользователь хранилища: ${target.displayName}`,
         progressStartMessage: 'Добавляю пользователя в хранилище...',
         successMessage: `Пользователь "${userName}" добавлен в хранилище.`,
         errorTitle: `Ошибка добавления пользователя в хранилище "${target.displayName}".`,
         failureOperation: 'добавлении пользователя в хранилище',
-      }, toCliServices(services));
+      }, toCliServices(services)));
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.copyUsers', async (node: NodeArg) => {
@@ -366,21 +351,15 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-copy-users',
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: buildCopyUsersOperation({ path: sourcePath, user: userName, password, restoreDeletedUser }),
         target,
-        extraArgs: [
-          '-Path', sourcePath,
-          '-User', userName,
-          '-Pwd', password,
-          ...(restoreDeletedUser ? ['-RestoreDeletedUser'] : []),
-        ],
         progressTitle: `Копирование пользователей: ${target.displayName}`,
         progressStartMessage: 'Копирую пользователей из другого хранилища...',
         successMessage: `Пользователи для "${target.displayName}" скопированы.`,
         errorTitle: `Ошибка копирования пользователей в хранилище "${target.displayName}".`,
         failureOperation: 'копировании пользователей хранилища',
-      }, toCliServices(services));
+      }, toCliServices(services)));
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.dump', async (node: NodeArg) => {
@@ -415,19 +394,16 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-dump',
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: buildDumpOperation(version),
         target,
-        extraArgs: [
-          '-File', fileUri.fsPath,
-          ...(version.trim() ? ['-Version', version.trim()] : []),
-        ],
+        output: { name: REPOSITORY_DUMP_OUTPUT, targetPath: fileUri.fsPath },
         progressTitle: `Выгрузка версии: ${target.displayName}`,
         progressStartMessage: 'Выгружаю конфигурацию из хранилища...',
         successMessage: `Версия хранилища "${target.displayName}" выгружена в "${fileUri.fsPath}".`,
         errorTitle: `Ошибка выгрузки версии хранилища "${target.displayName}".`,
         failureOperation: 'выгрузке версии из хранилища',
-      }, toCliServices(services));
+      }, toCliServices(services)));
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.report', async (node: NodeArg) => {
@@ -440,7 +416,7 @@ export function registerRepositoryCommands(
       if (!format) {
         return;
       }
-      const defaultExtension = format === 'mxl' ? 'mxl' : 'txt';
+      const defaultExtension = reportDefaultExtension(format);
       const fileUri = await vscode.window.showSaveDialog({
         title: 'Отчёт по хранилищу',
         defaultUri: vscode.Uri.file(path.join(
@@ -486,25 +462,17 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-report',
+      const reportOperation = buildReportOperation({ nBegin, nEnd, dateBegin, dateEnd, configurationVersion, format, flags });
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: reportOperation,
         target,
-        extraArgs: [
-          '-File', fileUri.fsPath,
-          ...(nBegin.trim() ? ['-NBegin', nBegin.trim()] : []),
-          ...(nEnd.trim() ? ['-NEnd', nEnd.trim()] : []),
-          ...(dateBegin.trim() ? ['-DateBegin', dateBegin.trim()] : []),
-          ...(dateEnd.trim() ? ['-DateEnd', dateEnd.trim()] : []),
-          ...(configurationVersion.trim() ? ['-ConfigurationVersion', configurationVersion.trim()] : []),
-          '-ReportFormat', format,
-          ...flags.flatMap((flag) => [`-${flag}`]),
-        ],
+        output: { name: repositoryReportOutputName(reportOperation), targetPath: fileUri.fsPath },
         progressTitle: `Отчёт по хранилищу: ${target.displayName}`,
         progressStartMessage: 'Строю отчёт по истории хранилища...',
         successMessage: `Отчёт по хранилищу "${target.displayName}" сформирован.`,
         errorTitle: `Ошибка построения отчёта по хранилищу "${target.displayName}".`,
         failureOperation: 'построении отчёта по хранилищу',
-      }, toCliServices(services));
+      }, toCliServices(services)));
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.setLabel', async (node: NodeArg) => {
@@ -526,47 +494,30 @@ export function registerRepositoryCommands(
         return;
       }
 
-      await runRepositoryCliCommand({
-        command: 'repository-set-label',
+      await runWithConfigurationOperationLock(() => runRepositoryCliCommand({
+        operation: buildSetLabelOperation({ name: labelName, version, comment }),
         target,
-        extraArgs: [
-          '-LabelName', labelName,
-          ...(version.trim() ? ['-Version', version.trim()] : []),
-          ...(comment.trim() ? ['-Comment', comment.trim()] : []),
-        ],
         progressTitle: `Установка метки: ${target.displayName}`,
         progressStartMessage: 'Устанавливаю метку версии в хранилище...',
         successMessage: `Метка "${labelName}" установлена для "${target.displayName}".`,
         errorTitle: `Ошибка установки метки для "${target.displayName}".`,
         failureOperation: 'установке метки хранилища',
-      }, toCliServices(services));
+      }, toCliServices(services)));
     })
   );
 }
 
-function toCliServices(services: CommandServices): RepositoryCliServices {
-  return {
-    workspaceFolder: services.workspaceFolder,
-    outputChannel: services.outputChannel,
-    repositoryService: services.repositoryService,
-    projectSecretStorage: services.projectSecretStorage,
-  };
-}
-
-function refreshRepositoryUi(services: CommandServices): void {
-  services.treeProvider.refresh();
-  services.refreshActionsView();
-}
-
-async function ensureTargetUpdatedBeforeCommit(
+/**
+ * Нужна ли загрузка локальных изменений в базу перед помещением: `false` — изменений нет,
+ * `true` — пользователь согласился обновить, `undefined` — помещение отменено.
+ */
+async function confirmUpdateBeforeCommit(
   target: RepositoryTarget,
   services: CommandServices
-): Promise<boolean> {
-  const changed = services.getChangedConfigurations().find(
-    (item) => path.resolve(item.rootPath).toLowerCase() === path.resolve(target.configRoot).toLowerCase()
-  );
+): Promise<boolean | undefined> {
+  const changed = await findChangedConfiguration(services, target);
   if (!changed) {
-    return true;
+    return false;
   }
 
   const picked = await vscode.window.showQuickPick([
@@ -587,278 +538,5 @@ async function ensureTargetUpdatedBeforeCommit(
     ignoreFocusOut: true,
   });
 
-  if (picked?.id !== 'update') {
-    return false;
-  }
-
-  const updated = target.configKind === 'cfe'
-    ? await runUpdateExtension(
-        target.extensionName ?? target.displayName,
-        target.configRoot,
-        services.workspaceFolder,
-        services.outputChannel,
-        false
-      )
-    : await runUpdateMainConfiguration(
-        target.displayName,
-        target.configRoot,
-        services.workspaceFolder,
-        services.outputChannel,
-        false
-      );
-  if (!updated) {
-    return false;
-  }
-
-  services.markConfigurationsClean([target.configRoot]);
-  refreshRepositoryUi(services);
-  return true;
-}
-
-async function runPostRepositorySync(target: RepositoryTarget, services: CommandServices): Promise<void> {
-  try {
-    const updated = await runApplyDatabaseConfiguration({
-      kind: target.configKind,
-      name: target.displayName,
-      rootPath: target.configRoot,
-      extensionName: target.extensionName,
-    }, services.workspaceFolder, services.outputChannel, false);
-    if (!updated) {
-      return;
-    }
-
-    const imported = target.configKind === 'cfe'
-      ? await runDecompileExtension(
-          target.extensionName ?? target.displayName,
-          target.configRoot,
-          services.workspaceFolder,
-          services.outputChannel
-        )
-      : await runDecompileMainConfiguration(
-          target.displayName,
-          target.configRoot,
-          services.workspaceFolder,
-          services.outputChannel
-        );
-    if (!imported) {
-      return;
-    }
-
-    services.markConfigurationsClean([target.configRoot]);
-    await services.reloadEntries();
-    refreshRepositoryUi(services);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    services.outputChannel.appendLine(`[repository][post-sync][error] ${message}`);
-  }
-}
-
-function requireRootTarget(services: CommandServices, node: NodeArg): RepositoryTarget | null {
-  const repositoryNode = node as RepositoryCommandNode | undefined;
-  if (!repositoryNode?.xmlPath || (repositoryNode.nodeKind !== 'configuration' && repositoryNode.nodeKind !== 'extension')) {
-    void vscode.window.showWarningMessage('Команда хранилища доступна только для корня основной конфигурации или расширения.');
-    return null;
-  }
-
-  return requireTarget(services.repositoryService, repositoryNode);
-}
-
-function requireConnectedRootTarget(services: CommandServices, node: NodeArg): RepositoryTarget | null {
-  const target = requireRootTarget(services, node);
-  if (!target || !ensureConnected(services.repositoryService, target)) {
-    return null;
-  }
-  return target;
-}
-
-function requireRepositoryNode(services: CommandServices, node: NodeArg): RepositoryCommandNode | null {
-  const repositoryNode = node as RepositoryCommandNode | undefined;
-  if (!repositoryNode?.xmlPath) {
-    void vscode.window.showWarningMessage('Команда хранилища доступна только для узлов конфигурации с XML.');
-    return null;
-  }
-
-  const target = requireTarget(services.repositoryService, repositoryNode);
-  if (!target || !ensureConnected(services.repositoryService, target)) {
-    return null;
-  }
-
-  return repositoryNode;
-}
-
-function requireTarget(repositoryService: RepositoryService, node: RepositoryNodeRef): RepositoryTarget | null {
-  if (!node.xmlPath) {
-    return null;
-  }
-  return repositoryService.resolveTargetByXmlPath(node.xmlPath);
-}
-
-function ensureConnected(repositoryService: RepositoryService, target: RepositoryTarget): boolean {
-  if (!repositoryService.hasBinding(target) || !repositoryService.isConnected(target)) {
-    void vscode.window.showWarningMessage(`Для "${target.displayName}" нет активного подключения к хранилищу.`);
-    return false;
-  }
-  return true;
-}
-
-function validateBindingForm(
-  formData: { repoPath: string; repoUser: string; repoPassword: string }
-): { ok: true; binding: RepositoryBinding } | { ok: false; errorMessage: string } {
-  const repoPath = formData.repoPath.trim();
-  const repoUser = formData.repoUser.trim();
-  if (!repoPath) {
-    return {
-      ok: false,
-      errorMessage: '\u041d\u0443\u0436\u043d\u043e \u0443\u043a\u0430\u0437\u0430\u0442\u044c \u043f\u0443\u0442\u044c \u043a \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0443 \u0438\u043b\u0438 \u0430\u0434\u0440\u0435\u0441 \u0441\u0435\u0440\u0432\u0435\u0440\u0430.',
-    };
-  }
-  if (!repoUser) {
-    return {
-      ok: false,
-      errorMessage: '\u041d\u0443\u0436\u043d\u043e \u0443\u043a\u0430\u0437\u0430\u0442\u044c \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0430.',
-    };
-  }
-  return {
-    ok: true,
-    binding: {
-      repoPath,
-      repoUser,
-      repoPassword: formData.repoPassword,
-    },
-  };
-}
-
-async function askRecursiveMode(title: string, nodeLabel: string): Promise<boolean | undefined> {
-  return pickBoolean(
-    title,
-    `Как выполнить операцию для "${nodeLabel}"?`,
-    'Рекурсивно',
-    'Только выбранный объект'
-  );
-}
-
-async function pickBoolean(
-  title: string,
-  placeHolder: string,
-  trueLabel: string,
-  falseLabel: string
-): Promise<boolean | undefined> {
-  const items: BooleanPickItem[] = [
-    { label: trueLabel, value: true },
-    { label: falseLabel, value: false },
-  ];
-  const picked = await vscode.window.showQuickPick(items, {
-    title,
-    placeHolder,
-    ignoreFocusOut: true,
-  });
-  return picked?.value;
-}
-
-async function pickRights(): Promise<RightsPickItem['value'] | undefined> {
-  const items: RightsPickItem[] = [
-    {
-      label: 'Administration',
-      description: 'Полный административный доступ к хранилищу',
-      value: 'Administration',
-    },
-    {
-      label: 'ManageConfigurationVersions',
-      description: 'Управление версиями и метками',
-      value: 'ManageConfigurationVersions',
-    },
-    {
-      label: 'LockObjects',
-      description: 'Захват, освобождение и помещение объектов',
-      value: 'LockObjects',
-    },
-    {
-      label: 'ReadOnly',
-      description: 'Только чтение истории и версий',
-      value: 'ReadOnly',
-    },
-  ];
-  const picked = await vscode.window.showQuickPick(items, {
-    title: 'Права пользователя хранилища',
-    placeHolder: 'Выберите набор прав',
-    ignoreFocusOut: true,
-  });
-  return picked?.value;
-}
-
-async function pickReportFormat(): Promise<'txt' | 'mxl' | undefined> {
-  const picked = await vscode.window.showQuickPick([
-    { label: 'txt', description: 'Текстовый отчёт' },
-    { label: 'mxl', description: 'Табличный документ 1С' },
-  ], {
-    title: 'Формат отчёта по хранилищу',
-    placeHolder: 'Выберите формат файла отчёта',
-    ignoreFocusOut: true,
-  });
-
-  if (picked?.label === 'txt' || picked?.label === 'mxl') {
-    return picked.label;
-  }
-  return undefined;
-}
-
-async function pickReportFlags(): Promise<ReportFlagItem['flag'][] | undefined> {
-  const items: ReportFlagItem[] = [
-    {
-      label: 'Группировать по объектам',
-      description: 'Параметр GroupByObject',
-      flag: 'GroupByObject',
-    },
-    {
-      label: 'Группировать по комментариям',
-      description: 'Параметр GroupByComment',
-      flag: 'GroupByComment',
-    },
-    {
-      label: 'Исключить версии с метками',
-      description: 'Параметр DoNotIncludeVersionsWithLabels',
-      flag: 'DoNotIncludeVersionsWithLabels',
-    },
-    {
-      label: 'Включить только версии с метками',
-      description: 'Параметр IncludeOnlyVersionsWithLabels',
-      flag: 'IncludeOnlyVersionsWithLabels',
-    },
-    {
-      label: 'Включать строки комментариев с //',
-      description: 'Параметр IncludeCommentLinesWithDoubleSlash',
-      flag: 'IncludeCommentLinesWithDoubleSlash',
-    },
-  ];
-
-  const picked = await vscode.window.showQuickPick(items, {
-    title: 'Дополнительные параметры отчёта',
-    placeHolder: 'Можно выбрать несколько флагов или не выбирать ни одного',
-    canPickMany: true,
-    ignoreFocusOut: true,
-  });
-  return picked?.map((item) => item.flag);
-}
-
-async function promptRequiredText(title: string, prompt: string, password = false): Promise<string | undefined> {
-  const value = await vscode.window.showInputBox({
-    title,
-    prompt,
-    password,
-    ignoreFocusOut: true,
-    validateInput: (input) => (input.trim() ? undefined : 'Значение обязательно'),
-  });
-  return value?.trim();
-}
-
-async function promptOptionalText(title: string, prompt: string): Promise<string | undefined> {
-  return vscode.window.showInputBox({
-    title,
-    prompt,
-    ignoreFocusOut: true,
-  });
-}
-
-function sanitizeFileName(value: string): string {
-  return value.replace(/[\\/:*?"<>|]/g, '_');
+  return picked?.id === 'update' ? true : undefined;
 }

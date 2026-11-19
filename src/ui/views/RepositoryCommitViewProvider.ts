@@ -10,7 +10,27 @@ export interface RepositoryCommitFormData {
 
 type RepositoryCommitMessage =
   | { readonly type: 'command'; readonly command: 'submit'; readonly payload: RepositoryCommitFormData }
-  | { readonly type: 'command'; readonly command: 'cancel' };
+  | { readonly type: 'command'; readonly command: 'cancel' }
+  | { readonly type: string; readonly command?: string };
+
+/** Ответ формы: данные или отмена. */
+export type RepositoryCommitAnswer = { readonly kind: 'submit'; readonly data: RepositoryCommitFormData } | { readonly kind: 'cancel' };
+
+/**
+ * Ответом формы считаются только команды submit/cancel; иное сообщение (`null`) форму не закрывает.
+ * Служебное `{ type: 'ready' }`, которое
+ * webview шлёт сразу после загрузки, раньше трактовалось как отмена: панель закрывалась в момент
+ * открытия, и помещение молча прекращалось.
+ */
+export function resolveRepositoryCommitAnswer(message: RepositoryCommitMessage): RepositoryCommitAnswer | null {
+  if (message.type !== 'command') {
+    return null;
+  }
+  if (message.command === 'submit' && 'payload' in message) {
+    return { kind: 'submit', data: message.payload };
+  }
+  return message.command === 'cancel' ? { kind: 'cancel' } : null;
+}
 
 /**
  * Провайдер панели помещения изменений в хранилище 1С.
@@ -85,7 +105,11 @@ export class RepositoryCommitViewProvider implements vscode.Disposable {
   }
 
   private handleMessage(message: RepositoryCommitMessage): void {
-    this.resolvePromise?.(message.command === 'submit' ? message.payload : undefined);
+    const answer = resolveRepositoryCommitAnswer(message);
+    if (!answer) {
+      return;
+    }
+    this.resolvePromise?.(answer.kind === 'submit' ? answer.data : undefined);
     this.panel?.dispose();
     this.panel = undefined;
   }

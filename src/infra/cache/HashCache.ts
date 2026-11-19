@@ -75,6 +75,14 @@ export function buildHashSnapshot(scopeKey: string, configDir: string): HashCach
 }
 
 /**
+ * Базовая линия считается снятой, если у неё есть время снятия или хотя бы один файл: снимок пустой
+ * выгрузки тоже валидная линия, а `loadHashCache` без файла возвращает снимок без того и другого.
+ */
+export function hasHashBaseline(snapshot: HashCacheSnapshot): boolean {
+  return Boolean(snapshot.generatedAt || Object.keys(snapshot.files).length > 0);
+}
+
+/**
  * Сохраняет снапшот на диск в служебный каталог проекта.
  */
 export function saveHashCache(projectRoot: string, snapshot: HashCacheSnapshot): void {
@@ -173,7 +181,15 @@ function getCacheFilePath(projectRoot: string, scopeKey: string): string {
 }
 
 function computeFileHash(filePath: string): string {
-  const content = fs.readFileSync(filePath);
+  return hashContent(fs.readFileSync(filePath));
+}
+
+/**
+ * SHA-1 уже прочитанного содержимого: быстрая проверка (`HashScanner`) читает файлы асинхронно и
+ * обязана хешировать ровно так же, как эталонный полный проход, иначе базовая линия и текущее
+ * состояние расходились бы на каждом файле.
+ */
+export function hashContent(content: Uint8Array): string {
   const oneShotHash = Reflect.get(crypto, 'hash');
   if (typeof oneShotHash === 'function') {
     return oneShotHash('sha1', content, 'hex');

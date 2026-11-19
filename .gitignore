@@ -30,3 +30,5 @@ npm-debug.log*
 
 docs/1cdocs
 .claude
+
+tmp/

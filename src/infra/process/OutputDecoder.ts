@@ -18,6 +18,26 @@ export function recoverGarbledText(chunk: Buffer): string {
 }
 
 /**
+ * Декодирует лог `/Out` пакетного конфигуратора. Кодировку платформа выбирает сама
+ * (UTF-16 с BOM обеих очерёдностей, UTF-8 с BOM, BOM-less OEM-866/Win1251), поэтому
+ * сначала BOM, затем эвристика. В отличие от {@link decodeProcessOutput} от ОС не
+ * зависит: файл может прийти и с удалённого сервера.
+ */
+export function decodeDesignerLogBytes(data: Uint8Array): string {
+  const buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return buffer.subarray(2).toString('utf16le');
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return decode(buffer.subarray(2), 'utf16-be');
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return buffer.subarray(3).toString('utf-8');
+  }
+  return recoverGarbledText(buffer);
+}
+
+/**
  * Нормализует кодировку вывода внешней команды.
  * Декодер обрабатывает stdout процесса, запущенного на ЭТОЙ же машине, поэтому
  * кодировка вывода соответствует платформе хоста. На Windows консольные утилиты

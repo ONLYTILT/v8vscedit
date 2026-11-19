@@ -31,7 +31,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, statSync } 
 import * as path from 'node:path';
 import { globSync } from 'glob';
 import { branchRangesOfSource } from './patch-coverage/branchFacts.mjs';
-import { parseLcov, summarizeBranchCoverage, buildVerdict } from './patch-coverage/verdict.mjs';
+import { parseLcov, summarizeBranchCoverage, buildVerdict, lcovKeyRelativeToRoot } from './patch-coverage/verdict.mjs';
 import { planShards, verifyShardReports } from './patch-coverage/shards.mjs';
 import { resolveDiffBase, addedLines } from './patch-coverage/diffBase.mjs';
 
@@ -367,7 +367,7 @@ const lcovPath = path.join(ROOT, 'coverage', 'lcov.info');
 const lcov = existsSync(lcovPath)
   ? new Map(
       [...parseLcov(readFileSync(lcovPath, 'utf-8'))].map(([sf, entry]) => [
-        path.relative(ROOT, path.resolve(ROOT, sf)),
+        lcovKeyRelativeToRoot(sf, ROOT, path),
         entry,
       ])
     )

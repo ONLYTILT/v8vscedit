@@ -1,40 +1,19 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { decode } from 'iconv-lite';
-import { resolveV8ExecutablePath, runProcess } from '../../infra/process';
+import { decodeDesignerLogBytes, resolveV8ExecutablePath, runProcess } from '../../infra/process';
+import { buildInfoBaseConnectionArgs } from '../../infra/process/designer/InfoBaseConnectionArgs';
 import type { OnecConnection } from './types';
 
-export interface RepositoryConnection {
-  repoPath: string;
-  repoUser: string;
-  repoPassword: string;
-}
+// Перенос staging-файла общий для CLI и расширения, поэтому живёт в infra.
+export { moveStagingToTarget } from '../../infra/fs/StagingFile';
 
 export function resolveV8Path(v8Path: string): string {
   return resolveV8ExecutablePath(v8Path);
 }
 
 export function appendConnectionArgs(args: string[], connection: OnecConnection): void {
-  if (connection.infoBaseServer && connection.infoBaseRef) {
-    args.push('/S', `${connection.infoBaseServer}/${connection.infoBaseRef}`);
-  } else {
-    args.push('/F', connection.infoBasePath);
-  }
-  if (connection.userName) {
-    args.push(`/N${connection.userName}`);
-  }
-  if (connection.password) {
-    args.push(`/P${connection.password}`);
-  }
-}
-
-export function appendRepositoryArgs(args: string[], repository: RepositoryConnection): void {
-  args.push('/ConfigurationRepositoryF', repository.repoPath);
-  args.push('/ConfigurationRepositoryN', repository.repoUser);
-  if (repository.repoPassword) {
-    args.push('/ConfigurationRepositoryP', repository.repoPassword);
-  }
+  args.push(...buildInfoBaseConnectionArgs(connection));
 }
 
 export function createTempDir(prefix: string): string {
@@ -51,23 +30,6 @@ export function safeRemoveDir(dirPath: string): void {
 
 export function writeUtf8BomLines(filePath: string, lines: string[]): void {
   fs.writeFileSync(filePath, `\uFEFF${lines.join('\n')}`, 'utf-8');
-}
-
-/**
- * Переносит успешно выгруженный staging-файл на целевой путь.
- *
- * ЕДИНСТВЕННАЯ реализация этого переноса в CLI: и одиночная выгрузка
- * (`dump-cf`), и пакетная (`dump-cfe-all`) обязаны вести себя одинаково —
- * разошедшиеся копии никто бы не поймал, обе исполняются только в дочернем
- * процессе. На Windows `rename` поверх существующего файла падает, поэтому цель
- * удаляется явно (перезапись к этому моменту уже разрешена guard'ом
- * `-Overwrite`).
- */
-export function moveStagingToTarget(stagingPath: string, targetPath: string): void {
-  if (fs.existsSync(targetPath)) {
-    fs.rmSync(targetPath, { force: true });
-  }
-  fs.renameSync(stagingPath, targetPath);
 }
 
 /**
@@ -117,53 +79,18 @@ export function printLogFile(filePath: string): void {
     return;
   }
   try {
-    const data = fs.readFileSync(filePath);
-    const content = decodeLogFile(data).trim();
-    if (!content) {
-      return;
-    }
-    console.log('--- Log ---');
-    console.log(content);
-    console.log('--- End ---');
+    printLogText(decodeDesignerLogBytes(fs.readFileSync(filePath)).trim());
   } catch {
     // Ошибка чтения лога не критична.
   }
 }
 
-function decodeLogFile(data: Buffer): string {
-  if (data.length >= 2 && data[0] === 0xff && data[1] === 0xfe) {
-    return data.subarray(2).toString('utf16le');
+/** Печать уже декодированного лога `/Out` в формате, который ждут скрипты-потребители CLI. */
+export function printLogText(content: string): void {
+  if (!content) {
+    return;
   }
-  if (data.length >= 2 && data[0] === 0xfe && data[1] === 0xff) {
-    return decode(data.subarray(2), 'utf16-be');
-  }
-  if (data.length >= 3 && data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf) {
-    return data.subarray(3).toString('utf-8');
-  }
-
-  const utf8Text = data.toString('utf-8');
-  if (!utf8Text.includes('�')) {
-    return utf8Text;
-  }
-
-  const cp866Text = decode(data, 'cp866');
-  const cp1251Text = decode(data, 'win1251');
-  return pickMostReadableText([cp866Text, cp1251Text, utf8Text]);
-}
-
-function pickMostReadableText(candidates: string[]): string {
-  let best = candidates[0] ?? '';
-  let bestScore = -1;
-
-  for (const candidate of candidates) {
-    const cyr = (candidate.match(/[А-Яа-яЁё]/g) ?? []).length;
-    const replacement = (candidate.match(/�/g) ?? []).length;
-    const score = cyr * 2 - replacement * 3;
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
-    }
-  }
-
-  return best;
+  console.log('--- Log ---');
+  console.log(content);
+  console.log('--- End ---');
 }

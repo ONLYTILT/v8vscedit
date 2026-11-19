@@ -1,19 +1,27 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import * as vscode from 'vscode';
-import { decode } from 'iconv-lite';
 import type { RepositoryBinding, RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import { resolveDbPassword, type ProjectSecretStorage } from '../../../infra/environment';
 import {
-  describeProcessInterruption,
   formatCommandLineForLog,
   normalizeInfoBasePath,
-  pickMostReadableText,
   resolveV8ExecutablePath,
   resolveV8PathHintFromVersion,
-  runProcess,
 } from '../../../infra/process';
+import {
+  describeDesignerArgs,
+  type DesignerBatchExecutor,
+  type DesignerBatchResult,
+} from '../../../infra/process/designer/DesignerBatchExecutor';
+import { moveStagingToTarget } from '../../../infra/fs/StagingFile';
+import {
+  buildRepositoryDesignerRequest,
+  type RepositoryOperation,
+} from '../../../infra/repository/RepositoryDesignerArgs';
+import { hasReceivedFromRepository, resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
+import type { RepositoryLockOutcome } from './repositoryLockFlow';
+import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
+import { acquireDesignerBatchExecutor, type DesignerExecutorDeps } from '../ext/designerExecutorRegistry';
 
 interface ConnectionParams {
   infoBasePath?: string;
@@ -22,20 +30,24 @@ interface ConnectionParams {
   userName?: string;
   password?: string;
   v8Path?: string;
+  /** `--v8version` env.json: по нему путь к 1cv8 на сервере выводится, если `remote.v8Path` пуст. */
+  v8Version?: string;
 }
 
 interface RepositoryCliRunOptions {
-  command: string;
+  operation: RepositoryOperation;
   target: RepositoryTarget;
   bindingOverride?: RepositoryBinding;
-  extraArgs?: string[];
+  /** Выходной файл операции (dump/report): staging переносится на `targetPath` только при успехе. */
+  output?: { name: string; targetPath: string };
   progressTitle: string;
   progressStartMessage: string;
   successMessage: string;
   errorTitle: string;
   failureOperation?: string;
   showSuccessMessage?: boolean;
-  afterSuccess?: () => void | Promise<void>;
+  /** Получает результат запуска: по логу платформы уточняется, что именно сделано (Н10). */
+  afterSuccess?: (result: DesignerBatchResult) => void | Promise<void>;
 }
 
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -49,6 +61,45 @@ export interface RepositoryCliServices {
   outputChannel: vscode.OutputChannel;
   repositoryService: RepositoryService;
   projectSecretStorage: ProjectSecretStorage;
+  /**
+   * Фабрика исполнителя пакетного конфигуратора — приоритетный шов под интеграционный тест без
+   * установленной платформы. Без неё исполнитель выбирает реестр (локальный или удалённый).
+   */
+  createDesignerExecutor?: (v8Path: string, cwd: string) => DesignerBatchExecutor;
+  /** Шов реестра исполнителей (подмена хоста PowerShell в тестах); в продукте не задаётся. */
+  designerExecutorDeps?: DesignerExecutorDeps;
+}
+
+interface ResolvedExecutor {
+  readonly executor: DesignerBatchExecutor;
+  readonly v8Path: string;
+  readonly connection: ConnectionParams;
+}
+
+/**
+ * Исполнитель и путь к 1cv8. Ошибки конфигурации (env.json, удалённый режим) бросаются здесь,
+ * ДО начала операции: статус не включается, на сервер ничего не уходит.
+ */
+/** Подключение из env.json: путь к 1cv8 вычислен всегда (пустая строка — искать стандартную установку). */
+type ResolvedConnection = ConnectionParams & { v8Path: string };
+
+async function resolveExecutor(connection: ResolvedConnection, services: RepositoryCliServices): Promise<ResolvedExecutor> {
+  if (services.createDesignerExecutor) {
+    const v8Path = resolveV8ExecutablePath(connection.v8Path);
+    return { executor: services.createDesignerExecutor(v8Path, services.workspaceFolder.uri.fsPath), v8Path, connection };
+  }
+  const lease = await acquireDesignerBatchExecutor({
+    workspaceFolder: services.workspaceFolder,
+    outputChannel: services.outputChannel,
+    secrets: services.projectSecretStorage,
+    localV8Path: connection.v8Path,
+    v8Version: connection.v8Version,
+  }, services.designerExecutorDeps);
+  // С сервера база может адресоваться иначе (remote.ibConnection): учётные данные — те же, из env.json.
+  const effective = lease.ibConnectionOverride
+    ? { ...parseIbConnection(lease.ibConnectionOverride), userName: connection.userName, password: connection.password }
+    : connection;
+  return { executor: lease.executor, v8Path: lease.v8Path, connection: effective };
 }
 
 export async function runRepositoryCliCommand(
@@ -65,35 +116,21 @@ export async function runRepositoryCliCommand(
     throw new Error(`Для "${options.target.displayName}" не настроено подключение к хранилищу в env.json.`);
   }
 
-  const v8Path = resolveV8ExecutablePath(connection.v8Path ?? '');
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8repo_'));
-  const outFile = path.join(tempDir, `${options.command}.log`);
+  const { executor, v8Path, connection: effectiveConnection } = await resolveExecutor(connection, services);
 
   beginRepositoryOperationStatus(options.progressTitle, options.progressStartMessage);
 
   try {
-    const designerArgs: string[] = ['DESIGNER'];
-    appendConnectionDesignerArgs(designerArgs, connection);
-    appendRepositoryDesignerArgs(designerArgs, binding);
-    designerArgs.push(...buildCommandDesignerArgs(options.command, options.extraArgs ?? []));
-    if (options.target.extensionName) {
-      designerArgs.push('-Extension', options.target.extensionName);
-    }
-    designerArgs.push('/Out', outFile, '/DisableStartupDialogs');
-
-    // В векторе два секрета: пароль базы (слитно, `/P<пароль>`) и пароль
-    // хранилища (`/ConfigurationRepositoryP <пароль>`). Оба передаются маскеру
-    // ЗНАЧЕНИЯМИ — это точнее правил по ключам и не зависит от формы записи.
-    const commandAsText = formatCommandLineForLog(v8Path, designerArgs, [
-      // Пароль базы необязателен в env.json (тип допускает undefined), пароль
-      // хранилища — нет. Пустая строка маскером игнорируется.
-      connection.password ?? '',
-      binding.repoPassword,
-    ]);
+    // Пакетный Конфигуратор не войдёт в базу, пока её держит агент: отпускаем до запуска,
+    // а сбой отключения — отказ операции (ошибка показывается, исполнитель освобождается в finally).
+    await releaseAgentInfoBaseForBatch(services.workspaceFolder, services.outputChannel);
+    const request = buildRepositoryDesignerRequest(effectiveConnection, binding, options.operation, options.target.extensionName);
+    // Секреты (пароли базы, хранилища и пользователя операции) маскируются ЗНАЧЕНИЯМИ —
+    // это точнее правил по ключам и не зависит от формы записи.
+    const commandAsText = formatCommandLineForLog(v8Path, describeDesignerArgs(request.args), request.secrets);
     services.outputChannel.appendLine(`[repository] Старт: ${commandAsText}`);
 
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
+    const outputLines: string[] = [];
     // Прогресс-нотификация с кнопкой отмены для прерывания зависшего конфигуратора.
     // Статус-бар не переписываем — withProgress добавлен только ради отмены.
     const result = await vscode.window.withProgress(
@@ -102,64 +139,47 @@ export async function runRepositoryCliCommand(
         title: options.progressTitle,
         cancellable: true,
       },
-      (_progress, token) => runProcess({
-        command: v8Path,
-        args: designerArgs,
-        cwd: services.workspaceFolder.uri.fsPath,
-        shell: false,
-        cancellationToken: token,
-        onStdout: (text) => {
+      (_progress, token) => executor.run({
+        ...request,
+        cancellation: token,
+        onOutput: (text) => {
           const line = text.trim();
           if (!line) {
             return;
           }
-          stdoutChunks.push(line);
-          services.outputChannel.appendLine(`[repository][stdout] ${line}`);
+          outputLines.push(line);
+          services.outputChannel.appendLine(`[repository][output] ${line}`);
           updateRepositoryOperationStatus(options.progressTitle, trimStatusMessage(line));
-        },
-        onStderr: (text) => {
-          const line = text.trim();
-          if (!line) {
-            return;
-          }
-          stderrChunks.push(line);
-          services.outputChannel.appendLine(`[repository][stderr] ${line}`);
-          updateRepositoryOperationStatus(options.progressTitle, trimStatusMessage(`stderr: ${line}`));
         },
       })
     );
 
-    const interruption = describeProcessInterruption(result);
-    if (interruption) {
-      services.outputChannel.appendLine(`[repository] ${interruption}`);
+    if (result.interrupted) {
+      services.outputChannel.appendLine(`[repository] ${result.interrupted}`);
       endRepositoryOperationStatus(options.progressTitle, 'прервано');
-      void vscode.window.showInformationMessage(`${options.progressTitle}: ${interruption}`);
+      void vscode.window.showInformationMessage(`${options.progressTitle}: ${result.interrupted}`);
       return false;
     }
 
-    const logContent = readLogFileContent(outFile);
+    if (result.log) {
+      services.outputChannel.appendLine(`[repository][log]\n${result.log}`);
+    }
+    const operation = options.failureOperation ?? options.progressTitle.toLowerCase();
     if (result.exitCode !== 0) {
-      if (logContent) {
-        services.outputChannel.appendLine(`[repository][log]\n${logContent}`);
-      }
-      const details = [
-        ...stderrChunks,
-        ...stdoutChunks,
-        result.lastStderr,
-        result.lastStdout,
-        logContent,
-      ].filter(Boolean);
-      const reason = extractFailureReason(details, result.exitCode);
-      const operation = options.failureOperation ?? options.progressTitle.toLowerCase();
+      const reason = extractFailureReason([...outputLines, result.log], result.exitCode);
       throw new Error(`Ошибка при ${operation}: ${reason}`);
     }
 
-    if (logContent) {
-      services.outputChannel.appendLine(`[repository][log]\n${logContent}`);
+    if (options.output) {
+      const staged = result.outputs.get(options.output.name);
+      if (!staged) {
+        throw new Error(`Ошибка при ${operation}: конфигуратор не создал выходной файл.`);
+      }
+      moveStagingToTarget(staged, options.output.targetPath);
     }
 
     if (options.afterSuccess) {
-      await options.afterSuccess();
+      await options.afterSuccess(result);
     }
 
     services.outputChannel.appendLine(`[repository] Завершено: ${commandAsText}`);
@@ -172,14 +192,13 @@ export async function runRepositoryCliCommand(
     const message = error instanceof Error ? error.message : String(error);
     services.outputChannel.appendLine(`[repository][error] ${message}`);
     endRepositoryOperationStatus(options.progressTitle, 'ошибка');
-    await vscode.window.showErrorMessage(`${options.errorTitle}\n${message}`);
+    // Без await (запрет №18): раннер выполняется внутри секции общего замка, и открытая
+    // нотификация держала бы «операция уже выполняется» до её закрытия.
+    void vscode.window.showErrorMessage(`${options.errorTitle}\n${message}`);
     return false;
   } finally {
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      // временный каталог уже мог быть удалён — игнорируем
-    }
+    // Не забранный staging (сбой/отмена) не должен пережить операцию.
+    await executor.dispose();
   }
 }
 
@@ -193,29 +212,37 @@ export function resolveRepositoryTarget(
   return repositoryService.resolveTargetByXmlPath(node.xmlPath);
 }
 
+/**
+ * Захват объектов. Результат — что захвачено и получила ли база новые версии (по логу): по нему
+ * команда решает, нужен ли импорт в проект. `undefined` — захват не выполнен (ошибку показал раннер).
+ */
 export async function runRepositoryLockAction(
   services: RepositoryCliServices,
   node: RepositoryNodeRef,
-  recursive: boolean
-): Promise<boolean> {
+  recursive: boolean,
+  options: { readonly revised: boolean }
+): Promise<RepositoryLockOutcome | undefined> {
   const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.createObjectsFileForNode(node, recursive);
-  return runRepositoryCliCommand({
-    command: 'repository-lock',
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
+  let outcome: RepositoryLockOutcome | undefined;
+  const ok = await runRepositoryCliCommand({
+    operation: { kind: 'lock', objectsXml: objects.xml, revised: options.revised },
     target,
-    extraArgs: [
-      '-ObjectsFile',
-      objects.filePath,
-    ],
     progressTitle: `Захват: ${node.label ?? target.displayName}`,
-    progressStartMessage: 'Получаю объекты из хранилища для редактирования...',
+    progressStartMessage: options.revised
+      ? 'Захватываю объекты и получаю их версии из хранилища...'
+      : 'Получаю объекты из хранилища для редактирования...',
     successMessage: `Объекты "${node.label ?? target.displayName}" захвачены.`,
     errorTitle: `Ошибка захвата объектов "${node.label ?? target.displayName}".`,
     failureOperation: 'захвате объектов хранилища',
-    afterSuccess: () => {
-      services.repositoryService.setLocked(target, objects.fullNames, true);
+    // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
+    afterSuccess: (result) => {
+      const lockedFullNames = resolveLockedFullNames(objects.fullNames, result.log);
+      services.repositoryService.setLocked(target, lockedFullNames, true);
+      outcome = { lockedFullNames, receivedFromRepository: hasReceivedFromRepository(result.log) };
     },
   }, services);
+  return ok ? outcome : undefined;
 }
 
 export async function runRepositoryUnlockAction(
@@ -225,15 +252,10 @@ export async function runRepositoryUnlockAction(
   force: boolean
 ): Promise<boolean> {
   const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.createObjectsFileForNode(node, recursive);
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
   return runRepositoryCliCommand({
-    command: 'repository-unlock',
+    operation: { kind: 'unlock', objectsXml: objects.xml, force },
     target,
-    extraArgs: [
-      '-ObjectsFile',
-      objects.filePath,
-      ...(force ? ['-Force'] : []),
-    ],
     progressTitle: `Освобождение: ${node.label ?? target.displayName}`,
     progressStartMessage: 'Отменяю захват объектов...',
     successMessage: `Объекты "${node.label ?? target.displayName}" освобождены.`,
@@ -256,17 +278,16 @@ export async function runRepositoryCommitAction(
   }
 ): Promise<boolean> {
   const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.createObjectsFileForNode(node, options.recursive);
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
   return runRepositoryCliCommand({
-    command: 'repository-commit',
+    operation: {
+      kind: 'commit',
+      objectsXml: objects.xml,
+      comment: options.comment,
+      keepLocked: options.keepLocked,
+      force: options.force,
+    },
     target,
-    extraArgs: [
-      '-ObjectsFile',
-      objects.filePath,
-      ...(options.comment ? ['-Comment', options.comment] : []),
-      ...(options.keepLocked ? ['-KeepLocked'] : []),
-      ...(options.force ? ['-Force'] : []),
-    ],
     progressTitle: `Помещение: ${node.label ?? target.displayName}`,
     progressStartMessage: 'Помещаю изменения в хранилище...',
     successMessage: `Изменения "${node.label ?? target.displayName}" помещены в хранилище.`,
@@ -290,16 +311,10 @@ export async function runRepositoryUpdateAction(
   }
 ): Promise<boolean> {
   const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.createObjectsFileForNode(node, options.recursive);
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
   return runRepositoryCliCommand({
-    command: 'repository-update',
+    operation: { kind: 'update', objectsXml: objects.xml, version: options.version, force: options.force },
     target,
-    extraArgs: [
-      '-ObjectsFile',
-      objects.filePath,
-      ...(options.version ? ['-Version', options.version] : []),
-      ...(options.force ? ['-Force'] : []),
-    ],
     progressTitle: `Получение: ${node.label ?? target.displayName}`,
     progressStartMessage: 'Получаю изменения из хранилища...',
     successMessage: `Объекты "${node.label ?? target.displayName}" обновлены из хранилища.`,
@@ -316,262 +331,10 @@ function requireTarget(repositoryService: RepositoryService, node: RepositoryNod
   return target;
 }
 
-function appendConnectionDesignerArgs(args: string[], connection: ConnectionParams): void {
-  if (connection.infoBaseServer && connection.infoBaseRef) {
-    args.push('/S', `${connection.infoBaseServer}/${connection.infoBaseRef}`);
-  } else if (connection.infoBasePath) {
-    args.push('/F', connection.infoBasePath);
-  } else {
-    throw new Error('Недостаточно параметров подключения к базе из env.json');
-  }
-  if (connection.userName) {
-    args.push(`/N${connection.userName}`);
-  }
-  if (connection.password) {
-    args.push(`/P${connection.password}`);
-  }
-}
-
-function appendRepositoryDesignerArgs(args: string[], binding: RepositoryBinding): void {
-  args.push('/ConfigurationRepositoryF', binding.repoPath);
-  args.push('/ConfigurationRepositoryN', binding.repoUser);
-  if (binding.repoPassword) {
-    args.push('/ConfigurationRepositoryP', binding.repoPassword);
-  }
-}
-
-const BOOLEAN_EXTRA_FLAGS = new Set([
-  'AllowConfigurationChanges',
-  'NoBind',
-  'ForceBindAlreadyBindedUser',
-  'ForceReplaceCfg',
-  'Force',
-  'Revised',
-  'KeepLocked',
-  'RestoreDeletedUser',
-  'GroupByObject',
-  'GroupByComment',
-  'DoNotIncludeVersionsWithLabels',
-  'IncludeOnlyVersionsWithLabels',
-  'IncludeCommentLinesWithDoubleSlash',
-  'Verbose',
-]);
-
-interface ParsedExtraArgs {
-  bool(name: string): boolean;
-  value(name: string): string | undefined;
-}
-
-function parseExtraArgs(extraArgs: string[]): ParsedExtraArgs {
-  const values = new Map<string, string>();
-  const flags = new Set<string>();
-  let i = 0;
-  while (i < extraArgs.length) {
-    const arg = extraArgs[i];
-    if (!arg.startsWith('-')) {
-      i += 1;
-      continue;
-    }
-    const name = arg.slice(1);
-    if (BOOLEAN_EXTRA_FLAGS.has(name)) {
-      flags.add(name);
-      i += 1;
-      continue;
-    }
-    if (i + 1 < extraArgs.length && !extraArgs[i + 1].startsWith('-')) {
-      values.set(name, extraArgs[i + 1]);
-      i += 2;
-    } else {
-      flags.add(name);
-      i += 1;
-    }
-  }
-  return {
-    bool: (name) => flags.has(name),
-    value: (name) => values.get(name),
-  };
-}
-
-function pushIfValue(target: string[], name: string, value: string | undefined): void {
-  if (value !== undefined && value !== '') {
-    target.push(name, value);
-  }
-}
-
-function buildCommandDesignerArgs(command: string, extraArgs: string[]): string[] {
-  const opts = parseExtraArgs(extraArgs);
-  switch (command) {
-    case 'repository-create': {
-      const args = ['/ConfigurationRepositoryCreate'];
-      if (opts.bool('AllowConfigurationChanges')) {
-        args.push('-AllowConfigurationChanges');
-      }
-      pushIfValue(args, '-ChangesAllowedRule', opts.value('ChangesAllowedRule'));
-      pushIfValue(args, '-ChangesNotRecommendedRule', opts.value('ChangesNotRecommendedRule'));
-      if (opts.bool('NoBind')) {
-        args.push('-NoBind');
-      }
-      return args;
-    }
-    case 'repository-bind': {
-      const args = ['/ConfigurationRepositoryBindCfg'];
-      if (opts.bool('ForceBindAlreadyBindedUser')) {
-        args.push('-forceBindAlreadyBindedUser');
-      }
-      if (opts.bool('ForceReplaceCfg')) {
-        args.push('-forceReplaceCfg');
-      }
-      return args;
-    }
-    case 'repository-unbind': {
-      const args = ['/ConfigurationRepositoryUnbindCfg'];
-      if (opts.bool('Force')) {
-        args.push('-force');
-      }
-      return args;
-    }
-    case 'repository-lock': {
-      const args = ['/ConfigurationRepositoryLock'];
-      pushIfValue(args, '-Objects', opts.value('ObjectsFile'));
-      if (opts.bool('Revised')) {
-        args.push('-revised');
-      }
-      return args;
-    }
-    case 'repository-unlock': {
-      const args = ['/ConfigurationRepositoryUnLock'];
-      pushIfValue(args, '-Objects', opts.value('ObjectsFile'));
-      if (opts.bool('Force')) {
-        args.push('-force');
-      }
-      return args;
-    }
-    case 'repository-commit': {
-      const args = ['/ConfigurationRepositoryCommit'];
-      pushIfValue(args, '-Objects', opts.value('ObjectsFile'));
-      pushIfValue(args, '-comment', opts.value('Comment'));
-      if (opts.bool('KeepLocked')) {
-        args.push('-keepLocked');
-      }
-      if (opts.bool('Force')) {
-        args.push('-force');
-      }
-      return args;
-    }
-    case 'repository-update': {
-      const args = ['/ConfigurationRepositoryUpdateCfg'];
-      pushIfValue(args, '-Objects', opts.value('ObjectsFile'));
-      pushIfValue(args, '-v', opts.value('Version'));
-      if (opts.bool('Force')) {
-        args.push('-force');
-      }
-      return args;
-    }
-    case 'repository-add-user': {
-      const args = ['/ConfigurationRepositoryAddUser'];
-      pushIfValue(args, '-User', opts.value('User'));
-      pushIfValue(args, '-Pwd', opts.value('Pwd'));
-      pushIfValue(args, '-Rights', opts.value('Rights'));
-      if (opts.bool('RestoreDeletedUser')) {
-        args.push('-RestoreDeletedUser');
-      }
-      return args;
-    }
-    case 'repository-copy-users': {
-      const args = ['/ConfigurationRepositoryCopyUsers'];
-      pushIfValue(args, '-Path', opts.value('Path'));
-      pushIfValue(args, '-User', opts.value('User'));
-      pushIfValue(args, '-Pwd', opts.value('Pwd'));
-      if (opts.bool('RestoreDeletedUser')) {
-        args.push('-RestoreDeletedUser');
-      }
-      return args;
-    }
-    case 'repository-dump': {
-      const file = opts.value('File');
-      if (!file) {
-        throw new Error('Для выгрузки требуется параметр -File');
-      }
-      const args = ['/ConfigurationRepositoryDumpCfg', file];
-      pushIfValue(args, '-v', opts.value('Version'));
-      return args;
-    }
-    case 'repository-report': {
-      const file = opts.value('File');
-      if (!file) {
-        throw new Error('Для отчёта требуется параметр -File');
-      }
-      const args = ['/ConfigurationRepositoryReport', file];
-      pushIfValue(args, '-NBegin', opts.value('NBegin'));
-      pushIfValue(args, '-NEnd', opts.value('NEnd'));
-      pushIfValue(args, '-DateBegin', opts.value('DateBegin'));
-      pushIfValue(args, '-DateEnd', opts.value('DateEnd'));
-      pushIfValue(args, '-ConfigurationVersion', opts.value('ConfigurationVersion'));
-      pushIfValue(args, '-ReportFormat', opts.value('ReportFormat'));
-      if (opts.bool('GroupByObject')) {
-        args.push('-GroupByObject');
-      }
-      if (opts.bool('GroupByComment')) {
-        args.push('-GroupByComment');
-      }
-      if (opts.bool('DoNotIncludeVersionsWithLabels')) {
-        args.push('-DoNotIncludeVersionsWithLabels');
-      }
-      if (opts.bool('IncludeOnlyVersionsWithLabels')) {
-        args.push('-IncludeOnlyVersionsWithLabels');
-      }
-      if (opts.bool('IncludeCommentLinesWithDoubleSlash')) {
-        args.push('-IncludeCommentLinesWithDoubleSlash');
-      }
-      return args;
-    }
-    case 'repository-set-label': {
-      const args = ['/ConfigurationRepositorySetLabel'];
-      pushIfValue(args, '-name', opts.value('LabelName'));
-      pushIfValue(args, '-v', opts.value('Version'));
-      pushIfValue(args, '-comment', opts.value('Comment'));
-      return args;
-    }
-    default:
-      throw new Error(`Неизвестная команда хранилища: ${command}`);
-  }
-}
-
-function readLogFileContent(outFile: string): string {
-  if (!fs.existsSync(outFile)) {
-    return '';
-  }
-  try {
-    const data = fs.readFileSync(outFile);
-    return decodeLogFile(data).trim();
-  } catch {
-    return '';
-  }
-}
-
-function decodeLogFile(data: Buffer): string {
-  if (data.length >= 2 && data[0] === 0xff && data[1] === 0xfe) {
-    return data.subarray(2).toString('utf16le');
-  }
-  if (data.length >= 2 && data[0] === 0xfe && data[1] === 0xff) {
-    return decode(data.subarray(2), 'utf16-be');
-  }
-  if (data.length >= 3 && data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf) {
-    return data.subarray(3).toString('utf-8');
-  }
-  const utf8Text = data.toString('utf-8');
-  if (!utf8Text.includes('�')) {
-    return utf8Text;
-  }
-  const cp866Text = decode(data, 'cp866');
-  const cp1251Text = decode(data, 'win1251');
-  return pickMostReadableText([cp866Text, cp1251Text, utf8Text]);
-}
-
 async function resolveDatabaseConnection(
   settingsPath: string,
   secrets: ProjectSecretStorage
-): Promise<ConnectionParams> {
+): Promise<ResolvedConnection> {
   if (!fs.existsSync(settingsPath)) {
     throw new Error(`Не найден env.json для подключения к базе: ${settingsPath}`);
   }
@@ -586,11 +349,13 @@ async function resolveDatabaseConnection(
     throw new Error(`В env.json отсутствует "--ibconnection": ${settingsPath}`);
   }
 
-  const connection = parseIbConnection(ibConnectionRaw);
-  connection.userName = asString(defaults['--db-user']) ?? '';
-  connection.password = await resolveDbPassword(secrets, asString(defaults['--db-pwd']) ?? '');
-  connection.v8Path = resolveV8PathFromSettings(defaults);
-  return connection;
+  return {
+    ...parseIbConnection(ibConnectionRaw),
+    userName: asString(defaults['--db-user']) ?? '',
+    password: await resolveDbPassword(secrets, asString(defaults['--db-pwd']) ?? ''),
+    v8Path: resolveV8PathFromSettings(defaults),
+    v8Version: asString(defaults['--v8version']),
+  };
 }
 
 function parseIbConnection(rawValue: string): ConnectionParams {

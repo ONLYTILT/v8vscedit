@@ -152,7 +152,7 @@ function createBaselineServices(overrides: Partial<CommandServices> = {}): Comma
     aiSkillsInstaller: notImplemented('aiSkillsInstaller') as never,
     refreshChangedConfigurationState: () => undefined,
     markChangedConfigurationByFiles: () => undefined,
-    getChangedConfigurations: () => [],
+    getChangedConfigurations: () => Promise.resolve([]),
     markConfigurationsClean: () => undefined,
     suppressConfigurationReloadForFiles: () => undefined,
     revealTreeNode: () => Promise.resolve(false),

@@ -1,8 +1,10 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2';
-import type { AgentMessage } from '../../domain/agent';
+import type { AgentConnectPolicyOptions, AgentMessage } from '../../domain/agent';
 import { getAgentMessageText, isTerminalAgentMessage } from '../../domain/agent';
+import { SSH_CLOSED_BEFORE_READY_CODE } from './SshConnectErrorClassifier';
+import { AgentConnectRetryLoop, type AgentConnectRetryDeps } from './AgentConnectRetry';
 import { DesignerAgentJsonReader } from './DesignerAgentJsonReader';
 import type { AgentCommandHooks, AgentCommandResult, DesignerAgentTransport, DesignerAgentTransportFactory } from './AgentTransport';
 import { AgentCommandError } from './AgentTransport';
@@ -15,36 +17,55 @@ export interface DesignerAgentSshClient {
   end(): void;
 }
 
-export interface DesignerAgentConnectionOptions {
+/** Параметры одного SSH-подключения: всё, что нужно транспорту для единственной попытки. */
+export interface DesignerAgentEndpointOptions {
   readonly host: string;
   readonly port: number;
   readonly user: string;
   readonly password?: string;
   readonly privateKeyPath?: string;
   readonly connectTimeoutSeconds?: number;
-  readonly connectAttempts?: number;
-  readonly connectRetryDelayMs?: number;
+  /**
+   * `false` — `dispose()` закрывает канал и SSH, не отправляя `common shutdown`. Нужно для агента,
+   * которого запустил не расширение (удалённый сервер): смена настроек или выход из VS Code не
+   * должны гасить чужой процесс. По умолчанию `true` — свой локальный агент останавливается.
+   */
+  readonly shutdownOnDispose?: boolean;
+}
+
+/** Параметры фабрики: конечная точка плюс политика повторов — повторы решает только фабрика. */
+export interface DesignerAgentConnectionOptions extends DesignerAgentEndpointOptions {
+  readonly policy: AgentConnectPolicyOptions;
+  /** Момент старта локально запущенного агента: открывает окно прогрева для auth-отказов. */
+  readonly agentStartedAt?: number;
+}
+
+export interface DesignerAgentTransportFactoryDeps extends AgentConnectRetryDeps {
+  readonly createClient?: () => DesignerAgentSshClient;
 }
 
 export class ProcessDesignerAgentTransportFactory implements DesignerAgentTransportFactory {
-  constructor(private readonly options: DesignerAgentConnectionOptions) {}
+  // Цикл повторов живёт столько же, сколько фабрика: состояние конечной точки (lastRefusedAt)
+  // переносится между вызовами create().
+  private readonly retry: AgentConnectRetryLoop;
+  private readonly createClient: () => DesignerAgentSshClient;
 
-  async create(): Promise<DesignerAgentTransport> {
-    const attempts = Math.max(1, this.options.connectAttempts ?? 1);
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  constructor(private readonly options: DesignerAgentConnectionOptions, deps: DesignerAgentTransportFactoryDeps = {}) {
+    this.retry = new AgentConnectRetryLoop(options, deps);
+    this.createClient = deps.createClient ?? (() => new Client());
+  }
+
+  create(): Promise<DesignerAgentTransport> {
+    return this.retry.run(async () => {
+      const transport = new ProcessDesignerAgentTransport(this.options, this.createClient);
       try {
-        const transport = new ProcessDesignerAgentTransport(this.options);
         await transport.connect();
         return transport;
       } catch (error) {
-        lastError = error;
-        if (attempt < attempts) {
-          await delay(this.options.connectRetryDelayMs ?? 1000);
-        }
+        await transport.reset();
+        throw error;
       }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    });
   }
 }
 
@@ -57,9 +78,13 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   private queue: Promise<unknown> = Promise.resolve();
   private disposed = false;
   private closeEmitted = false;
+  // Соединение, однажды поднятое и потерянное (close/error SSH-клиента), не реанимируется
+  // внутри этого объекта: новый SSH требует заново `options set` (его шлёт менеджер сессий)
+  // и `connect-ib` (подключение ИБ не переживает закрытие SSH-сессии, план §5b п.1).
+  private lost = false;
 
   constructor(
-    private readonly options: DesignerAgentConnectionOptions,
+    private readonly options: DesignerAgentEndpointOptions,
     private readonly createClient: () => DesignerAgentSshClient = () => new Client()
   ) {}
 
@@ -72,9 +97,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     }
     // disposed не сбрасываем здесь: после reset()/dispose() сессия считается
     // выброшенной, и команда из очереди не должна реанимировать её через connect().
-    if (this.disposed) {
-      throw new Error('Сессия агента уже закрыта.');
-    }
+    this.assertUsable();
 
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const client = this.createClient();
@@ -108,10 +131,28 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
         });
       });
       client.on('error', (error) => {
-        this.output.emit('error', error);
+        // Ошибка ПОСЛЕ готовности — соединение потеряно уже сейчас, не дожидаясь 'close' (Н13):
+        // команда, пришедшая между 'error' и 'close', иначе ушла бы в мёртвый канал.
+        if (settled) {
+          this.lost = true;
+        }
+        // Сначала отказ connect(): на этапе подключения у output нет слушателей 'error', и
+        // EventEmitter бросил бы прямо отсюда — промис connect() так и не отклонился бы.
         settle(error);
+        // Слушатель есть только у выполняющейся команды; вне её ошибку сообщит последующий 'close'.
+        if (this.output.listenerCount('error') > 0) {
+          this.output.emit('error', error);
+        }
       });
-      client.on('close', () => this.handleClose());
+      client.on('close', () => {
+        // ssh2 при обрыве во время KEX/auth (и при DISCONNECT BY_APPLICATION) даёт только 'close'
+        // без 'error' и снимает readyTimeout: без отказа здесь connect() не завершился бы никогда.
+        // После готовности settle — no-op.
+        settle(Object.assign(new Error('SSH-соединение с агентом закрыто до готовности.'), {
+          code: SSH_CLOSED_BEFORE_READY_CODE,
+        }));
+        this.handleClose();
+      });
       client.connect(buildSshConnectConfig(this.options));
     });
 
@@ -134,7 +175,9 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     if (!this.client) {
       return Promise.resolve();
     }
-    this.channel?.write('common shutdown\n');
+    if (this.options.shutdownOnDispose !== false) {
+      this.channel?.write('common shutdown\n');
+    }
     this.channel?.end();
     this.client.end();
     this.channel = undefined;
@@ -155,10 +198,22 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     return Promise.resolve();
   }
 
-  private async executeQueued(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+  /** Транспорт выброшен (reset/dispose) или его SSH-соединение потеряно — нужен новый экземпляр. */
+  isClosed(): boolean {
+    return this.disposed || this.lost;
+  }
+
+  private assertUsable(): void {
     if (this.disposed) {
       throw new Error('Сессия агента уже закрыта.');
     }
+    if (this.lost) {
+      throw new Error('SSH-соединение с агентом потеряно; команда не отправлена, нужна новая сессия.');
+    }
+  }
+
+  private async executeQueued(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+    this.assertUsable();
     await this.connect();
     const channel = this.requireChannel();
     const messages: AgentMessage[] = [];
@@ -240,6 +295,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   }
 
   private handleClose(): void {
+    this.lost = true;
     this.channel = undefined;
     this.client = undefined;
     if (!this.disposed && !this.closeEmitted) {
@@ -256,11 +312,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   }
 }
 
-function delay(timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, timeoutMs));
-}
-
-export function buildSshConnectConfig(options: DesignerAgentConnectionOptions): ConnectConfig {
+export function buildSshConnectConfig(options: DesignerAgentEndpointOptions): ConnectConfig {
   const config: ConnectConfig = {
     host: options.host,
     port: options.port,

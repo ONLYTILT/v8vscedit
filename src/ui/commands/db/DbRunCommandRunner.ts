@@ -2,10 +2,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { spawn, type ChildProcess } from 'child_process';
-import { launchInteractiveDesignerWithAgentPause } from '../../../infra/agent';
+import { launchInteractiveDesignerWithAgentPause, type InteractiveDesignerProcess } from '../../../infra/agent';
 import { resolveDbPassword, type ProjectSecretStorage } from '../../../infra/environment';
 import { formatCommandLineForLog, normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion } from '../../../infra/process';
 import { getAgentOperationServiceForInteractiveDesigner, isAgentConfigurationOperationMode } from '../ext/ExtensionCommandRunner';
+import { CONFIGURATION_OPERATION_BUSY_MESSAGE, isConfigurationOperationRunning } from '../ext/configurationOperationLock';
+import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from '../ext/agent/remoteLocalDesigner';
 
 interface DbRunConnectionParams {
   infoBasePath?: string;
@@ -23,6 +25,11 @@ interface DbRunOptions {
   url?: string;
 }
 
+export interface DbRunDeps {
+  /** Шов под тест: платформа 1С в CI недоступна. По умолчанию — отсоединённый процесс. */
+  readonly spawnClient: (command: string, args: string[], cwd: string) => InteractiveDesignerProcess;
+}
+
 /**
  * Запускает клиент 1С в выбранном режиме из параметров env.json.
  */
@@ -30,14 +37,41 @@ export async function runDbClientFromWorkspace(
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
   secrets: ProjectSecretStorage,
-  options: DbRunOptions
+  options: DbRunOptions,
+  deps: DbRunDeps = { spawnClient: spawnDetached }
 ): Promise<void> {
+  const pausesAgent = options.mode === 'DESIGNER' && isAgentConfigurationOperationMode();
+  if (pausesAgent && isConfigurationOperationRunning()) {
+    // Запуск Конфигуратора отключает базу от агента — посреди агентской операции это
+    // оборвало бы её. Ждать здесь нечего: пользователь повторит запуск после операции.
+    void vscode.window.showInformationMessage(
+      `${CONFIGURATION_OPERATION_BUSY_MESSAGE} Конфигуратор можно будет запустить после её завершения.`
+    );
+    return;
+  }
+
   try {
     const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath);
     const connection = await resolveConnectionFromSettings(settingsPath, secrets);
+    if (options.mode === 'DESIGNER') {
+      // Н51: Конфигуратор — локальный 1cv8; файловая база удалённого режима для него недоступна.
+      // Тонкий клиент к базе подключается сам и с агентом не конфликтует — его это не касается.
+      const decision = decideLocalDesignerInRemote(readInfoBaseConnectionKind(settingsPath), 'interactive');
+      if (decision.action === 'refuse') {
+        outputChannel.appendLine(`[db-run][error] ${decision.reason}`);
+        void vscode.window.showErrorMessage(decision.reason);
+        return;
+      }
+      if (decision.notice) {
+        outputChannel.appendLine(`[db-run] ${decision.notice}`);
+      }
+    }
     const v8Path = resolveV8ExecutablePath(connection.v8Path ?? '');
     const args = buildLaunchArguments(options, connection);
-    const agentService = options.mode === 'DESIGNER' && isAgentConfigurationOperationMode()
+    // Интерактивный Конфигуратор и подключённый агент конфликтуют по блокировке базы:
+    // сервис агента ищется тем же путём, что и release перед пакетными операциями
+    // (кэш либо внешний агент на порту — с принудительным отключением).
+    const agentService = pausesAgent
       ? await getAgentOperationServiceForInteractiveDesigner(workspaceFolder, outputChannel)
       : undefined;
 
@@ -47,7 +81,7 @@ export async function runDbClientFromWorkspace(
     await launchInteractiveDesignerWithAgentPause({
       agentSession: agentService?.service,
       forceAgentDisconnect: agentService?.forceDisconnect,
-      launch: () => spawnDetached(v8Path, args, workspaceFolder.uri.fsPath),
+      launch: () => deps.spawnClient(v8Path, args, workspaceFolder.uri.fsPath),
       hooks: {
         onMessage: (message) => outputChannel.appendLine(`[db-run][agent] ${message}`),
       },

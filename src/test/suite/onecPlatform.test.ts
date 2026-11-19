@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion } from '../../infra/process/OnecPlatform';
+import { OnecStarterExecutableError } from '../../infra/process/V8ExecutableGuard';
 
 suite('OnecPlatform', () => {
   test('Сохраняет абсолютный путь файловой базы на macOS/Linux', () => {
@@ -73,5 +74,69 @@ suite('OnecPlatform', () => {
       resolveV8PathHintFromVersion('8.5.1.1150', 'darwin'),
       '/opt/1cv8/8.5.1.1150'
     );
+  });
+});
+
+suite('OnecPlatform: защита от стартера 1cestart.exe', () => {
+  let root: string;
+  let savedPath: string | undefined;
+
+  setup(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-onec-starter-'));
+    savedPath = process.env.PATH;
+  });
+
+  teardown(() => {
+    process.env.PATH = savedPath;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  for (const name of ['1cestart.exe', '1CEStart.EXE']) {
+    test(`явный путь к файлу ${name} — OnecStarterExecutableError, а не общая «Не удалось определить»`, () => {
+      const file = path.join(root, name);
+      fs.writeFileSync(file, '');
+      assert.throws(
+        () => resolveV8ExecutablePath(file, 'win32'),
+        (error: unknown) => error instanceof OnecStarterExecutableError && error.executablePath.toLowerCase().endsWith('1cestart.exe')
+      );
+    });
+  }
+
+  test('явный путь в кавычках к стартеру — тоже отказ (кавычки снимаются до проверки)', () => {
+    const file = path.join(root, '1cestart.exe');
+    fs.writeFileSync(file, '');
+    assert.throws(() => resolveV8ExecutablePath(`"${file}"`, 'win32'), OnecStarterExecutableError);
+  });
+
+  test('имя без разделителя «1cestart» и файл в PATH — отказ (ветка findExecutableInPath)', () => {
+    const fileName = process.platform === 'win32' ? '1cestart.exe' : '1cestart';
+    fs.writeFileSync(path.join(root, fileName), '');
+    process.env.PATH = root;
+    assert.throws(() => resolveV8ExecutablePath('1cestart', process.platform), OnecStarterExecutableError);
+  });
+
+  test('имя «1cestart.exe» с расширением и файл в PATH — отказ', () => {
+    fs.writeFileSync(path.join(root, '1cestart.exe'), '');
+    process.env.PATH = root;
+    assert.throws(() => resolveV8ExecutablePath('1cestart.exe', process.platform), OnecStarterExecutableError);
+  });
+
+  test('win32: файл 1CV8.EXE принимается (имя сверяется без учёта регистра)', () => {
+    const file = path.join(root, '1CV8.EXE');
+    fs.writeFileSync(file, '');
+    assert.strictEqual(path.resolve(resolveV8ExecutablePath(file, 'win32')).toLowerCase(), path.resolve(file).toLowerCase());
+  });
+
+  test('win32: каталог bin с 1cv8.exe — как прежде', () => {
+    const exe = path.join(root, 'bin', '1cv8.exe');
+    fs.mkdirSync(path.dirname(exe), { recursive: true });
+    fs.writeFileSync(exe, '');
+    assert.strictEqual(path.resolve(resolveV8ExecutablePath(root, 'win32')), path.resolve(exe));
+  });
+
+  test('win32: явный путь к 1cv8.exe — как прежде', () => {
+    const exe = path.join(root, '1cv8.exe');
+    fs.writeFileSync(exe, '');
+    assert.strictEqual(path.resolve(resolveV8ExecutablePath(exe, 'win32')), path.resolve(exe));
   });
 });

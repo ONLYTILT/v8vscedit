@@ -115,6 +115,33 @@ suite('ProcessDesignerAgentTransport', () => {
     );
   });
 
+  test('Э4: после неожиданного закрытия канала транспорт мёртв — не переподключается внутри себя', async () => {
+    const fake = new FakeSshClient();
+    const created: FakeSshClient[] = [];
+    const transport = new ProcessDesignerAgentTransport(baseOptions(), () => { created.push(fake); return fake; });
+    await transport.execute('config update-db-cfg');
+    assert.strictEqual(transport.isClosed(), false);
+
+    fake.channel.emit('close');
+    assert.strictEqual(transport.isClosed(), true);
+    await assert.rejects(transport.execute('common connect-ib'), /потеряно/);
+    // Новое SSH-соединение не открывалось, команда в канал не писалась.
+    assert.strictEqual(created.length, 1);
+    assert.deepStrictEqual(fake.channel.writes, ['config update-db-cfg\n']);
+  });
+
+  test('Э4: reset и dispose делают транспорт закрытым', async () => {
+    const resetTransport = new ProcessDesignerAgentTransport(baseOptions(), () => new FakeSshClient());
+    await resetTransport.connect();
+    await resetTransport.reset();
+    assert.strictEqual(resetTransport.isClosed(), true);
+    await assert.rejects(resetTransport.execute('x'), /уже закрыта/);
+
+    const disposed = new ProcessDesignerAgentTransport(baseOptions(), () => new FakeSshClient());
+    await disposed.dispose();
+    assert.strictEqual(disposed.isClosed(), true);
+  });
+
   test('закрывает агент командой shutdown', async () => {
     const fake = new FakeSshClient();
     const transport = new ProcessDesignerAgentTransport(baseOptions(), () => fake);

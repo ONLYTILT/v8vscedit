@@ -43,36 +43,75 @@ export function resolveAtomicTempPath(targetPath: string, uniqueSuffix: string):
 }
 
 /**
- * Пишет `data` в `targetPath` подменой файла.
+ * Пишет `data` в `targetPath` подменой файла. Строка пишется как UTF-8 без BOM,
+ * `Uint8Array` — байт-в-байт (кодировка Node для двоичных данных игнорируется):
+ * двоичный вариант нужен для файлов, которые приходят от агента конфигуратора
+ * уже готовыми байтами (BOM/CRLF платформы сохраняются как есть).
  *
  * Отказ на любом этапе — громкий: исходное исключение пробрасывается, цель
  * остаётся нетронутой, временный файл убирается. Молчаливого отката на прямую
  * `writeFileSync` здесь нет сознательно — он вернул бы ровно тот дефект
  * (обрезанный файл), ради которого функция и написана.
  */
-export function writeFileAtomic(targetPath: string, data: string): void {
+export function writeFileAtomic(targetPath: string, data: string | Uint8Array): void {
   const target = resolveWriteTarget(targetPath);
-  writeCounter += 1;
-  const tempPath = resolveAtomicTempPath(
-    target,
-    `${String(process.pid)}.${String(Date.now())}.${String(writeCounter)}`
-  );
+  const tempPath = nextTempPath(target);
   try {
     fs.writeFileSync(tempPath, data, 'utf-8');
-    const mode = existingFileMode(target);
-    if (mode !== undefined) {
-      // `rename` подменяет inode, значит и права: без переноса режима цели
-      // файл после первой же правки получил бы режим по умолчанию.
-      fs.chmodSync(tempPath, mode);
-    }
-    fs.renameSync(tempPath, target);
+    commitTemp(tempPath, target);
   } catch (error) {
-    // Мусор убирается безусловно (`force` гасит ENOENT, если временный файл так
-    // и не создался), а исходная причина отказа пробрасывается наружу: тихий
-    // откат на прямую запись вернул бы ровно тот дефект, ради которого написан
-    // этот модуль.
-    fs.rmSync(tempPath, { force: true });
+    // Мусор убирается безусловно, а исходная причина отказа пробрасывается
+    // наружу: тихий откат на прямую запись вернул бы ровно тот дефект, ради
+    // которого написан этот модуль. Именно unlink, а не `fs.rmSync`: на Windows
+    // rmSync системного Node 24 молча не удаляет файл с кириллицей в имени, а имя
+    // временного файла содержит имя цели.
+    removeTempQuietly(tempPath);
     throw error;
+  }
+}
+
+/**
+ * Потоковый вариант {@link writeFileAtomic} для файлов, которые нельзя держать в памяти целиком
+ * (архив выгрузки): `write` сам заполняет временный файл по переданному пути — порциями, с
+ * отменой. Подмена цели и уборка — та же механика temp+rename, что у буферного варианта; отказ
+ * или отмена внутри `write` оставляют цель нетронутой.
+ */
+export async function writeFileAtomicWith(
+  targetPath: string,
+  write: (tempPath: string) => Promise<void>
+): Promise<void> {
+  const target = resolveWriteTarget(targetPath);
+  const tempPath = nextTempPath(target);
+  try {
+    await write(tempPath);
+    commitTemp(tempPath, target);
+  } catch (error) {
+    removeTempQuietly(tempPath);
+    throw error;
+  }
+}
+
+function nextTempPath(target: string): string {
+  writeCounter += 1;
+  return resolveAtomicTempPath(target, `${String(process.pid)}.${String(Date.now())}.${String(writeCounter)}`);
+}
+
+function commitTemp(tempPath: string, target: string): void {
+  const mode = existingFileMode(target);
+  if (mode !== undefined) {
+    // `rename` подменяет inode, значит и права: без переноса режима цели
+    // файл после первой же правки получил бы режим по умолчанию.
+    fs.chmodSync(tempPath, mode);
+  }
+  fs.renameSync(tempPath, target);
+}
+
+/** Временный файл мог так и не появиться (отказ на создании) — его отсутствие не ошибка. */
+function removeTempQuietly(tempPath: string): void {
+  try {
+    fs.unlinkSync(tempPath);
+  } catch {
+    // исходная причина отказа важнее
   }
 }
 
