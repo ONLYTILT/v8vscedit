@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion } from '../../infra/process/OnecPlatform';
+import { normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion, resolveV8ThinClientExecutablePath } from '../../infra/process/OnecPlatform';
 import { OnecStarterExecutableError } from '../../infra/process/V8ExecutableGuard';
 
 suite('OnecPlatform', () => {
@@ -74,6 +74,92 @@ suite('OnecPlatform', () => {
       resolveV8PathHintFromVersion('8.5.1.1150', 'darwin'),
       '/opt/1cv8/8.5.1.1150'
     );
+  });
+});
+
+suite('OnecPlatform: тонкий клиент 1cv8c', () => {
+  let root: string;
+
+  setup(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-onec-thin-'));
+  });
+
+  teardown(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(...segments: string[]): string {
+    const file = path.join(root, ...segments);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '');
+    return file;
+  }
+
+  test('win32: --path на каталог bin — берётся 1cv8c.exe рядом с 1cv8.exe', () => {
+    touch('bin', '1cv8.exe');
+    const thin = touch('bin', '1cv8c.exe');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(root, 'win32'), thin);
+  });
+
+  test('win32: --path на 1cv8.exe — тонкий клиент из того же каталога', () => {
+    const designer = touch('1cv8.exe');
+    const thin = touch('1cv8c.exe');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(designer, 'win32'), thin);
+  });
+
+  test('win32: явный путь к 1CV8C.EXE в кавычках принимается как есть (регистр не важен)', () => {
+    const thin = touch('1CV8C.EXE');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(`"${thin}"`, 'win32'), thin);
+  });
+
+  test('win32: нет 1cv8c.exe — ошибка с именем тонкого клиента, без возврата к 1cv8.exe', () => {
+    const designer = touch('1cv8.exe');
+    assert.throws(
+      () => resolveV8ThinClientExecutablePath(designer, 'win32'),
+      (error: unknown) => error instanceof Error
+        && error.message.includes('Не найден тонкий клиент 1cv8c.exe')
+        && error.message.includes(designer)
+    );
+  });
+
+  test('win32: явный путь к несуществующему 1cv8c.exe — ошибка резолвера платформы', () => {
+    assert.throws(
+      () => resolveV8ThinClientExecutablePath(path.join(root, '1cv8c.exe'), 'win32'),
+      /Не найден исполняемый файл 1С/
+    );
+  });
+
+  test('linux: 1cv8 и 1cv8c в каталоге версии — берётся 1cv8c', () => {
+    touch('1cv8');
+    const thin = touch('1cv8c');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(root, 'linux'), thin);
+  });
+
+  test('linux: в каталоге только 1cv8c — он же и возвращается', () => {
+    const thin = touch('1cv8c');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(root, 'linux'), thin);
+  });
+
+  test('linux: нет 1cv8c — ошибка с unix-именем тонкого клиента', () => {
+    touch('1cv8');
+    assert.throws(() => resolveV8ThinClientExecutablePath(root, 'linux'), /Не найден тонкий клиент 1cv8c рядом/);
+  });
+
+  test('darwin: тонкий клиент — отдельный бандл 1cv8c.app рядом с 1cv8.app', () => {
+    const designer = touch('1cv8.app', 'Contents', 'MacOS', '1cv8');
+    const thin = touch('1cv8c.app', 'Contents', 'MacOS', '1cv8c');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(designer, 'darwin'), thin);
+  });
+
+  test('darwin: 1cv8 вне бандла — 1cv8c ищется в том же каталоге', () => {
+    const designer = touch('1cv8');
+    const thin = touch('1cv8c');
+    assert.strictEqual(resolveV8ThinClientExecutablePath(designer, 'darwin'), thin);
+  });
+
+  test('darwin: бандл 1cv8.app без 1cv8c.app — ошибка', () => {
+    const designer = touch('1cv8.app', 'Contents', 'MacOS', '1cv8');
+    assert.throws(() => resolveV8ThinClientExecutablePath(designer, 'darwin'), /Не найден тонкий клиент 1cv8c/);
   });
 });
 

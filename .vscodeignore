@@ -1,5 +1,6 @@
 .vscode/**
 .vscode-test/**
+.v8vscedit/**
 out/**
 node_modules/**
 !node_modules/ssh2/**

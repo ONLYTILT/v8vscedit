@@ -227,9 +227,15 @@ suite('Э9 / Н51: пакетные операции в удалённом ре�
 
     const secrets = { getDbPassword: () => Promise.resolve(undefined) } as unknown as ProjectSecretStorage;
 
-    function writeLaunchableEnv(ibConnection = '/Ssrv/base'): string {
+    const thinClientPath = (): string => path.join(root, process.platform === 'win32' ? '1cv8c.exe' : '1cv8c');
+
+    // Установка платформы содержит оба файла: Конфигуратор (1cv8) и тонкий клиент (1cv8c) рядом.
+    function writeLaunchableEnv(ibConnection = '/Ssrv/base', withThinClient = true): string {
       const v8Path = path.join(root, process.platform === 'win32' ? '1cv8.exe' : '1cv8');
       fs.writeFileSync(v8Path, '');
+      if (withThinClient) {
+        fs.writeFileSync(thinClientPath(), '');
+      }
       writeEnv(ibConnection, { '--path': v8Path });
       return v8Path;
     }
@@ -297,7 +303,7 @@ suite('Э9 / Н51: пакетные операции в удалённом ре�
     test('remote + ENTERPRISE: тонкий клиент запускается как раньше, агент не отключается', async () => {
       await setAgentSetting('location', 'remote');
       await setOperationMode('agent');
-      const v8Path = writeLaunchableEnv();
+      writeLaunchableEnv();
       const seeded = await seedCachedAgentService(root, { connected: true });
       const spawned: string[][] = [];
 
@@ -306,10 +312,38 @@ suite('Э9 / Н51: пакетные операции в удалённом ре�
       });
 
       assert.strictEqual(spawned.length, 1);
-      assert.strictEqual(path.resolve(spawned[0][0]), path.resolve(v8Path));
+      assert.strictEqual(path.resolve(spawned[0][0]), path.resolve(thinClientPath()));
       assert.strictEqual(spawned[0][1], 'ENTERPRISE');
       assert.deepStrictEqual(seeded.factory.log, []);
       assert.deepStrictEqual(errors, []);
+    });
+
+    test('ENTERPRISE запускает 1cv8c из каталога платформы, DESIGNER — 1cv8 (одна настройка --path)', async () => {
+      await setAgentSetting('location', 'local');
+      await setOperationMode('batch');
+      const v8Path = writeLaunchableEnv();
+      const spawned: string[] = [];
+      const spawnClient = (command: string): InteractiveDesignerProcess => { spawned.push(path.resolve(command)); return new FakeClientProcess(); };
+
+      await runDbClientFromWorkspace(folder, channel, secrets, { mode: 'ENTERPRISE' }, { spawnClient });
+      await runDbClientFromWorkspace(folder, channel, secrets, { mode: 'DESIGNER' }, { spawnClient });
+
+      assert.deepStrictEqual(spawned, [path.resolve(thinClientPath()), path.resolve(v8Path)]);
+      assert.deepStrictEqual(errors, []);
+    });
+
+    test('ENTERPRISE без 1cv8c рядом с 1cv8: ошибка про тонкий клиент, толстый клиент не запускается', async () => {
+      await setAgentSetting('location', 'local');
+      await setOperationMode('batch');
+      writeLaunchableEnv('/Ssrv/base', false);
+      const spawned: string[] = [];
+
+      await runDbClientFromWorkspace(folder, channel, secrets, { mode: 'ENTERPRISE' }, {
+        spawnClient: (command) => { spawned.push(command); return new FakeClientProcess(); },
+      });
+
+      assert.deepStrictEqual(spawned, []);
+      assert.ok(errors.some((message) => message.includes('Не найден тонкий клиент 1cv8c')), errors.join('|'));
     });
   });
 });

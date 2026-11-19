@@ -5,6 +5,8 @@ import { globSync } from 'glob';
 import { assertNotOnecStarter } from './V8ExecutableGuard';
 
 const WINDOWS_EXECUTABLE = '1cv8.exe';
+const WINDOWS_THIN_CLIENT = '1cv8c.exe';
+const UNIX_THIN_CLIENT = '1cv8c';
 const V8_PATH_SOURCE = 'Путь к платформе 1С (--path в env.json)';
 const UNIX_EXECUTABLES = ['1cv8', '1cv8c'] as const;
 
@@ -26,6 +28,57 @@ export function resolveV8ExecutablePath(v8Path: string, platform: NodeJS.Platfor
   const resolved = resolveV8ExecutablePathUnchecked(explicitPath, platform);
   assertNotOnecStarter(resolved, V8_PATH_SOURCE);
   return resolved;
+}
+
+/**
+ * Находит тонкий клиент (`1cv8c`) той же установки платформы, что и Конфигуратор.
+ * `1cv8 ENTERPRISE` запускает толстый клиент, поэтому для тонкого нужен отдельный файл.
+ * Ищется рядом с результатом `resolveV8ExecutablePath`, чтобы `--path`/`--v8version` и выбор
+ * свежей версии работали одинаково для обеих кнопок, а клиент не оказался другой версии.
+ * Возврата к `1cv8` при отсутствии тонкого клиента нет намеренно — иначе молча запустился бы толстый.
+ */
+export function resolveV8ThinClientExecutablePath(v8Path: string, platform: NodeJS.Platform = process.platform): string {
+  const explicitPath = trimOuterQuotes(v8Path).trim();
+  // Явный путь к самому тонкому клиенту: на Windows резолвер Конфигуратора принимает только 1cv8.exe.
+  if (isThinClientName(explicitPath, platform) && isExistingFile(explicitPath)) {
+    return explicitPath;
+  }
+
+  const designer = resolveV8ExecutablePath(v8Path, platform);
+  if (isThinClientName(designer, platform)) {
+    return designer;
+  }
+
+  const found = collectThinClientSiblings(designer, platform).find(isExistingFile);
+  if (found) {
+    return found;
+  }
+  const thinName = platform === 'win32' ? WINDOWS_THIN_CLIENT : UNIX_THIN_CLIENT;
+  throw new Error(
+    `Не найден тонкий клиент ${thinName} рядом с ${designer}. ` +
+    `Установите компонент «Тонкий клиент» платформы 1С или укажите путь к ${thinName} в "--path" env.json.`
+  );
+}
+
+function collectThinClientSiblings(designerPath: string, platform: NodeJS.Platform): string[] {
+  const dir = path.dirname(designerPath);
+  if (platform === 'win32') {
+    return [path.join(dir, WINDOWS_THIN_CLIENT)];
+  }
+  const candidates = [path.join(dir, UNIX_THIN_CLIENT)];
+  // macOS: тонкий клиент — отдельный бандл рядом с 1cv8.app, а не файл в его Contents/MacOS.
+  const appSuffix = path.join('1cv8.app', 'Contents', 'MacOS');
+  if (platform === 'darwin' && dir.endsWith(appSuffix)) {
+    const appsRoot = dir.slice(0, dir.length - appSuffix.length);
+    candidates.push(path.join(appsRoot, `${UNIX_THIN_CLIENT}.app`, 'Contents', 'MacOS', UNIX_THIN_CLIENT));
+  }
+  return candidates;
+}
+
+function isThinClientName(filePath: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32'
+    ? path.basename(filePath).toLowerCase() === WINDOWS_THIN_CLIENT
+    : path.basename(filePath) === UNIX_THIN_CLIENT;
 }
 
 function resolveV8ExecutablePathUnchecked(explicitPath: string, platform: NodeJS.Platform): string {

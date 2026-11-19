@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { spawn, type ChildProcess } from 'child_process';
 import { launchInteractiveDesignerWithAgentPause, type InteractiveDesignerProcess } from '../../../infra/agent';
 import { resolveDbPassword, type ProjectSecretStorage } from '../../../infra/environment';
-import { formatCommandLineForLog, normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion } from '../../../infra/process';
+import { formatCommandLineForLog, normalizeInfoBasePath, resolveV8ExecutablePath, resolveV8PathHintFromVersion, resolveV8ThinClientExecutablePath } from '../../../infra/process';
 import { getAgentOperationServiceForInteractiveDesigner, isAgentConfigurationOperationMode } from '../ext/ExtensionCommandRunner';
 import { CONFIGURATION_OPERATION_BUSY_MESSAGE, isConfigurationOperationRunning } from '../ext/configurationOperationLock';
 import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from '../ext/agent/remoteLocalDesigner';
@@ -17,6 +17,9 @@ interface DbRunConnectionParams {
   password?: string;
   v8Path?: string;
 }
+
+/** После чтения env.json путь к платформе известен всегда (пустая строка — автопоиск). */
+type ResolvedDbRunConnection = DbRunConnectionParams & { v8Path: string };
 
 interface DbRunOptions {
   mode: 'ENTERPRISE' | 'DESIGNER';
@@ -66,7 +69,9 @@ export async function runDbClientFromWorkspace(
         outputChannel.appendLine(`[db-run] ${decision.notice}`);
       }
     }
-    const v8Path = resolveV8ExecutablePath(connection.v8Path ?? '');
+    const v8Path = options.mode === 'ENTERPRISE'
+      ? resolveV8ThinClientExecutablePath(connection.v8Path)
+      : resolveV8ExecutablePath(connection.v8Path);
     const args = buildLaunchArguments(options, connection);
     // Интерактивный Конфигуратор и подключённый агент конфликтуют по блокировке базы:
     // сервис агента ищется тем же путём, что и release перед пакетными операциями
@@ -169,7 +174,7 @@ function resolveSettingsPath(workspaceRoot: string): string {
 async function resolveConnectionFromSettings(
   settingsPath: string,
   secrets: ProjectSecretStorage
-): Promise<DbRunConnectionParams> {
+): Promise<ResolvedDbRunConnection> {
   const raw = fs.readFileSync(settingsPath, 'utf-8');
   const parsed = JSON.parse(raw) as {
     default?: Record<string, unknown>;
@@ -184,8 +189,7 @@ async function resolveConnectionFromSettings(
   const connection = parseIbConnection(ibConnectionRaw);
   connection.userName = asString(defaults['--db-user']) ?? '';
   connection.password = await resolveDbPassword(secrets, asString(defaults['--db-pwd']) ?? '');
-  connection.v8Path = resolveV8PathFromSettings(defaults);
-  return connection;
+  return { ...connection, v8Path: resolveV8PathFromSettings(defaults) };
 }
 
 function parseIbConnection(rawValue: string): DbRunConnectionParams {

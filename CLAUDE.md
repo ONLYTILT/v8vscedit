@@ -68,6 +68,7 @@ npm run build         # полная сборка: clean + build:node + build:we
 npm run watch         # параллельный watch node + webview (scripts/vite-watch.mjs)
 npm run typecheck     # tsc (расширение) + vue-tsc (webview); = npm run compile
 npm run lint          # eslint . --max-warnings=0
+npm run package       # VSIX (vsce package; prepublish = build). Без --no-dependencies: ssh2 — external, едет из node_modules
 npm test              # запуск всех тестов через @vscode/test-electron (out/test/runTests.js)
 npm run test:fast     # прогон без pretest-пересборки; фильтр: MOCHA_GREP='<regex>' npm run test:fast
 npm run coverage:changed # 100% ТОЛЬКО по изменённым production-файлам (гейт задачи; scripts/patch-coverage.mjs)
