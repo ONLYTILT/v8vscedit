@@ -40,7 +40,7 @@ PowerShell или `cmd`, а не из Git Bash: MSYS переписывает а
 вызова `&` перед путём в кавычках).
 
 ```bat
-"C:\Program Files\1cv8\common\1cestart.exe" DESIGNER /S "server\base" /N "Login" /P "Password" /AgentMode /AgentBaseDir "C:\Users\a.kitmanov\Documents\tlc_buh_prod" /AgentSSHHostKeyAuto /AgentSSHHost 127.0.0.1 /AgentSSHPort 1543 /Visible /AgentListenAddress 0.0.0.0
+"C:\Program Files\1cv8\common\1cestart.exe" DESIGNER /S "server\base" /N "Login" /P "Password" /AgentMode /AgentBaseDir "C:\AgentBaseDir" /AgentSSHHostKeyAuto /AgentSSHHost 127.0.0.1 /AgentSSHPort 1543 /Visible /AgentListenAddress 0.0.0.0
 ```
 
 Не разбивайте команду на строки обратной кавычкой `` ` ``: это перенос только для PowerShell. В `cmd`,
