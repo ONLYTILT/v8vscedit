@@ -12,8 +12,11 @@ import {
   type PowerShellRemoteHostOptions,
 } from '../../../infra/process/remote/PowerShellRemoteHost';
 import { RemoteDesignerBatchExecutor, type RemoteDesignerHost } from '../../../infra/process/remote/RemoteDesignerBatchExecutor';
+import { assertServerDesignerExecutable } from '../../../infra/process/V8ExecutableGuard';
 import { getAgentExecutionMode, readAgentLocation } from './agent/agentSettings';
 import { nonEmptyString } from './connectionSettings';
+
+const V8_PATH_SETTING = 'v8vscedit.remote.v8Path';
 
 /**
  * Реестр исполнителей пакетного Конфигуратора: локальный (1cv8 на этой машине) или удалённый
@@ -114,6 +117,10 @@ export async function acquireDesignerBatchExecutor(
     };
   }
   const settings = readRemoteDesignerSettings();
+  // Ошибка настройки отбивается до сессии с сервером: ни пароля, ни передачи по сети, ни статуса операции.
+  if (settings.v8Path) {
+    assertServerDesignerExecutable(settings.v8Path, V8_PATH_SETTING);
+  }
   const host = await obtainHost(input, settings, deps);
   const v8Path = await resolveServerV8Path(host, settings, input.v8Version);
   return {
@@ -240,6 +247,8 @@ async function resolveServerV8Path(host: RegistryHost, settings: RemoteDesignerS
     if (!found) {
       throw new Error(`На сервере ${settings.computerName} не найден 1cv8 по пути ${settings.v8Path} (v8vscedit.remote.v8Path).`);
     }
+    // Хост мог разрешить путь иначе, чем записано в настройке; проверка дешёвая и страхует от правки скрипта хоста.
+    assertServerDesignerExecutable(found, V8_PATH_SETTING);
     return found;
   }
   const version = v8Version?.trim();
@@ -250,6 +259,7 @@ async function resolveServerV8Path(host: RegistryHost, settings: RemoteDesignerS
   if (!found) {
     throw new Error(`На сервере ${settings.computerName} не найдена платформа 1С версии ${version} (задайте v8vscedit.remote.v8Path).`);
   }
+  assertServerDesignerExecutable(found, `Путь к 1cv8 платформы ${version} на сервере ${settings.computerName}`);
   return found;
 }
 

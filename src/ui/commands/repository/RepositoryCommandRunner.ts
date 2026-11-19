@@ -18,7 +18,8 @@ import {
   buildRepositoryDesignerRequest,
   type RepositoryOperation,
 } from '../../../infra/repository/RepositoryDesignerArgs';
-import { resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
+import { hasReceivedFromRepository, resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
+import type { RepositoryLockOutcome } from './repositoryLockFlow';
 import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
 import { acquireDesignerBatchExecutor, type DesignerExecutorDeps } from '../ext/designerExecutorRegistry';
 
@@ -211,26 +212,37 @@ export function resolveRepositoryTarget(
   return repositoryService.resolveTargetByXmlPath(node.xmlPath);
 }
 
+/**
+ * Захват объектов. Результат — что захвачено и получила ли база новые версии (по логу): по нему
+ * команда решает, нужен ли импорт в проект. `undefined` — захват не выполнен (ошибку показал раннер).
+ */
 export async function runRepositoryLockAction(
   services: RepositoryCliServices,
   node: RepositoryNodeRef,
-  recursive: boolean
-): Promise<boolean> {
+  recursive: boolean,
+  options: { readonly revised: boolean }
+): Promise<RepositoryLockOutcome | undefined> {
   const target = requireTarget(services.repositoryService, node);
   const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
-  return runRepositoryCliCommand({
-    operation: { kind: 'lock', objectsXml: objects.xml },
+  let outcome: RepositoryLockOutcome | undefined;
+  const ok = await runRepositoryCliCommand({
+    operation: { kind: 'lock', objectsXml: objects.xml, revised: options.revised },
     target,
     progressTitle: `Захват: ${node.label ?? target.displayName}`,
-    progressStartMessage: 'Получаю объекты из хранилища для редактирования...',
+    progressStartMessage: options.revised
+      ? 'Захватываю объекты и получаю их версии из хранилища...'
+      : 'Получаю объекты из хранилища для редактирования...',
     successMessage: `Объекты "${node.label ?? target.displayName}" захвачены.`,
     errorTitle: `Ошибка захвата объектов "${node.label ?? target.displayName}".`,
     failureOperation: 'захвате объектов хранилища',
     // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
     afterSuccess: (result) => {
-      services.repositoryService.setLocked(target, resolveLockedFullNames(objects.fullNames, result.log), true);
+      const lockedFullNames = resolveLockedFullNames(objects.fullNames, result.log);
+      services.repositoryService.setLocked(target, lockedFullNames, true);
+      outcome = { lockedFullNames, receivedFromRepository: hasReceivedFromRepository(result.log) };
     },
   }, services);
+  return ok ? outcome : undefined;
 }
 
 export async function runRepositoryUnlockAction(

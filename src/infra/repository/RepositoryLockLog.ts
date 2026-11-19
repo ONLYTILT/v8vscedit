@@ -53,3 +53,20 @@ export function resolveLockedFullNames(fullNames: readonly string[], log: string
   // корневых объектов. Корень захватывается целиком, и успех операции — его единственный признак.
   return fullNames.filter((name) => !OBJECT_FULL_NAME.test(name) || locked.has(name.toLocaleLowerCase('ru')));
 }
+
+const OPERATION_BEGIN_MARKER = '---- Начало операции';
+const RECEIVED_PREFIX = 'Объект получен из хранилища:';
+
+/**
+ * Получила ли база при захвате новые версии объектов из хранилища (эксперимент Э14: строка
+ * «Объект получен из хранилища» пишется и при захвате БЕЗ `-revised`, если объект менялся в
+ * хранилище). Лог не распознан (нет маркера начала операции) — `true`: лишний импорт дешевле
+ * проекта, молча отстающего от базы.
+ */
+export function hasReceivedFromRepository(log: string): boolean {
+  const lines = log.split(/\r?\n/).map((line) => line.trim());
+  if (!lines.some((line) => line.startsWith(OPERATION_BEGIN_MARKER))) {
+    return true;
+  }
+  return lines.some((line) => line.startsWith(RECEIVED_PREFIX));
+}

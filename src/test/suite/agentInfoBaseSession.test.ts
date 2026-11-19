@@ -17,11 +17,17 @@
  * `await timers.fireAll()`), и не должен отклоняться: ошибка idle-отключения не уходит наружу.
  */
 import * as assert from 'assert';
+import * as os from 'os';
 import {
   AgentInfoBaseSession,
   SYSTEM_TIMERS,
   isInfoBaseAlreadyConnectedMessage,
   isInfoBaseNotConnectedMessage,
+  AgentCommandError,
+  AgentInfoBaseLockedError,
+  AgentOperationService,
+  isInfoBaseLockedByDesignerError,
+  type TimerApi,
   type DesignerAgentTransportFactory,
 } from '../../infra/agent';
 import { FakeTimers, ScriptedFactory, ScriptedTransport, agentError, deferred, type TransportBehavior } from './support/agentInfoBaseFakes';
@@ -546,4 +552,194 @@ suite('AgentInfoBaseSession: текстовый фолбэк распознав�
       assert.strictEqual(isInfoBaseNotConnectedMessage(text), expected);
     });
   }
+});
+
+const LOCK_TEXT = 'Ошибка блокировки информационной базы для конфигурирования';
+const lockedError = (): AgentCommandError => agentError('DesignerAlreadyStarted', LOCK_TEXT);
+
+/** Таймеры повтора: срабатывают сразу (микрозадачей) и сдвигают внедрённые часы на запрошенную задержку. */
+class AutoTimers implements TimerApi {
+  readonly delays: number[] = [];
+  now = 0;
+  setTimeout(callback: () => void | Promise<void>, ms: number): unknown {
+    this.delays.push(ms);
+    this.now += ms;
+    void Promise.resolve().then(callback);
+    return this.delays.length;
+  }
+  clearTimeout(): void { /* нечего снимать */ }
+}
+
+/** connect-ib отказывает с `failure` первые `times` раз (Infinity — всегда), затем отвечает успехом. */
+function lockedConnect(times: number, failure: () => Error = lockedError): TransportBehavior {
+  let left = times;
+  return (command) => {
+    if (command === CONNECT && left > 0) {
+      left -= 1;
+      return failure();
+    }
+    return undefined;
+  };
+}
+
+function makeRetry(behavior: TransportBehavior, retry?: { windowMs: number; delaysMs: number[] }) {
+  const factory = new ScriptedFactory(behavior);
+  const timers = new AutoTimers();
+  const session = new AgentInfoBaseSession(factory, {
+    idleDisconnectMs: 0,
+    timers,
+    clock: () => timers.now,
+    ...(retry ? { infoBaseLockRetry: retry } : {}),
+  });
+  return { factory, timers, session };
+}
+
+suite('isInfoBaseLockedByDesignerError: классификация блокировки ИБ', () => {
+  test('error-type DesignerAlreadyStarted → true', () => {
+    assert.strictEqual(isInfoBaseLockedByDesignerError(lockedError()), true);
+  });
+
+  for (const errorType of ['DesignerAlreadyConnectedToInfoBase', 'UnknownError']) {
+    test(`иной error-type ${errorType}, даже с текстом блокировки → false (машинный код авторитетен)`, () => {
+      assert.strictEqual(isInfoBaseLockedByDesignerError(agentError(errorType, LOCK_TEXT)), false);
+    });
+  }
+
+  test('без error-type: текст с лишними пробелами, переводом строки и другим регистром → true', () => {
+    const error = new AgentCommandError('ОШИБКА  блокировки\nинформационной базы для конфигурирования', 'cmd');
+    assert.strictEqual(isInfoBaseLockedByDesignerError(error), true);
+  });
+
+  test('обычный Error с текстом блокировки (фолбэк по тексту) → true', () => {
+    assert.strictEqual(isInfoBaseLockedByDesignerError(new Error(LOCK_TEXT)), true);
+  });
+
+  test('Error с посторонним текстом → false', () => {
+    assert.strictEqual(isInfoBaseLockedByDesignerError(new Error('другое')), false);
+  });
+
+  test('не-Error значение (строка) классифицируется по тексту', () => {
+    assert.strictEqual(isInfoBaseLockedByDesignerError(LOCK_TEXT), true);
+    assert.strictEqual(isInfoBaseLockedByDesignerError('что-то иное'), false);
+  });
+});
+
+suite('AgentInfoBaseSession: повтор connect-ib при блокировке ИБ', () => {
+  test('два отказа DesignerAlreadyStarted и успех: ровно 3 connect-ib, задержки [500, 1000], одно сообщение «База занята»', async () => {
+    const { session, factory, timers } = makeRetry(lockedConnect(2));
+    const messages: string[] = [];
+    const result = await session.run(async (exec) => { await exec.execute('op'); return 7; }, { onMessage: (m) => messages.push(m) });
+    assert.strictEqual(result, 7);
+    assert.strictEqual(factory.count(CONNECT), 3);
+    assert.deepStrictEqual(timers.delays, [500, 1_000]);
+    assert.strictEqual(factory.log.at(-1), 'op');
+    assert.strictEqual(messages.filter((m) => m.includes('База занята')).length, 1);
+    assert.strictEqual(session.isInfoBaseConnected(), true);
+  });
+
+  test('отказы до конца окна: AgentInfoBaseLockedError с описанием, waitedMs, сброс транспорта, база не подключена', async () => {
+    const { session, factory, timers } = makeRetry(lockedConnect(Infinity));
+    await assert.rejects(
+      session.run(sendCommand('op')),
+      (error: unknown) => {
+        assert.ok(error instanceof AgentInfoBaseLockedError);
+        assert.ok(error instanceof AgentCommandError);
+        assert.strictEqual(error.command, CONNECT);
+        assert.strictEqual(error.finalMessage?.['error-type'], 'DesignerAlreadyStarted');
+        assert.strictEqual(error.waitedMs, 13_500);
+        assert.ok(error.message.includes('1cestart.exe'), error.message);
+        assert.ok(error.message.includes(LOCK_TEXT), error.message);
+        return true;
+      }
+    );
+    // 0,5 + 1 + 2×6 с = 13,5 с; следующая пауза 2 с вышла бы за окно 15 с.
+    assert.deepStrictEqual(timers.delays, [500, 1_000, 2_000, 2_000, 2_000, 2_000, 2_000, 2_000]);
+    assert.strictEqual(factory.count(CONNECT), 9);
+    assert.ok(factory.resetCount >= 1, 'транспорт сброшен');
+    assert.strictEqual(session.isInfoBaseConnected(), false);
+    assert.ok(!factory.log.includes('op'));
+  });
+
+  test('без error-type (фолбэк по тексту) за окном: AgentInfoBaseLockedError без finalMessage', async () => {
+    const { session } = makeRetry(lockedConnect(Infinity, () => new Error(LOCK_TEXT)));
+    await assert.rejects(
+      session.run(sendCommand('op')),
+      (error: unknown) => error instanceof AgentInfoBaseLockedError && error.finalMessage === undefined && error.message.includes(LOCK_TEXT)
+    );
+  });
+
+  test('прочая ошибка connect-ib (UnknownError): без повторов, исходная ошибка', async () => {
+    const original = agentError('UnknownError', 'сбой');
+    const { session, factory, timers } = makeRetry(lockedConnect(1, () => original));
+    await assert.rejects(session.run(sendCommand('op')), (error: unknown) => error === original);
+    assert.strictEqual(factory.count(CONNECT), 1);
+    assert.deepStrictEqual(timers.delays, []);
+  });
+
+  test('DesignerAlreadyConnectedToInfoBase после одного DesignerAlreadyStarted → подключено', async () => {
+    let calls = 0;
+    const { session, factory } = makeRetry((command) => {
+      if (command !== CONNECT) { return undefined; }
+      calls += 1;
+      return calls === 1 ? lockedError() : agentError('DesignerAlreadyConnectedToInfoBase');
+    });
+    await session.run(sendCommand('op'));
+    assert.strictEqual(factory.count(CONNECT), 2);
+    assert.strictEqual(session.isInfoBaseConnected(), true);
+  });
+
+  test('отмена: после первого отказа сразу исходная ошибка, таймер не взведён', async () => {
+    const { session, factory, timers } = makeRetry(lockedConnect(Infinity));
+    await assert.rejects(
+      session.run(sendCommand('op'), { cancellation: { isCancellationRequested: true } }),
+      (error: unknown) => error instanceof AgentCommandError && !(error instanceof AgentInfoBaseLockedError) && error.finalMessage?.['error-type'] === 'DesignerAlreadyStarted'
+    );
+    assert.strictEqual(factory.count(CONNECT), 1);
+    assert.deepStrictEqual(timers.delays, []);
+  });
+
+  test('reconnectInfoBase тоже повторяет', async () => {
+    const { session, factory, timers } = makeRetry(lockedConnect(1));
+    await session.reconnectInfoBase();
+    assert.strictEqual(factory.count(CONNECT), 2);
+    assert.deepStrictEqual(timers.delays, [500]);
+    assert.strictEqual(session.isInfoBaseConnected(), true);
+  });
+
+  test('пользовательские опции окна: короткое окно — быстрый отказ', async () => {
+    const { session, factory, timers } = makeRetry(lockedConnect(Infinity), { windowMs: 1_000, delaysMs: [600] });
+    await assert.rejects(session.run(sendCommand('op')), AgentInfoBaseLockedError);
+    assert.deepStrictEqual(timers.delays, [600]);
+    assert.strictEqual(factory.count(CONNECT), 2);
+  });
+
+  test('очередь: вторая run, поставленная во время ожидания повтора, выполняется после первой', async () => {
+    const factory = new ScriptedFactory(lockedConnect(1));
+    const timers = new FakeTimers();
+    const session = new AgentInfoBaseSession(factory, { idleDisconnectMs: 0, timers, clock: () => 0 });
+    const first = session.run(sendCommand('first'));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(timers.pending.size, 1, 'первая операция ждёт повтора');
+    const second = session.run(sendCommand('second'));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(factory.log, [CONNECT]);
+    await timers.fireAll();
+    await Promise.all([first, second]);
+    assert.deepStrictEqual(factory.log, [CONNECT, CONNECT, 'first', 'second']);
+  });
+});
+
+suite('AgentOperationService: infoBaseLockRetry пробрасывается в сессию', () => {
+  test('короткое окно из опций → быстрый отказ AgentInfoBaseLockedError', async () => {
+    const factory = new ScriptedFactory(lockedConnect(Infinity));
+    const timers = new AutoTimers();
+    const service = new AgentOperationService(
+      os.tmpdir(),
+      factory,
+      { timers, clock: () => timers.now, infoBaseLockRetry: { windowMs: 1_000, delaysMs: [600] } }
+    );
+    await assert.rejects(service.reconnectInfoBase(), AgentInfoBaseLockedError);
+    assert.strictEqual(factory.count(CONNECT), 2);
+    assert.deepStrictEqual(timers.delays, [600]);
+  });
 });

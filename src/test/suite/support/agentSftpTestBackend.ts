@@ -92,6 +92,9 @@ export class SftpTestBackend {
    * в полёте не больше `IO_WINDOW` порций.
    */
   readonly maxConcurrent: Record<'READ' | 'WRITE', number> = { READ: 0, WRITE: 0 };
+  /** Сейчас открытых каталогов (OPENDIR без CLOSE) и их наибольшее число за время жизни сервера. */
+  openDirs = 0;
+  maxOpenDirs = 0;
 
   private readonly inFlight: Record<'READ' | 'WRITE', number> = { READ: 0, WRITE: 0 };
   private readonly failures: FailureState[] = [];
@@ -255,6 +258,9 @@ export class SftpTestBackend {
           fs.closeSync(open.fd);
           this.openFds.delete(open.fd);
         }
+        if (open?.kind === 'dir') {
+          this.openDirs -= 1;
+        }
         handles.delete(h.toString('hex'));
         status(reqId, STATUS_CODE.OK);
       });
@@ -355,6 +361,8 @@ export class SftpTestBackend {
           longname: name,
           attrs: toAttributes(fs.lstatSync(path.join(abs, name))),
         }));
+        this.openDirs += 1;
+        this.maxOpenDirs = Math.max(this.maxOpenDirs, this.openDirs);
         sftp.handle(reqId, newHandle({ kind: 'dir', entries, offset: 0 }));
       });
     });

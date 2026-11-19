@@ -257,6 +257,8 @@ export async function runUpdateExtension(
       workspaceFolder,
       outputChannel,
       rootPath: extensionRoot,
+      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя.
+      confirmFullDump: promptFullDump,
     },
     async (service, operationHooks) => {
       await service.loadChangedAndUpdate(
@@ -290,6 +292,8 @@ export async function runUpdateMainConfiguration(
       workspaceFolder,
       outputChannel,
       rootPath: configRoot,
+      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя.
+      confirmFullDump: promptFullDump,
     },
     async (service, operationHooks) => {
       await service.loadChangedAndUpdate(

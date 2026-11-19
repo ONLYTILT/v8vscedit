@@ -174,6 +174,7 @@ suite('AgentSyncEngine: полная выгрузка только по необ
             targetKind: kind,
             targetName: targetNameOf(kind),
             projectDir: h.configRoot,
+            operation: 'import',
             reason,
             reasonText: ARCHIVE_REASON_POLICY[reason].text,
           }]);

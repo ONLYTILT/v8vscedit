@@ -1,21 +1,12 @@
 ﻿import * as path from 'path';
 import * as vscode from 'vscode';
-import type { RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import { REPOSITORY_DUMP_OUTPUT, repositoryReportOutputName } from '../../../infra/repository/RepositoryDesignerArgs';
 import type { CommandServices, NodeArg } from '../_shared';
-import {
-  runApplyDatabaseConfiguration,
-  runDecompileExtension,
-  runDecompileMainConfiguration,
-  runUpdateExtension,
-  runUpdateMainConfiguration,
-} from '../ext/ExtensionCommandRunner';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
 import {
-  type RepositoryCliServices,
   runRepositoryCliCommand,
   runRepositoryCommitAction,
-  runRepositoryLockAction,
   runRepositoryUnlockAction,
   runRepositoryUpdateAction,
 } from './RepositoryCommandRunner';
@@ -41,8 +32,16 @@ import {
   promptOptionalText,
   promptRequiredText,
 } from './repositoryPrompts';
+import { registerRepositoryLockCommand } from './RepositoryLockCommand';
+import {
+  requireConnectedRootTarget,
+  requireRepositoryNode,
+  requireRootTarget,
+  resolveRepositoryNode,
+  toCliServices,
+} from './repositoryNodeTargets';
+import { findChangedConfiguration, refreshRepositoryUi, runPostRepositorySync, updateTargetDatabase } from './repositoryPostSync';
 
-type RepositoryCommandNode = NodeArg & RepositoryNodeRef;
 
 /**
  * Регистрирует команды работы с хранилищем конфигурации.
@@ -51,6 +50,7 @@ export function registerRepositoryCommands(
   context: vscode.ExtensionContext,
   services: CommandServices
 ): void {
+  registerRepositoryLockCommand(context, services);
   context.subscriptions.push(
     vscode.commands.registerCommand('v8vscedit.repository.connect', async (node: NodeArg) => {
       const target = requireRootTarget(services, node);
@@ -147,8 +147,8 @@ export function registerRepositoryCommands(
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.disconnect', async (node: NodeArg) => {
-      const target = requireRootTarget(services, node);
-      if (!target || !ensureConnected(services.repositoryService, target)) {
+      const target = requireConnectedRootTarget(services, node);
+      if (!target) {
         return;
       }
 
@@ -175,25 +175,6 @@ export function registerRepositoryCommands(
           refreshRepositoryUi(services);
         },
       }, toCliServices(services)));
-    }),
-
-    vscode.commands.registerCommand('v8vscedit.repository.lock', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
-        return;
-      }
-
-      const recursive = await askRecursiveMode('Захват объектов', repositoryNode.label ?? 'выбранный узел');
-      if (recursive === undefined) {
-        return;
-      }
-
-      const ok = await runWithConfigurationOperationLock(
-        () => runRepositoryLockAction(toCliServices(services), repositoryNode, recursive)
-      );
-      if (ok) {
-        refreshRepositoryUi(services);
-      }
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.unlock', async (node: NodeArg) => {
@@ -225,15 +206,11 @@ export function registerRepositoryCommands(
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.commit', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
+      const resolved = resolveRepositoryNode(services, node);
+      if (!resolved) {
         return;
       }
-
-      const target = requireTarget(services.repositoryService, repositoryNode);
-      if (!target) {
-        return;
-      }
+      const { node: repositoryNode, target } = resolved;
 
       // Все вопросы пользователю — ДО замка (иначе открытая форма держала бы «операция уже
       // выполняется» для всех), а «обновить БД → поместить» — одна секция замка: помещается
@@ -258,7 +235,7 @@ export function registerRepositoryCommands(
       }
 
       const ok = await runWithConfigurationOperationLock(async () => {
-        if (updateBeforeCommit && !await updateTargetBeforeCommit(target, services)) {
+        if (updateBeforeCommit && !await updateTargetDatabase(target, services)) {
           return false;
         }
         return runRepositoryCommitAction(toCliServices(services), repositoryNode, formData);
@@ -530,22 +507,6 @@ export function registerRepositoryCommands(
   );
 }
 
-function toCliServices(services: CommandServices): RepositoryCliServices {
-  return {
-    workspaceFolder: services.workspaceFolder,
-    outputChannel: services.outputChannel,
-    repositoryService: services.repositoryService,
-    projectSecretStorage: services.projectSecretStorage,
-    createDesignerExecutor: services.createDesignerExecutor,
-    designerExecutorDeps: services.designerExecutorDeps,
-  };
-}
-
-function refreshRepositoryUi(services: CommandServices): void {
-  services.treeProvider.refresh();
-  services.refreshActionsView();
-}
-
 /**
  * Нужна ли загрузка локальных изменений в базу перед помещением: `false` — изменений нет,
  * `true` — пользователь согласился обновить, `undefined` — помещение отменено.
@@ -554,9 +515,7 @@ async function confirmUpdateBeforeCommit(
   target: RepositoryTarget,
   services: CommandServices
 ): Promise<boolean | undefined> {
-  const changed = (await services.getChangedConfigurations()).find(
-    (item) => path.resolve(item.rootPath).toLowerCase() === path.resolve(target.configRoot).toLowerCase()
-  );
+  const changed = await findChangedConfiguration(services, target);
   if (!changed) {
     return false;
   }
@@ -580,115 +539,4 @@ async function confirmUpdateBeforeCommit(
   });
 
   return picked?.id === 'update' ? true : undefined;
-}
-
-async function updateTargetBeforeCommit(target: RepositoryTarget, services: CommandServices): Promise<boolean> {
-  const updated = target.configKind === 'cfe'
-    ? await runUpdateExtension(
-        target.extensionName ?? target.displayName,
-        target.configRoot,
-        services.workspaceFolder,
-        services.outputChannel,
-        false
-      )
-    : await runUpdateMainConfiguration(
-        target.displayName,
-        target.configRoot,
-        services.workspaceFolder,
-        services.outputChannel,
-        false
-      );
-  if (!updated) {
-    return false;
-  }
-
-  services.markConfigurationsClean([target.configRoot]);
-  refreshRepositoryUi(services);
-  return true;
-}
-
-async function runPostRepositorySync(target: RepositoryTarget, services: CommandServices): Promise<void> {
-  try {
-    const updated = await runApplyDatabaseConfiguration({
-      kind: target.configKind,
-      name: target.displayName,
-      rootPath: target.configRoot,
-      extensionName: target.extensionName,
-    }, services.workspaceFolder, services.outputChannel, false);
-    if (!updated) {
-      return;
-    }
-
-    const imported = target.configKind === 'cfe'
-      ? await runDecompileExtension(
-          target.extensionName ?? target.displayName,
-          target.configRoot,
-          services.workspaceFolder,
-          services.outputChannel
-        )
-      : await runDecompileMainConfiguration(
-          target.displayName,
-          target.configRoot,
-          services.workspaceFolder,
-          services.outputChannel
-        );
-    if (!imported) {
-      return;
-    }
-
-    services.markConfigurationsClean([target.configRoot]);
-    await services.reloadEntries();
-    refreshRepositoryUi(services);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    services.outputChannel.appendLine(`[repository][post-sync][error] ${message}`);
-  }
-}
-
-function requireRootTarget(services: CommandServices, node: NodeArg): RepositoryTarget | null {
-  const repositoryNode = node as RepositoryCommandNode | undefined;
-  if (!repositoryNode?.xmlPath || (repositoryNode.nodeKind !== 'configuration' && repositoryNode.nodeKind !== 'extension')) {
-    void vscode.window.showWarningMessage('Команда хранилища доступна только для корня основной конфигурации или расширения.');
-    return null;
-  }
-
-  return requireTarget(services.repositoryService, repositoryNode);
-}
-
-function requireConnectedRootTarget(services: CommandServices, node: NodeArg): RepositoryTarget | null {
-  const target = requireRootTarget(services, node);
-  if (!target || !ensureConnected(services.repositoryService, target)) {
-    return null;
-  }
-  return target;
-}
-
-function requireRepositoryNode(services: CommandServices, node: NodeArg): RepositoryCommandNode | null {
-  const repositoryNode = node as RepositoryCommandNode | undefined;
-  if (!repositoryNode?.xmlPath) {
-    void vscode.window.showWarningMessage('Команда хранилища доступна только для узлов конфигурации с XML.');
-    return null;
-  }
-
-  const target = requireTarget(services.repositoryService, repositoryNode);
-  if (!target || !ensureConnected(services.repositoryService, target)) {
-    return null;
-  }
-
-  return repositoryNode;
-}
-
-function requireTarget(repositoryService: RepositoryService, node: RepositoryNodeRef): RepositoryTarget | null {
-  if (!node.xmlPath) {
-    return null;
-  }
-  return repositoryService.resolveTargetByXmlPath(node.xmlPath);
-}
-
-function ensureConnected(repositoryService: RepositoryService, target: RepositoryTarget): boolean {
-  if (!repositoryService.hasBinding(target) || !repositoryService.isConnected(target)) {
-    void vscode.window.showWarningMessage(`Для "${target.displayName}" нет активного подключения к хранилищу.`);
-    return false;
-  }
-  return true;
 }

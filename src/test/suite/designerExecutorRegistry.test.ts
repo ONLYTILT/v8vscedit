@@ -58,6 +58,7 @@ import {
 import type { CommandServices } from '../../ui/commands/_shared';
 import { registerResetRemotePasswordCommand } from '../../ui/commands/ext/agent/ResetRemotePasswordCommand';
 import { RemoteDesignerBatchExecutor } from '../../infra/process/remote/RemoteDesignerBatchExecutor';
+import { OnecStarterExecutableError } from '../../infra/process/V8ExecutableGuard';
 import { disposeCachedAgentOperationServices } from '../../ui/commands/ext/agent/AgentServiceRegistry';
 import {
   acquireDesignerBatchExecutor,
@@ -688,6 +689,83 @@ suite('Э9: designerExecutorRegistry — выбор local/remote, хост, па
       await acquireRemotePowerShellHost({ workspaceFolder: folder, outputChannel: channel, secrets }, deps);
       assert.strictEqual(prompts, 1);
       assert.strictEqual(await secrets.getRemotePassword(), PASSWORD);
+    });
+  });
+
+  suite('защита от стартера 1cestart.exe (V8ExecutableGuard)', () => {
+    const STARTER = 'C:\\Program Files\\1cv8\\common\\1cestart.exe';
+    let resolveCalls: { v8Path?: string; v8Version?: string }[];
+    let guardedDeps: DesignerExecutorDeps;
+
+    setup(() => {
+      resolveCalls = [];
+      guardedDeps = {
+        ...deps,
+        createHost: (options) => {
+          const host = new FakeRegistryHost(options);
+          const original = host.resolveV8.bind(host);
+          host.resolveV8 = (target) => { resolveCalls.push(target); return original(target); };
+          host.resolvable.set('C:\\1c\\bin\\1cv8.exe', 'C:\\1c\\bin\\1cv8.exe');
+          host.resolvable.set('C:\\1c\\1cv8c.exe', 'C:\\1c\\1cv8c.exe');
+          host.resolvable.set(STARTER, STARTER);
+          host.resolvable.set('C:\\1c\\1cv8.exe', STARTER);
+          host.resolvable.set('v8.3.27.2130', STARTER);
+          host.resolvable.set('v8.3.1.1', 'C:\\Program Files\\1cv8\\8.3.1.1\\bin\\1cv8.exe');
+          hosts.push(host);
+          return host;
+        },
+      };
+    });
+
+    for (const starterPath of [STARTER, 'C:/Program Files/1cv8/common/1CEStart.exe', '1cestart.exe']) {
+      test(`remote.v8Path = ${starterPath}: отказ OnecStarterExecutableError, resolveV8 хоста не вызван`, async () => {
+        await configureRemote({ v8Path: starterPath });
+        await assert.rejects(
+          () => acquireDesignerBatchExecutor(input(), guardedDeps),
+          (error: unknown) => error instanceof OnecStarterExecutableError && error.message.includes('v8vscedit.remote.v8Path')
+        );
+        assert.deepStrictEqual(resolveCalls, []);
+      });
+    }
+
+    test('remote.v8Path = 1cv8c.exe: ошибка «не 1cv8.exe», resolveV8 не вызван', async () => {
+      await configureRemote({ v8Path: 'C:\\1c\\1cv8c.exe' });
+      await assert.rejects(
+        () => acquireDesignerBatchExecutor(input(), guardedDeps),
+        (error: unknown) => error instanceof Error && !(error instanceof OnecStarterExecutableError) && error.message.includes('не 1cv8.exe')
+      );
+      assert.deepStrictEqual(resolveCalls, []);
+    });
+
+    test('хост вернул стартер на путь 1cv8.exe из настройки: отказ', async () => {
+      await configureRemote({ v8Path: 'C:\\1c\\1cv8.exe' });
+      await assert.rejects(() => acquireDesignerBatchExecutor(input(), guardedDeps), OnecStarterExecutableError);
+      assert.strictEqual(resolveCalls.length, 1);
+    });
+
+    test('хост вернул стартер на версию платформы: отказ', async () => {
+      await configureRemote({ v8Path: '' });
+      await assert.rejects(() => acquireDesignerBatchExecutor(input({ v8Version: '8.3.27.2130' }), guardedDeps), OnecStarterExecutableError);
+    });
+
+    test('хост вернул путь bin 1cv8.exe: lease как прежде', async () => {
+      await configureRemote({ v8Path: 'C:\\1c\\bin\\1cv8.exe' });
+      const lease = await acquireDesignerBatchExecutor(input(), guardedDeps);
+      assert.strictEqual(lease.kind, 'remote');
+      assert.strictEqual(lease.v8Path, 'C:\\1c\\bin\\1cv8.exe');
+    });
+
+    test('вывод из версии: нормальный 1cv8.exe проходит проверку', async () => {
+      await configureRemote({ v8Path: '' });
+      const lease = await acquireDesignerBatchExecutor(input({ v8Version: '8.3.1.1' }), guardedDeps);
+      assert.strictEqual(lease.v8Path, 'C:\\Program Files\\1cv8\\8.3.1.1\\bin\\1cv8.exe');
+    });
+
+    test('local: localV8Path указывает на 1cestart.exe — отказ OnecStarterExecutableError', async () => {
+      const starter = path.join(root, '1cestart.exe');
+      fs.writeFileSync(starter, '');
+      await assert.rejects(() => acquireDesignerBatchExecutor(input({ localV8Path: starter }), guardedDeps), OnecStarterExecutableError);
+      assert.strictEqual(hosts.length, 0);
     });
   });
 });

@@ -399,3 +399,46 @@ suite('Э9: команда v8vscedit.remote.checkConnection — часть Power
     assert.strictEqual(h.server.passwordAttempts, 0);
   });
 });
+
+suite('checkRemotePowerShell: стартер 1cestart.exe вместо 1cv8.exe', () => {
+  const STARTER = 'C:\\Program Files\\1cv8\\common\\1cestart.exe';
+
+  test('v8Path — стартер: часть v8 failed/v8-starter, resolveV8 не вызван, powershell ok', async () => {
+    const host = new CheckHost();
+    const report = await checkRemotePowerShell(host, { computerName: SERVER, v8Path: STARTER });
+    assert.strictEqual(report.ok, false);
+    assert.strictEqual(report.parts[0].status, 'ok');
+    assert.strictEqual(report.parts[1].id, 'v8');
+    assert.strictEqual(report.parts[1].status, 'failed');
+    assert.strictEqual(report.parts[1].reason, 'v8-starter');
+    assert.ok(report.parts[1].message.includes('1cestart.exe'), report.parts[1].message);
+    assert.ok(!host.calls.includes('resolveV8'));
+  });
+
+  test('хост вернул стартер (путь из настройки указывал на 1cv8.exe) — v8-starter', async () => {
+    const host = new CheckHost();
+    host.resolved = STARTER;
+    const report = await checkRemotePowerShell(host, { computerName: SERVER, v8Path: 'C:\\1c\\1cv8.exe' });
+    assert.strictEqual(report.ok, false);
+    assert.strictEqual(report.parts[1].status, 'failed');
+    assert.strictEqual(report.parts[1].reason, 'v8-starter');
+  });
+
+  test('хост вернул стартер на версию платформы — v8-starter', async () => {
+    const host = new CheckHost();
+    host.resolved = STARTER;
+    const report = await checkRemotePowerShell(host, { computerName: SERVER, v8Version: '8.3.27.2130' });
+    assert.strictEqual(report.parts[1].reason, 'v8-starter');
+  });
+
+  test('формат отчёта: строка «[ОШИБКА] 1cv8: …» с названием стартера', async () => {
+    const report = await checkRemotePowerShell(new CheckHost(), { computerName: SERVER, v8Path: STARTER });
+    const lines = formatRemotePowerShellReport(report);
+    assert.ok(lines.some((line) => line.startsWith('[ОШИБКА] 1cv8:') && line.includes('1cestart.exe')), lines.join('\n'));
+  });
+
+  test('нормальный путь по-прежнему ok (регресс)', async () => {
+    const report = await checkRemotePowerShell(new CheckHost(), { computerName: SERVER, v8Path: 'C:\\1c\\1cv8.exe' });
+    assert.strictEqual(report.ok, true);
+  });
+});

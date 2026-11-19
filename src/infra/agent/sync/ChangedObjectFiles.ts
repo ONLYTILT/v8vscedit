@@ -143,7 +143,7 @@ export async function collectOwnerFiles(
   const perOwner = new Map<ChangedOwner, string[] | undefined>();
   const { cancelled } = await forEachConcurrent(owners, async (owner) => {
     perOwner.set(owner, await ownerFilesInStore(store, prefix, owner));
-  }, options, (owner) => owner.fullName);
+  }, { ...options, action: 'list' }, (owner) => owner.fullName);
   if (cancelled) {
     throw new AgentTransferCancelledError();
   }

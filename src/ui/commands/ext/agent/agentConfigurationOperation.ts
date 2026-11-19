@@ -82,8 +82,8 @@ export async function runAgentConfigurationOperation(
     return true;
   } catch (error) {
     if (error instanceof AgentFullDumpDeclinedError) {
-      // Отказ от полной выгрузки — решение пользователя, а не сбой: текст ошибки — инструкция ручной
-      // выгрузки, её и показываем (до общей ветки отмены: это её подкласс).
+      // Отказ от полной выгрузки — решение пользователя, а не сбой: текст ошибки — инструкция по контексту
+      // отказа (импорт, импорт после посева, загрузка), её и показываем (до общей ветки отмены: это её подкласс).
       options.outputChannel.appendLine(`[agent] ${error.message}`);
       endConfigurationOperationStatus(options.progressTitle, 'отменено');
       void vscode.window.showInformationMessage(error.message);

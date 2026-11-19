@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   AgentTransferError,
+  type AgentPoolAction,
   forEachConcurrent,
   statFiles,
 } from '../../infra/agent/files/AgentFileTransfer';
@@ -156,5 +157,62 @@ suite('AgentFileTransfer: statFiles', () => {
     const map = await statFiles(store, ['dir/a.txt'], { cancellation: { isCancellationRequested: true } });
     assert.strictEqual(map.size, 0);
     assert.strictEqual(store.maxInFlight, 0);
+  });
+});
+
+suite('AgentFileTransfer: текст и действие AgentTransferError (4e)', () => {
+  const failure = (path: string) => ({ path, error: new Error('сбой') });
+
+  test('по умолчанию: «Не удалось передать файлы агента (N)», action = transfer', () => {
+    const error = new AgentTransferError([failure('a'), failure('b')]);
+    assert.strictEqual(error.action, 'transfer');
+    assert.ok(error.message.startsWith('Не удалось передать файлы агента (2)'), error.message);
+    assert.ok(error.message.includes('a: сбой') && error.message.includes('b: сбой'));
+  });
+
+  const table: [AgentPoolAction, string][] = [
+    ['transfer', 'Не удалось передать файлы агента'],
+    ['stat', 'Не удалось проверить файлы агента'],
+    ['list', 'Не удалось прочитать каталоги агента'],
+  ];
+  for (const [action, text] of table) {
+    test(`action=${action}: конструктор выбирает текст «${text}»`, () => {
+      const error = new AgentTransferError([failure('x')], action);
+      assert.strictEqual(error.action, action);
+      assert.ok(error.message.startsWith(text), error.message);
+      assert.ok(error.message.includes('(1)'));
+    });
+
+    test(`forEachConcurrent(..., { action: ${action} }) при отказе: текст и action в AgentTransferError`, async () => {
+      await assert.rejects(
+        forEachConcurrent(['one'], () => Promise.reject(new Error('сбой пула')), { action }),
+        (error: unknown) => error instanceof AgentTransferError && error.action === action && error.message.startsWith(text)
+      );
+    });
+  }
+
+  test('forEachConcurrent без action — transfer', async () => {
+    await assert.rejects(
+      forEachConcurrent(['one'], () => Promise.reject(new Error('сбой пула'))),
+      (error: unknown) => error instanceof AgentTransferError && error.action === 'transfer'
+    );
+  });
+
+  test('statFiles с хранилищем, у которого stat бросает → action = stat, текст «проверить файлы»', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-stat-fail-'));
+    try {
+      class FailingStatStore extends LocalAgentFileStore {
+        override stat(): Promise<AgentFileEntry | undefined> { return Promise.reject(new Error('stat недоступен')); }
+      }
+      await assert.rejects(
+        statFiles(new FailingStatStore(base), ['a.txt']),
+        (error: unknown) => error instanceof AgentTransferError
+          && error.action === 'stat'
+          && error.message.startsWith('Не удалось проверить файлы агента')
+          && error.message.includes('stat недоступен')
+      );
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });

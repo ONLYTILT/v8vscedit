@@ -4,6 +4,7 @@ import { buildDumpConfigToFilesCommand, buildLoadConfigFromFilesCommand } from '
 import { collectConfigFilesForLoad } from '../ConfigLoadFileCollector';
 import { uploadFiles } from '../files/AgentFileTransfer';
 import { packDirectoryFilesToFile } from './ArchiveCodec';
+import { confirmFullDumpOrThrow } from './FullDumpConsent';
 import { CONFIG_DUMP_INFO_XML, CONFIGURATION_XML, listProjectFiles, toProjectPath } from './ProjectFiles';
 import {
   EXCHANGE_ARCHIVE,
@@ -107,6 +108,8 @@ async function loadWithPlan(context: SyncOperationContext, mode: AgentLoadMode):
       await context.exec.execute(buildDumpConfigToFilesCommand(mirror, { extensionName: context.extensionName, update: true, force: true }));
       break;
     case 'full-dump':
+      // Вопрос — ДО любой мутации M: отказ не должен ни очищать M, ни менять манифест.
+      await confirmFullDumpOrThrow(context, 'mirror-empty', 'load');
       // M на сервере нет, но БД ≡ B: полная выгрузка базы в M — на сервере, без скачивания (Н47).
       // M очищается заранее, как в первом импорте: остаток недостоверного M не должен пережить выгрузку.
       context.hooks?.onMessage?.('Зеркало выгрузки на стороне агента не подготовлено: выгрузка конфигурации в него на сервере.');

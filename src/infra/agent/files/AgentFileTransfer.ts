@@ -54,11 +54,20 @@ export function throwIfTransferCancellationRequested(cancellation: AgentTransfer
   }
 }
 
-/** Отказ передачи: перечень всех файлов, на которых она упала (одновременно идущие тоже). */
+/** Что делал пул: по действию выбирается текст отказа (STAT/LIST — не «передача»). */
+export type AgentPoolAction = 'transfer' | 'stat' | 'list';
+
+const POOL_FAILURE_TEXT: Record<AgentPoolAction, string> = {
+  transfer: 'Не удалось передать файлы агента',
+  stat: 'Не удалось проверить файлы агента',
+  list: 'Не удалось прочитать каталоги агента',
+};
+
+/** Отказ пула: перечень всех элементов, на которых он упал (одновременно идущие тоже). */
 export class AgentTransferError extends Error {
-  constructor(readonly failures: readonly AgentTransferFailure[]) {
+  constructor(readonly failures: readonly AgentTransferFailure[], readonly action: AgentPoolAction = 'transfer') {
     super(
-      `Не удалось передать файлы агента (${String(failures.length)}): ` +
+      `${POOL_FAILURE_TEXT[action]} (${String(failures.length)}): ` +
       failures.map((failure) => `${failure.path}: ${failure.error.message}`).join('; ')
     );
     this.name = 'AgentTransferError';
@@ -96,10 +105,10 @@ export function uploadFiles(
 export function forEachConcurrent<T>(
   items: readonly T[],
   run: (item: T) => void | Promise<void>,
-  options: AgentTransferOptions = {},
+  options: AgentTransferOptions & { readonly action?: AgentPoolAction } = {},
   describe: (item: T) => string = String
 ): Promise<AgentTransferResult> {
-  return runTransfer(items, async (item) => { await run(item); }, options, describe);
+  return runTransfer(items, async (item) => { await run(item); }, options, describe, options.action);
 }
 
 /**
@@ -112,7 +121,7 @@ export async function statFiles(
   options: AgentTransferOptions = {}
 ): Promise<Map<string, AgentFileEntry | undefined>> {
   const done = new Map<string, AgentFileEntry | undefined>();
-  await forEachConcurrent(rels, async (rel) => { done.set(rel, await store.stat(rel)); }, options);
+  await forEachConcurrent(rels, async (rel) => { done.set(rel, await store.stat(rel)); }, { ...options, action: 'stat' });
   return new Map(rels.filter((rel) => done.has(rel)).map((rel) => [rel, done.get(rel)] as const));
 }
 
@@ -125,7 +134,8 @@ async function runTransfer<T>(
   rels: readonly T[],
   transferOne: (rel: T) => Promise<void>,
   options: AgentTransferOptions,
-  describe: (item: T) => string
+  describe: (item: T) => string,
+  action: AgentPoolAction = 'transfer'
 ): Promise<AgentTransferResult> {
   const concurrency = options.concurrency ?? DEFAULT_AGENT_TRANSFER_CONCURRENCY;
   if (!Number.isInteger(concurrency) || concurrency < 1) {
@@ -157,7 +167,7 @@ async function runTransfer<T>(
 
   await Promise.all(Array.from({ length: Math.min(concurrency, rels.length) }, worker));
   if (failures.length > 0) {
-    throw new AgentTransferError(failures);
+    throw new AgentTransferError(failures, action);
   }
   return { transferred: done, cancelled };
 }

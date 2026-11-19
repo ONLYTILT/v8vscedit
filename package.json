@@ -965,7 +965,12 @@
         "v8vscedit.remote.v8Path": {
           "type": "string",
           "default": "",
-          "description": "Путь к 1cv8.exe НА СЕРВЕРЕ 1С. Пусто — путь выводится из --v8version в env.json (стандартный каталог установки платформы) и проверяется на сервере"
+          "description": "Путь к 1cv8.exe НА СЕРВЕРЕ 1С — только 1cv8.exe конкретной версии, не стартер 1cestart.exe. Пусто — путь выводится из --v8version в env.json (стандартный каталог установки платформы) и проверяется на сервере"
+        },
+        "v8vscedit.repository.getRevisedOnLock": {
+          "type": "boolean",
+          "default": true,
+          "description": "Передавать ключ -revised при захвате объектов хранилища (получать версии захватываемых объектов из хранилища). Если захват получил новые версии объектов, изменившиеся объекты импортируются в файлы проекта"
         },
         "v8vscedit.remote.ibConnection": {
           "type": "string",

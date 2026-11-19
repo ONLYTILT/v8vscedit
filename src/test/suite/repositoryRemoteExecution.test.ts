@@ -23,6 +23,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { SecretStore } from '../../infra/ai/AiSecretStorage';
 import { ProjectSecretStorage } from '../../infra/environment/ProjectSecretStorage';
+import { OnecStarterExecutableError } from '../../infra/process/V8ExecutableGuard';
 import type { HostRunRequest, HostRunResult } from '../../infra/process/remote/PowerShellRemoteHost';
 import { RepositoryService, type RepositoryNodeRef } from '../../infra/repository/RepositoryService';
 import type { CommandServices } from '../../ui/commands/_shared';
@@ -229,7 +230,7 @@ suite('Э9: хранилище конфигурации в удалённом р
 
   suite('запуск на сервере', () => {
     test('захват: объекты уходят на сервер входным файлом, 1cv8 — по пути сервера, отметка о захвате поставлена', async () => {
-      assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false), true);
+      assert.deepStrictEqual(await runRepositoryLockAction(services, catalogNode, false, { revised: false }), { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true });
 
       assert.deepStrictEqual(host.ops(), ['mktemp', 'put', 'run', 'rmtemp']);
       const put = host.calls[1].args;
@@ -348,6 +349,25 @@ suite('Э9: хранилище конфигурации в удалённом р
       await setRemoteSetting('v8Path', 'C:\\нет\\1cv8.exe');
       await assert.rejects(() => runRepositoryCliCommand(runOptions(), services), /C:\\нет\\1cv8\.exe/);
     });
+
+    for (const starter of ['C:\\Program Files\\1cv8\\common\\1cestart.exe', 'C:/Program Files/1cv8/common/1CEStart.EXE']) {
+      test(`remote.v8Path = стартер (${starter}): отказ до статуса и до запуска на сервере`, async () => {
+        await setRemoteSetting('v8Path', starter);
+        let statusBars = 0;
+        const original = windowRef.createStatusBarItem;
+        windowRef.createStatusBarItem = (...args: unknown[]) => {
+          statusBars += 1;
+          return (original as (...a: unknown[]) => unknown)(...args);
+        };
+        try {
+          await assert.rejects(() => runRepositoryCliCommand(runOptions(), services), OnecStarterExecutableError);
+        } finally {
+          windowRef.createStatusBarItem = original;
+        }
+        assert.strictEqual(statusBars, 0, 'статус операции не должен включаться');
+        assert.deepStrictEqual(host.ops(), [], 'на сервер ничего не уходит');
+      });
+    }
   });
 
   suite('выходные файлы dump/report (staging)', () => {

@@ -717,3 +717,88 @@ suite('connectSftpAgentFileStore: подключение и политика Э3
     assert.deepStrictEqual(h.sleeps, []);
   });
 });
+
+suite('SftpAgentFileStore: общий бюджет открытых каталогов (не больше 8 OPENDIR на соединение)', () => {
+  const MAX_OPEN_DIRS = 8;
+  let env: Env;
+  let store: SftpAgentFileStore;
+
+  setup(async () => {
+    env = await createEnv();
+    store = await env.open();
+  });
+  teardown(async () => { await env.dispose(); });
+
+  function backend(): NonNullable<AgentSshTestServer['sftp']> {
+    assert.ok(env.server.sftp);
+    return env.server.sftp;
+  }
+
+  /** Даёт in-process SSH-серверу доставить все уже отправленные запросы (без реальных таймеров). */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  function seedDirs(count: number, filesPerDir = 3, prefix = 'd'): string[] {
+    const names: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const name = `${prefix}${String(i).padStart(2, '0')}`;
+      fs.mkdirSync(path.join(env.root, name));
+      for (let f = 0; f < filesPerDir; f += 1) {
+        fs.writeFileSync(path.join(env.root, name, `f${String(f)}.txt`), String(f));
+      }
+      names.push(name);
+    }
+    return names;
+  }
+
+  test('рекурсивный list широкого дерева (40 подкаталогов): все файлы найдены, пик открытых каталогов ≤ 8', async () => {
+    const dirs = seedDirs(40);
+    const entries = await store.list('', { recursive: true });
+    assert.strictEqual(entries.filter((entry) => entry.type === 'file').length, 40 * 3);
+    assert.strictEqual(entries.filter((entry) => entry.type === 'dir').length, dirs.length);
+    assert.ok(backend().maxOpenDirs <= MAX_OPEN_DIRS, `пик ${String(backend().maxOpenDirs)}`);
+    assert.strictEqual(backend().openDirs, 0, 'после обхода открытых каталогов нет');
+  });
+
+  test('16 параллельных list разных каталогов (внешний пул × вложенный): под удержанием READDIR открыто ровно 8, затем все результаты верны', async () => {
+    const dirs = seedDirs(16);
+    const gate = backend().hold('READDIR');
+    const lists = dirs.map((dir) => store.list(dir));
+    await gate.waitForPending(MAX_OPEN_DIRS);
+    await settle();
+    assert.strictEqual(gate.pendingCount(), MAX_OPEN_DIRS, 'девятый листинг не должен открыть каталог, пока не освободился слот');
+    assert.strictEqual(backend().openDirs, MAX_OPEN_DIRS);
+    gate.release();
+    const results = await Promise.all(lists);
+    for (const [index, entries] of results.entries()) {
+      assert.deepStrictEqual(entries.map((entry) => entry.path).sort(), ['f0.txt', 'f1.txt', 'f2.txt'].map((name) => `${dirs[index]}/${name}`));
+    }
+    assert.ok(backend().maxOpenDirs <= MAX_OPEN_DIRS, `пик ${String(backend().maxOpenDirs)}`);
+    assert.strictEqual(backend().openDirs, 0);
+  });
+
+  test('ошибка readdir не «съедает» слот: после 10 отказов подряд следующие list завершаются', async () => {
+    seedDirs(2, 1, 'bad');
+    seedDirs(1, 2, 'ok');
+    backend().failNext({ op: 'OPENDIR', pathIncludes: 'bad', times: 10 });
+    const failing = Array.from({ length: 10 }, () => store.list('bad00'));
+    for (const outcome of await Promise.allSettled(failing)) {
+      assert.strictEqual(outcome.status, 'rejected');
+    }
+    const entries = await store.list('ok00');
+    assert.strictEqual(entries.length, 2);
+  });
+
+  test('remove непустого каталога на нерекурсивном rmdir сервера (использует readdir) по-прежнему работает', async () => {
+    backend().recursiveRmdir = false;
+    seedDirs(3, 2, 'rm');
+    fs.mkdirSync(path.join(env.root, 'rm00', 'nested'));
+    fs.writeFileSync(path.join(env.root, 'rm00', 'nested', 'x.txt'), 'x');
+    await store.remove('rm00', { recursive: true });
+    assert.strictEqual(fs.existsSync(path.join(env.root, 'rm00')), false);
+    assert.strictEqual(fs.existsSync(path.join(env.root, 'rm01')), true);
+  });
+});

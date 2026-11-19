@@ -5,6 +5,8 @@ import * as path from 'path';
 import { META_TYPES, type MetaTypeDef } from '../../domain/MetaTypes';
 import type { DumpChangedObject } from '../../domain/agent/DumpChangesParser';
 import type { AgentFileStore } from '../../infra/agent/files/AgentFileStore';
+import { AgentTransferError } from '../../infra/agent/files/AgentFileTransfer';
+import type { AgentFileEntry } from '../../infra/agent/files/AgentFileStore';
 import { LocalAgentFileStore } from '../../infra/agent/files/LocalAgentFileStore';
 import { buildFolderByEnglishKind, collectOwnerFiles, resolveChangedOwners } from '../../infra/agent/sync/ChangedObjectFiles';
 import { EXAMPLE_GENERATIONS, skipWithoutCorpus } from './support/corpus';
@@ -338,5 +340,30 @@ suite('ChangedObjectFiles: на реальном корпусе example/2.20 (т
     const { owners } = resolveChangedOwners([line('modified', `Document.${dirName}`)]);
     const result = await collectOwnerFiles(new LocalAgentFileStore(root), '', owners);
     assert.deepStrictEqual([...result.files].sort(), expected.sort());
+  });
+});
+
+suite('ChangedObjectFiles: collectOwnerFiles — отказ чтения каталогов (4e)', () => {
+  test('list бросает: AgentTransferError с action = list и именем владельца в failures[0].path', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-changed-owner-list-'));
+    try {
+      const abs = path.join(tempRoot, 'ws', 'Catalogs', 'Товары', 'Ext');
+      fs.mkdirSync(abs, { recursive: true });
+      fs.writeFileSync(path.join(tempRoot, 'ws', 'Catalogs', 'Товары.xml'), 'x');
+      fs.writeFileSync(path.join(abs, 'ObjectModule.bsl'), 'x');
+      class FailingListStore extends LocalAgentFileStore {
+        override list(): Promise<AgentFileEntry[]> { return Promise.reject(new Error('листинг недоступен')); }
+      }
+      const { owners } = resolveChangedOwners([line('modified', 'Catalog.Товары')]);
+      await assert.rejects(
+        collectOwnerFiles(new FailingListStore(tempRoot), 'ws', owners),
+        (error: unknown) => error instanceof AgentTransferError
+          && error.action === 'list'
+          && error.failures[0].path === 'Catalog.Товары'
+          && error.message.startsWith('Не удалось прочитать каталоги агента')
+      );
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });

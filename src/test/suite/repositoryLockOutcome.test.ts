@@ -33,7 +33,7 @@ import type {
   DesignerBatchExecutor,
   DesignerBatchResult,
 } from '../../infra/process/designer/DesignerBatchExecutor';
-import { parseRepositoryLockLog, resolveLockedFullNames } from '../../infra/repository/RepositoryLockLog';
+import { hasReceivedFromRepository, parseRepositoryLockLog, resolveLockedFullNames } from '../../infra/repository/RepositoryLockLog';
 import { RepositoryService, type RepositoryNodeRef } from '../../infra/repository/RepositoryService';
 import {
   disposeRepositoryCommandStatusBar,
@@ -41,6 +41,26 @@ import {
   runRepositoryLockAction,
   type RepositoryCliServices,
 } from '../../ui/commands/repository/RepositoryCommandRunner';
+
+
+const BEGIN = '---- Начало операции с хранилищем конфигурации ----';
+const END = '---- Операция с хранилищем конфигурации завершена ----';
+const DONE = 'Захват объектов в хранилище успешно завершен';
+/** Реальный лог Э14: объект изменён в хранилище — получен и захвачен. */
+const LOG_RECEIVED = [BEGIN, 'Объект получен из хранилища: Справочник.Товары', 'Объект захвачен для редактирования: Справочник.Товары', END, DONE].join('\r\n');
+/** Реальный лог Э14: объект в хранилище не менялся — только захват. */
+const LOG_LOCKED_ONLY = [BEGIN, 'Объект захвачен для редактирования: Справочник.Товары', END, DONE].join('\r\n');
+/** Реальный лог Э14: объект со вложенными частями (макет, форма). */
+const LOG_RECEIVED_PARTS = [
+  BEGIN,
+  'Объект получен из хранилища: Документ.Документ1',
+  'Объект получен из хранилища: Документ.Документ1.Макет.Макет',
+  'Объект получен из хранилища: Документ.Документ1.Форма.ФормаДокумента',
+  'Объект захвачен для редактирования: Документ.Документ1',
+  'Объект захвачен для редактирования: Документ.Документ1.Макет.Макет',
+  'Объект захвачен для редактирования: Документ.Документ1.Форма.ФормаДокумента',
+  END, DONE,
+].join('\r\n');
 
 suite('Н10: parseRepositoryLockLog — разбор лога захвата', () => {
   test('все три формы строк: захвачен, отменён, отсутствует (CRLF, отступы по краям)', () => {
@@ -138,6 +158,9 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   let target: NonNullable<ReturnType<typeof resolveRepositoryTarget>>;
   let origError: unknown;
   let origInfo: unknown;
+  let requests: { args: readonly unknown[] }[];
+  let infos: string[];
+  let errors: string[];
 
   function fakeSecretStore(): SecretStore {
     const map = new Map<string, string>();
@@ -174,7 +197,13 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
     await service.saveBinding(target, { repoPath: 'C:\\repo', repoUser: 'u', repoPassword: 'p' });
 
     result = { exitCode: 0, log: '', outputs: new Map() };
-    const executor: DesignerBatchExecutor = { run: () => Promise.resolve(result), dispose: () => Promise.resolve() };
+    requests = [];
+    infos = [];
+    errors = [];
+    const executor: DesignerBatchExecutor = {
+      run: (request) => { requests.push({ args: request.args }); return Promise.resolve(result); },
+      dispose: () => Promise.resolve(),
+    };
     services = {
       workspaceFolder: { uri: vscode.Uri.file(root), name: 'h10', index: 0 },
       outputChannel: { appendLine: () => undefined } as unknown as vscode.OutputChannel,
@@ -184,8 +213,8 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
     };
     origError = windowRef.showErrorMessage;
     origInfo = windowRef.showInformationMessage;
-    windowRef.showErrorMessage = () => Promise.resolve(undefined);
-    windowRef.showInformationMessage = () => Promise.resolve(undefined);
+    windowRef.showErrorMessage = (message: string) => { errors.push(message); return Promise.resolve(undefined); };
+    windowRef.showInformationMessage = (message: string) => { infos.push(message); return Promise.resolve(undefined); };
   });
 
   teardown(() => {
@@ -196,26 +225,107 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   });
 
   test('exit 0, объект захвачен (строка в логе): отметка стоит', async () => {
-    result = { ...result, log: 'Объект захвачен для редактирования: Справочник.Товары' };
-    assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false), true);
+    result = { ...result, log: LOG_LOCKED_ONLY };
+    assert.deepStrictEqual(
+      await runRepositoryLockAction(services, catalogNode, false, { revised: false }),
+      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false }
+    );
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
   });
 
   test('exit 0, но платформа сообщила «отсутствует в обеих конфигурациях»: операция успешна, отметки нет (учёт не врёт)', async () => {
-    result = { ...result, log: 'Объекты, отсутствующие в обеих конфигурациях: Справочник.Товары' };
-    assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false), true);
+    result = { ...result, log: [BEGIN, 'Объекты, отсутствующие в обеих конфигурациях: Справочник.Товары', END].join('\r\n') };
+    const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: false });
+    assert.deepStrictEqual(outcome, { lockedFullNames: [], receivedFromRepository: false });
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), false);
   });
 
   test('захват КОРНЯ конфигурации с распознанным логом: корень отмечен захваченным (регресс Н10: служебное имя корня не отбрасывается)', async () => {
     result = { ...result, log: 'Объект захвачен для редактирования: Конфигурация.Основная\nЗахват объектов в хранилище успешно завершен' };
     const rootNode: RepositoryNodeRef = { nodeKind: 'configuration', label: 'Конфигурация', xmlPath: path.join(root, 'src', 'cf', 'Configuration.xml') };
-    assert.strictEqual(await runRepositoryLockAction(services, rootNode, false), true);
+    const outcome = await runRepositoryLockAction(services, rootNode, false, { revised: false });
+    assert.deepStrictEqual(outcome?.lockedFullNames, ['__configuration_root__']);
     assert.strictEqual(service.isRootLocked(target), true);
   });
 
-  test('лог не распознан (пустой): прежнее поведение — отметка стоит', async () => {
-    assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false), true);
+  test('лог не распознан (пустой): прежнее поведение — отметка стоит, receivedFromRepository консервативно true', async () => {
+    assert.deepStrictEqual(
+      await runRepositoryLockAction(services, catalogNode, false, { revised: false }),
+      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true }
+    );
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
+  });
+
+  test('revised=true, лог Э14 с «получен»: вектор с -revised после -Objects, receivedFromRepository=true, тост успеха показан', async () => {
+    result = { ...result, log: LOG_RECEIVED };
+    const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: true });
+    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true });
+    const args = requests[0].args;
+    assert.ok(args.includes('/ConfigurationRepositoryLock'));
+    assert.ok(args.includes('-revised'));
+    assert.ok(args.indexOf('-revised') > args.indexOf('-Objects'), 'ключ -revised идёт после -Objects');
+    // Импорт своего тоста не показывает, а захват — самый частый исход без импорта: тост нужен всегда.
+    assert.strictEqual(infos.length, 1);
+    assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
+  });
+
+  test('revised=true, объект в хранилище не менялся: только «захвачен» → receivedFromRepository=false', async () => {
+    result = { ...result, log: LOG_LOCKED_ONLY };
+    const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: true });
+    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false });
+  });
+
+  test('revised=false, но платформа сама получила версию (Э14): receivedFromRepository=true', async () => {
+    result = { ...result, log: LOG_RECEIVED };
+    const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: false });
+    assert.strictEqual(outcome?.receivedFromRepository, true);
+    assert.ok(!requests[0].args.includes('-revised'));
+  });
+
+  test('лог с вложенными частями (макет, форма): «получен» распознан', async () => {
+    result = { ...result, log: LOG_RECEIVED_PARTS };
+    const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: true });
+    assert.strictEqual(outcome?.receivedFromRepository, true);
+  });
+
+  test('revised=false: без -revised, тост успеха показан', async () => {
+    result = { ...result, log: LOG_LOCKED_ONLY };
+    await runRepositoryLockAction(services, catalogNode, false, { revised: false });
+    assert.ok(!requests[0].args.includes('-revised'));
+    assert.strictEqual(infos.length, 1);
+  });
+
+  for (const revised of [true, false]) {
+    test(`exit≠0 (revised=${String(revised)}): undefined, отметка не ставится, ошибка показана`, async () => {
+      result = { exitCode: 1, log: 'Объект захвачен другим пользователем', outputs: new Map() };
+      assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false, { revised }), undefined);
+      assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), false);
+      assert.strictEqual(errors.length, 1);
+    });
+  }
+});
+
+suite('hasReceivedFromRepository — получила ли база новые версии из хранилища', () => {
+  test('лог не распознан (нет маркера начала операции): true — лучше лишний импорт, чем отстающий проект', () => {
+    assert.strictEqual(hasReceivedFromRepository(''), true);
+    assert.strictEqual(hasReceivedFromRepository('неизвестный формат другой версии платформы'), true);
+    assert.strictEqual(hasReceivedFromRepository('Объект захвачен для редактирования: Справочник.Товары'), true);
+  });
+
+  test('реальный лог Э14 с «получен»: true', () => {
+    assert.strictEqual(hasReceivedFromRepository(LOG_RECEIVED), true);
+    assert.strictEqual(hasReceivedFromRepository(LOG_RECEIVED_PARTS), true);
+  });
+
+  test('реальный лог Э14 без «получен» (объект в хранилище не менялся): false', () => {
+    assert.strictEqual(hasReceivedFromRepository(LOG_LOCKED_ONLY), false);
+  });
+
+  test('распознанный лог без строк захвата и получения: false', () => {
+    assert.strictEqual(hasReceivedFromRepository([BEGIN, 'Объекты, отсутствующие в обеих конфигурациях: Справочник.Нет', END].join('\r\n')), false);
+  });
+
+  test('строка «получен» — только как отдельная строка с маркером (LF вместо CRLF тоже)', () => {
+    assert.strictEqual(hasReceivedFromRepository(LOG_RECEIVED.replace(/\r\n/g, '\n')), true);
   });
 });

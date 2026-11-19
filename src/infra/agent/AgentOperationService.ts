@@ -44,13 +44,15 @@ export interface AgentMirrorSeedRequest extends MirrorSeedCandidate {
   readonly localEditsSinceBaseline: number | undefined;
 }
 
-/** Ответ на вопрос перед полной серверной выгрузкой импорта. */
+/** Ответ на вопрос перед полной серверной выгрузкой (импорт или подготовка зеркала для загрузки). */
 export type AgentFullDumpDecision = 'dump' | 'cancel';
 
 export interface AgentFullDumpRequest {
   readonly targetKind: 'cf' | 'cfe';
   readonly targetName: string;
   readonly projectDir: string;
+  /** Импорт или загрузка: вопрос и текст отказа у них разные. */
+  readonly operation: 'import' | 'load';
   readonly reason: ImportArchiveReason;
   /** Текст причины из `ARCHIVE_REASON_POLICY`. */
   readonly reasonText: string;
@@ -142,6 +144,7 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
       idleDisconnectMs: sessionOptions.idleDisconnectMs ?? 0,
       timers: sessionOptions.timers ?? SYSTEM_TIMERS,
       clock: sessionOptions.clock ?? Date.now,
+      ...(sessionOptions.infoBaseLockRetry ? { infoBaseLockRetry: sessionOptions.infoBaseLockRetry } : {}),
     });
   }
 

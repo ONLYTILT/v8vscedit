@@ -1,4 +1,9 @@
 import { getAgentMessageText } from '../../domain/agent';
+import {
+  DEFAULT_INFO_BASE_LOCK_RETRY,
+  decideInfoBaseLockRetry,
+  type InfoBaseLockRetryOptions,
+} from '../../domain/agent/InfoBaseLockRetryPolicy';
 import type { AgentOperationHooks, DesignerAgentInfoBaseSession } from './AgentOperationService';
 import {
   AgentCommandError,
@@ -29,6 +34,8 @@ export interface AgentInfoBaseSessionOptions {
    * (`getLastActivityAt`) — для диагностики «сколько база держится подключённой».
    */
   readonly clock: () => number;
+  /** Повтор `connect-ib`, пока ИБ держит другой Конфигуратор; по умолчанию — DEFAULT_INFO_BASE_LOCK_RETRY. */
+  readonly infoBaseLockRetry?: InfoBaseLockRetryOptions;
 }
 
 /**
@@ -43,6 +50,7 @@ export const SYSTEM_TIMERS: TimerApi = {
 const SESSION_KEY = 'default';
 export const AGENT_CONNECT_IB_COMMAND = 'common connect-ib';
 export const AGENT_DISCONNECT_IB_COMMAND = 'common disconnect-ib';
+const INFO_BASE_LOCK_TEXT = 'ошибка блокировки информационной базы для конфигурирования';
 const DISCONNECT_MESSAGE = 'Отключение информационной базы от агента конфигуратора.';
 
 /**
@@ -144,7 +152,7 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
     let transport: DesignerAgentTransport;
     try {
       transport = await this.transports.create(SESSION_KEY);
-      await this.ensureConnected(transport, commandHooks);
+      await this.ensureConnected(transport, commandHooks, hooks);
     } catch (error) {
       // База не подключена — отключать нечего; канал сбрасываем, чтобы следующая попытка
       // не ушла в возможно мёртвое соединение.
@@ -162,16 +170,49 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
     }
   }
 
-  private async ensureConnected(transport: DesignerAgentTransport, commandHooks: AgentCommandHooks): Promise<void> {
+  private async ensureConnected(
+    transport: DesignerAgentTransport,
+    commandHooks: AgentCommandHooks,
+    hooks: AgentOperationHooks | undefined
+  ): Promise<void> {
     if (this.connectedTransport === transport) {
       return;
     }
     commandHooks.onMessage?.({ type: 'log', message: 'Подключение информационной базы к агенту конфигуратора.' });
-    try {
-      await transport.execute(AGENT_CONNECT_IB_COMMAND, commandHooks);
-    } catch (error) {
-      if (!isInfoBaseAlreadyConnectedError(error)) {
-        throw error;
+    const retry = this.options.infoBaseLockRetry ?? DEFAULT_INFO_BASE_LOCK_RETRY;
+    let failures = 0;
+    let firstFailureAt = 0;
+    // Цикл идёт внутри задачи очереди: параллельные операции ждут его, а не вклиниваются между попытками.
+    for (;;) {
+      try {
+        await transport.execute(AGENT_CONNECT_IB_COMMAND, commandHooks);
+        break;
+      } catch (error) {
+        if (isInfoBaseAlreadyConnectedError(error)) {
+          break;
+        }
+        if (!isInfoBaseLockedByDesignerError(error)) {
+          throw error;
+        }
+        failures += 1;
+        if (failures === 1) {
+          firstFailureAt = this.options.clock();
+        }
+        // Отмена — без ожидания и с исходной ошибкой агента: пользователь сам прервал операцию.
+        if (hooks?.cancellation?.isCancellationRequested === true) {
+          throw error;
+        }
+        const elapsedMs = this.options.clock() - firstFailureAt;
+        const decision = decideInfoBaseLockRetry({ failures, elapsedMs }, retry);
+        if (decision.action === 'fail') {
+          throw new AgentInfoBaseLockedError(error, elapsedMs);
+        }
+        if (failures === 1) {
+          hooks?.onMessage?.(
+            `База занята другим Конфигуратором — повторяю подключение до ${String(Math.round(retry.windowMs / 1000))} с…`
+          );
+        }
+        await new Promise<void>((resolve) => { this.options.timers.setTimeout(resolve, decision.delayMs); });
       }
     }
     this.connectedTransport = transport;
@@ -286,6 +327,35 @@ export function isInfoBaseAlreadyConnectedError(error: unknown): boolean {
     return errorType === 'DesignerAlreadyConnectedToInfoBase';
   }
   return isInfoBaseAlreadyConnectedMessage(describeError(error));
+}
+
+/**
+ * ИБ заблокирована другим Конфигуратором (`DesignerAlreadyStarted`, эксперимент 13). Машинный код
+ * авторитетен; текст — фолбэк только для ответа без `error-type`.
+ */
+export function isInfoBaseLockedByDesignerError(error: unknown): boolean {
+  const errorType = agentErrorType(error);
+  if (errorType !== undefined) {
+    return errorType === 'DesignerAlreadyStarted';
+  }
+  return normalizeAgentErrorMessage(describeError(error)).includes(INFO_BASE_LOCK_TEXT);
+}
+
+/**
+ * Окончательный отказ `connect-ib` по окну повтора. Подкласс AgentCommandError — журнал операции
+ * по-прежнему пишет команду, а `finalMessage` сохраняет ответ агента для диагностики.
+ */
+export class AgentInfoBaseLockedError extends AgentCommandError {
+  constructor(source: unknown, readonly waitedMs: number) {
+    super(
+      'Информационная база занята другим Конфигуратором (интерактивным, пакетной операцией или 1cv8, запущенным ' +
+      `стартером 1cestart.exe): агент не смог подключить её в течение ${String(Math.round(waitedMs / 1000))} с. ` +
+      `Закройте Конфигуратор этой базы на сервере и повторите. Ответ агента: ${describeError(source)}`,
+      AGENT_CONNECT_IB_COMMAND,
+      source instanceof AgentCommandError ? source.finalMessage : undefined
+    );
+    this.name = 'AgentInfoBaseLockedError';
+  }
 }
 
 export function isInfoBaseNotConnectedError(error: unknown): boolean {

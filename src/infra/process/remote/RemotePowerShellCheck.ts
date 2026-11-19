@@ -1,4 +1,5 @@
 import { PowerShellHostError, describeHostError } from './PowerShellRemoteHost';
+import { OnecStarterExecutableError, classifyV8Executable } from '../V8ExecutableGuard';
 
 /**
  * Вторая половина проверки подключения к серверу 1С (первая — SSH/SFTP агента): PowerShell-сессия
@@ -7,7 +8,7 @@ import { PowerShellHostError, describeHostError } from './PowerShellRemoteHost';
  */
 
 export type RemotePsPartId = 'powershell' | 'v8';
-export type RemotePsFailureReason = 'host-start' | 'session' | 'temp-write' | 'v8-not-found' | 'v8-config';
+export type RemotePsFailureReason = 'host-start' | 'session' | 'temp-write' | 'v8-not-found' | 'v8-config' | 'v8-starter';
 
 export interface RemotePsPart {
   readonly id: RemotePsPartId;
@@ -87,15 +88,29 @@ async function checkV8(host: RemotePsCheckHost, target: RemotePsCheckTarget): Pr
     };
   }
   const subject = query.v8Path ? `1cv8 по пути ${query.v8Path}` : `1cv8 платформы версии ${String(query.v8Version)}`;
+  // Стартер в настройке ловится до обращения к хосту: та же проверка, что у исполнителя операций,
+  // поэтому ошибка настройки видна при проверке подключения, а не на первой операции.
+  const configStarter = starterPart(query.v8Path ?? '', 'v8vscedit.remote.v8Path');
+  if (configStarter) {
+    return configStarter;
+  }
   try {
     const found = await host.resolveV8(query);
     if (!found) {
       return { id: 'v8', status: 'failed', reason: 'v8-not-found', message: `На сервере ${server} не найден ${subject}.` };
     }
-    return { id: 'v8', status: 'ok', message: `1cv8 на сервере: ${found}.` };
+    return starterPart(found, `Путь к 1cv8 на сервере ${server}`)
+      ?? { id: 'v8', status: 'ok', message: `1cv8 на сервере: ${found}.` };
   } catch (error) {
     return { id: 'v8', status: 'failed', reason: 'session', message: `Не удалось проверить ${subject} на сервере ${server}: ${describeHostError(error)}` };
   }
+}
+
+function starterPart(filePath: string, source: string): RemotePsPart | undefined {
+  if (classifyV8Executable(filePath) !== 'starter') {
+    return undefined;
+  }
+  return { id: 'v8', status: 'failed', reason: 'v8-starter', message: new OnecStarterExecutableError(filePath, source).message };
 }
 
 function report(parts: RemotePsPart[]): RemotePowerShellReport {

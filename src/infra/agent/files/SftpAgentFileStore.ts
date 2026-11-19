@@ -2,6 +2,7 @@ import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import type { FileEntryWithStats, Stats } from 'ssh2';
 import { writeFully } from '../../fs/FileHandleWrite';
+import { createRequestLimiter } from './RequestLimiter';
 import type { DesignerAgentConnectionOptions } from '../ProcessDesignerAgentTransport';
 import { toAgentPathSegments, type AgentFileEntry, type AgentFileStore, type AgentStreamOptions } from './AgentFileStore';
 import {
@@ -50,8 +51,12 @@ interface ResolvedPath {
   readonly remote: string;
 }
 
-/** Одновременных листингов при рекурсивном обходе. */
-const LIST_CONCURRENCY = 8;
+/**
+ * Общий бюджет одновременно открытых каталогов на одно SFTP-соединение (OPENDIR без CLOSE), он же
+ * ширина пула рекурсивного обхода. Без общего бюджета вложенные пулы (пул владельцев × пул обхода)
+ * открывали бы на сервере десятки дескрипторов каталогов разом.
+ */
+const MAX_OPEN_DIRS = 8;
 // Окончание временных имён: не `.xml`, иначе watcher `src/**/*.xml` принял бы недописанный файл
 // за изменение выгрузки (тот же принцип, что у AtomicFileWriter).
 const TEMP_SUFFIX = '.v8tmp';
@@ -78,6 +83,7 @@ export class SftpAgentFileStore implements AgentFileStore {
   private readonly knownDirs = new Set<string>();
   private readonly creatingDirs = new Map<string, Promise<void>>();
   private readonly writeLocks = new Map<string, Promise<void>>();
+  private readonly dirLimiter = createRequestLimiter(MAX_OPEN_DIRS);
 
   constructor(private readonly connection: SftpConnection, private readonly writeMode: SftpWriteMode = 'auto') {
     this.direct = writeMode === 'direct';
@@ -475,7 +481,7 @@ export class SftpAgentFileStore implements AgentFileStore {
     let level = [rel];
     while (level.length > 0) {
       const next: string[] = [];
-      await forEachLimited(level, LIST_CONCURRENCY, async (dir) => {
+      await forEachLimited(level, MAX_OPEN_DIRS, async (dir) => {
         for (const entry of await this.readdir(dir || '.')) {
           if (entry.attrs.isSymbolicLink()) {
             // Ссылки не перечисляются и не обходятся — как у локального хранилища.
@@ -605,8 +611,11 @@ export class SftpAgentFileStore implements AgentFileStore {
   }
 
   private readdir(remote: string): Promise<FileEntryWithStats[]> {
-    // ssh2 сам проходит OPENDIR/READDIR до EOF/CLOSE и отбрасывает «.» и «..».
-    return this.connection.request<FileEntryWithStats[]>((sftp, done) => sftp.readdir(remote, done));
+    // ssh2 сам проходит OPENDIR/READDIR до EOF/CLOSE и отбрасывает «.» и «..» — слот лимитера
+    // покрывает весь срок жизни дескриптора каталога. Взаимной блокировки нет: слот держится на один
+    // readdir, рекурсия обхода берёт слоты заново.
+    return this.dirLimiter(() =>
+      this.connection.request<FileEntryWithStats[]>((sftp, done) => sftp.readdir(remote, done)));
   }
 
   private unlink(remote: string): Promise<void> {

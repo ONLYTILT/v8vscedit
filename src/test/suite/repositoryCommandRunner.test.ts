@@ -410,13 +410,13 @@ suite('RepositoryCommandRunner', () => {
   suite('действия над узлом', () => {
     test('requireTarget: узел без xmlPath', async () => {
       await assert.rejects(
-        () => runRepositoryLockAction(services, { nodeKind: 'Catalog', label: 'X' }, false),
+        () => runRepositoryLockAction(services, { nodeKind: 'Catalog', label: 'X' }, false, { revised: false }),
         /Не удалось определить конфигурацию/
       );
     });
 
     test('захват ставит отметку, освобождение снимает', async () => {
-      assert.strictEqual(await runRepositoryLockAction(services, catalogNode, false), true);
+      assert.notStrictEqual(await runRepositoryLockAction(services, catalogNode, false, { revised: false }), undefined);
       assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
       assert.ok(requests[0].args.includes('/ConfigurationRepositoryLock'));
 
@@ -446,7 +446,7 @@ suite('RepositoryCommandRunner', () => {
     test('метка у узла отсутствует — в заголовках имя цели (получение, захват, освобождение, помещение)', async () => {
       const node: RepositoryNodeRef = { nodeKind: 'Catalog', xmlPath: catalogNode.xmlPath };
       await runRepositoryUpdateAction(services, node, { recursive: false, force: false });
-      await runRepositoryLockAction(services, node, false);
+      await runRepositoryLockAction(services, node, false, { revised: false });
       await runRepositoryUnlockAction(services, node, false, false);
       await runRepositoryCommitAction(services, node, { recursive: false, comment: '', keepLocked: false, force: false });
       assert.strictEqual(infos.length, 4);
@@ -458,7 +458,7 @@ suite('RepositoryCommandRunner', () => {
     test('ошибки лока без метки: заголовок ошибки несёт имя цели', async () => {
       const node: RepositoryNodeRef = { nodeKind: 'Catalog', xmlPath: catalogNode.xmlPath };
       behavior = () => ok({ exitCode: 1 });
-      await runRepositoryLockAction(services, node, false);
+      await runRepositoryLockAction(services, node, false, { revised: false });
       await runRepositoryUnlockAction(services, node, false, false);
       await runRepositoryCommitAction(services, node, { recursive: false, comment: '', keepLocked: false, force: false });
       assert.strictEqual(errors.length, 3);

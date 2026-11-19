@@ -2,7 +2,8 @@ import * as fs from 'fs';
 import { buildDumpConfigToFilesCommand } from '../../../domain/agent/AgentCommand';
 import { parseDumpChanges, type DumpChangeSet } from '../../../domain/agent/DumpChangesParser';
 import { downloadFiles, statFiles, type AgentTransferOptions } from '../files/AgentFileTransfer';
-import { confirmFullDumpOrThrow, importByArchive } from './ArchiveImport';
+import { importByArchive } from './ArchiveImport';
+import { confirmFullDumpOrThrow, type FullDumpConsentContext } from './FullDumpConsent';
 import { collectOwnerFiles, resolveChangedOwners, type ChangedOwner } from './ChangedObjectFiles';
 import { isProjectDumpReplaced } from './ProjectDumpInfo';
 import {
@@ -125,7 +126,10 @@ async function importRemote(context: SyncOperationContext): Promise<AgentImportR
   const mirrorState = await effectiveMirrorState(context);
   if (mirrorState !== 'empty') {
     // Ручная замена выгрузки проекта (новый файл версий): та же развилка посева, что у пустого M.
-    if (await isProjectDumpReplaced(context.target.rootPath, context.manifest.projectDumpInfo)) {
+    // Без хука посева seedFromProject всё равно вернул бы `skipped` — sha1 файла версий (десятки МБ)
+    // не считается зря.
+    if (context.hooks?.confirmMirrorSeed !== undefined
+      && await isProjectDumpReplaced(context.target.rootPath, context.manifest.projectDumpInfo)) {
       const seed = await seedFromProject(context, 'project-replaced');
       if (seed.kind === 'seeded') {
         return importSeeded(context, seed.base);
@@ -142,16 +146,16 @@ async function importRemote(context: SyncOperationContext): Promise<AgentImportR
   // случая, когда пользователь уже выбрал «Полная выгрузка» в вопросе о посеве. Недостоверный M
   // очищается заранее: его остаток не должен пережить операцию, даже если до посева дело не дойдёт.
   if (seed.kind !== 'full') {
-    await confirmFullDumpOrThrow(context, 'mirror-empty');
+    await confirmFullDumpOrThrow(context, 'mirror-empty', 'import');
   }
   context.markMirrorMutated();
   await context.store.remove(context.workspace.targetAgentDir, { recursive: true });
-  return importByArchive(context, 'mirror-empty', { confirmed: true });
+  return importByArchive(context, 'mirror-empty', 'confirmed');
 }
 
 /** Импорт после посева из выгрузки проекта: D = ∅ относительно hash(P), затем поиск сирот. */
 async function importSeeded(context: SyncOperationContext, base: Record<string, string>): Promise<AgentImportResult> {
-  const { result, changedOwners } = await importChanges(context, 'fresh', base);
+  const { result, changedOwners } = await importChanges(context, 'fresh', base, { afterSeed: true });
   // Архив сам удаляет из P всё, чего нет в базе: сирот после него не бывает.
   const orphans = result.strategy === 'archive' ? undefined : await handleOrphans(context, changedOwners);
   return { ...withOrphans(result, orphans), seededFrom: 'project' };
@@ -172,15 +176,18 @@ function withOrphans(result: AgentImportResult, orphans: OrphanFilesOutcome | un
 async function importChanges(
   context: SyncOperationContext,
   mirrorState: SyncMirrorState,
-  assumedBase: Readonly<Record<string, string>> | undefined
+  assumedBase: Readonly<Record<string, string>> | undefined,
+  options: { readonly afterSeed?: boolean } = {}
 ): Promise<ChangesOutcome> {
   const mirror = context.workspace.targetAgentDir;
+  // После посева отказ от выгрузки означает другое: зеркало уже подготовлено, ручная выгрузка не нужна.
+  const consent: FullDumpConsentContext = options.afterSeed === true ? 'import-after-seed' : 'import';
   const changeSet = await fetchChangeSet(context);
   // `--get-changes` вместе с `--update` только пишет список (пилот §5b п.4): M обновляется вторым
   // шагом. FullDump/нераспознанный список уходят в архив ДО него — иначе вторая полная выгрузка.
   const before = planBeforeUpdate({ mirrorState, changeSet });
   if (before.action === 'archive') {
-    return { result: await importByArchive(context, before.reason), changedOwners: new Set() };
+    return { result: await importByArchive(context, before.reason, consent), changedOwners: new Set() };
   }
   if (before.action === 'update') {
     context.markMirrorMutated();
@@ -225,7 +232,7 @@ async function importChanges(
     archiveThresholdFiles: context.archiveThresholdFiles,
   });
   if (plan.action === 'archive') {
-    return { result: await importByArchive(context, plan.reason), changedOwners };
+    return { result: await importByArchive(context, plan.reason, consent), changedOwners };
   }
   const deletable = new Set(plan.deletableIfAbsent);
   const restore = plan.restoreFromDatabase;
@@ -238,7 +245,7 @@ async function importChanges(
     // Текст агента бывает многострочным: сообщение журнала — одна строка.
     const reason = restored.reason.replace(/\s+/g, ' ').trim();
     context.hooks?.onMessage?.(`Точечная выгрузка не удалась (${reason}): импорт пойдёт полной выгрузкой.`);
-    return { result: await importByArchive(context, 'sparse-mirror-dirty'), changedOwners };
+    return { result: await importByArchive(context, 'sparse-mirror-dirty', consent), changedOwners };
   }
   const source = { dir: restored.sourceDir, files: new Set(restore) };
   const result = await importByDelta(context, plan.files, inMirror, deletable, source);
@@ -299,15 +306,16 @@ async function importByDelta(
   files: readonly string[],
   knownInMirror: ReadonlySet<string>,
   deletableIfAbsent: ReadonlySet<string>,
-  restore: RestoreSource = { dir: '', files: new Set() }
+  restore?: RestoreSource
 ): Promise<AgentImportResult> {
   const { store } = context;
   const prefix = `${context.workspace.targetAgentDir}/`;
-  const toStat = files.filter((rel) => !knownInMirror.has(rel) && !restore.files.has(rel));
+  const fromRestore = (rel: string): boolean => restore?.files.has(rel) === true;
+  const toStat = files.filter((rel) => !knownInMirror.has(rel) && !fromRestore(rel));
   const stats = await statFiles(store, toStat.map((rel) => prefix + rel), transferOptions(context));
   throwIfCancelled(context);
   const present = files.filter((rel) =>
-    restore.files.has(rel) || knownInMirror.has(rel) || stats.get(prefix + rel)?.type === 'file');
+    fromRestore(rel) || knownInMirror.has(rel) || stats.get(prefix + rel)?.type === 'file');
   const presentSet = new Set(present);
   const lost = files.filter((rel) => !presentSet.has(rel) && !deletableIfAbsent.has(rel));
   // План отдаёт неудаляемыми только файлы, проверенные STAT по M (правки неизменённых владельцев
@@ -319,13 +327,22 @@ async function importByDelta(
   }
 
   const projectDir = context.target.rootPath;
-  // Источник файла — каталог точечной выгрузки или M; путь в проекте восстанавливается по префиксу.
-  const restorePrefix = `${restore.dir}/`;
-  const sources = present.map((rel) => (restore.files.has(rel) ? restorePrefix : prefix) + rel);
+  // Источник файла — каталог точечной выгрузки или M. Путь в проекте берётся из карты, а не разбором
+  // префикса: префиксы двух каталогов могут вкладываться друг в друга.
+  const relBySource = new Map(present.map((rel) => [
+    restore?.files.has(rel) === true ? `${restore.dir}/${rel}` : prefix + rel,
+    rel,
+  ]));
   const staged = new Map<string, string>();
   let stagingCount = 0;
-  await downloadFiles(store, sources, async (source, data) => {
-    const rel = source.startsWith(restorePrefix) ? source.slice(restorePrefix.length) : source.slice(prefix.length);
+  await downloadFiles(store, [...relBySource.keys()], async (source, data) => {
+    const rel = relBySource.get(source);
+    /* c8 ignore start -- downloadFiles отдаёт в приёмник ровно запрошенные пути; ветка страхует от смены
+       контракта хранилища, из тестов (настоящее хранилище и эмулятор агента) недостижима. */
+    if (rel === undefined) {
+      throw new Error(`Неожиданный файл агента в дельте импорта: ${source}`);
+    }
+    /* c8 ignore stop */
     if (hasSameProjectContent(projectDir, rel, data)) {
       return;
     }

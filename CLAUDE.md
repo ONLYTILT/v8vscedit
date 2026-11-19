@@ -173,7 +173,7 @@ src/
 │   │                                  # .v8vscedit/cache), HashStatMemo (stat-мемо .v8vscedit/hash-stat),
 │   │                                  # HashScanner (scanHashSnapshot — быстрый async-проход;
 │   │                                  # docs/architecture.md, «Хеш-кэш: базовая линия и stat-мемо»)
-│   ├── repository/                   # хранилище 1С, локальные захваты
+│   ├── repository/                   # хранилище 1С, локальные захваты; RepositoryLockLog — разбор лога захвата
 │   ├── git/                          # статус Git для узлов метаданных (GitMetadataStatusService,
 │   │                                  # декорации) + представление «Изменения метаданных»
 │   │                                  # (GitPorcelainReader, MetadataChangeResolver,
@@ -600,7 +600,7 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   освобождение ИБ делает сам раннер, а допустимость в remote-режиме решает
   `decideLocalDesignerInRemote` (`ui/commands/ext/agent/remoteLocalDesigner.ts`: файловая база и петлевой
   сервер — отказ до побочных эффектов). Перевод такой операции на удалённый исполнитель — отдельная
-  задача по схеме хранилища, а не «правка раннера».
+  задача по схеме хранилища, а не «правка раннера». Путь к 1cv8 проходит единую проверку стартера (`infra/process/V8ExecutableGuard.ts`: локально `resolveV8ExecutablePath`, на сервере `assertServerDesignerExecutable` в `designerExecutorRegistry`) — третьей точки резолвинга не заводить; захват объектов хранилища — `ui/commands/repository/` (`repositoryLockFlow.ts`, `RepositoryLockCommand.ts`, `repositoryPostSync.ts`, `repositoryNodeTargets.ts`; см. architecture.md).
 - **Открытие BSL-модулей:** только реальные `file://` документы (виртуальная схема `onec://` удалена). Readonly — через `ui/readonly/BslReadonlyGuard.ts`.
 - **Изменение жизненного цикла/безопасности встроенного MCP-сервера** (порт, идентичность процесса,
   graceful shutdown, Host/Origin, отличается от «новый MCP-инструмент» из раздела выше): чистая логика —

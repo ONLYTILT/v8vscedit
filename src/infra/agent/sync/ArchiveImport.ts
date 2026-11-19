@@ -11,8 +11,8 @@ import {
   hasSameProjectContent,
   listProjectFiles,
 } from './ProjectFiles';
+import { confirmFullDumpOrThrow, type FullDumpConsentContext } from './FullDumpConsent';
 import {
-  AgentFullDumpDeclinedError,
   EXCHANGE_ARCHIVE,
   exchangeDirOf,
   throwIfCancelled,
@@ -36,30 +36,13 @@ import { ARCHIVE_REASON_POLICY, type ImportArchiveReason } from './SyncPlanner';
 export async function importByArchive(
   context: SyncOperationContext,
   reason: ImportArchiveReason,
-  options: { readonly confirmed?: boolean } = {}
+  // 'confirmed' — согласие уже получено вызывающим (первый импорт); иначе — контекст вопроса.
+  consent: FullDumpConsentContext | 'confirmed'
 ): Promise<AgentImportResult> {
-  if (options.confirmed !== true) {
-    await confirmFullDumpOrThrow(context, reason);
+  if (consent !== 'confirmed') {
+    await confirmFullDumpOrThrow(context, reason, consent);
   }
   return withTransferCancellation(() => importArchive(context, reason));
-}
-
-/** Вопрос перед полной серверной выгрузкой; нет хука — согласие (прежнее поведение), отказ — исключение. */
-export async function confirmFullDumpOrThrow(context: SyncOperationContext, reason: ImportArchiveReason): Promise<void> {
-  const confirm = context.hooks?.confirmFullDump;
-  if (confirm === undefined) {
-    return;
-  }
-  const decision = await confirm({
-    targetKind: context.target.kind,
-    targetName: context.extensionName ?? context.target.name,
-    projectDir: context.target.rootPath,
-    reason,
-    reasonText: ARCHIVE_REASON_POLICY[reason].text,
-  });
-  if (decision === 'cancel') {
-    throw new AgentFullDumpDeclinedError();
-  }
 }
 
 async function importArchive(context: SyncOperationContext, reason: ImportArchiveReason): Promise<AgentImportResult> {
