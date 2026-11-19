@@ -95,29 +95,40 @@ export function ownerOfProjectFile(rel: string): ProjectFileOwner | undefined {
 }
 
 export function resolveChangedOwners(changes: readonly DumpChangedObject[]): ChangedOwnersResult {
+  return resolveOwners(changes.map((change) => ({ kind: change.kind, name: change.name, source: change.fullName })));
+}
+
+/**
+ * То же по полным именам владельцев `<EnglishKind>.<Name>` (результат сравнения файлов версий): одна
+ * таблица «вид → папка» с переводом строк `--get-changes`, второго словаря нет. Нераспознанное имя
+ * возвращается в `unresolved` как есть.
+ */
+export function resolveOwnerNames(fullNames: readonly string[]): ChangedOwnersResult {
+  return resolveOwners(fullNames.map((fullName) => {
+    const dot = fullName.indexOf('.');
+    return { kind: fullName.slice(0, dot), name: fullName.slice(dot + 1), source: fullName };
+  }));
+}
+
+/** `source` — строка входа, которая уходит в `unresolved`, если вид не переводится в папку. */
+function resolveOwners(items: readonly { readonly kind: string; readonly name: string; readonly source: string }[]): ChangedOwnersResult {
   const owners = new Map<string, ChangedOwner>();
   const unresolved: string[] = [];
-  for (const change of changes) {
-    const fullName = `${change.kind}.${change.name}`;
+  for (const { kind, name, source } of items) {
+    const fullName = `${kind}.${name}`;
     if (owners.has(fullName)) {
       continue;
     }
-    if (change.kind === CONFIGURATION_KIND) {
-      owners.set(fullName, { fullName, kind: change.kind, name: change.name, xmlRel: CONFIGURATION_XML, dirRel: CONFIGURATION_DIR });
+    if (kind === CONFIGURATION_KIND) {
+      owners.set(fullName, { fullName, kind, name, xmlRel: CONFIGURATION_XML, dirRel: CONFIGURATION_DIR });
       continue;
     }
-    const folder = FOLDER_BY_ENGLISH_KIND.get(change.kind);
+    const folder = FOLDER_BY_ENGLISH_KIND.get(kind);
     if (folder === undefined) {
-      unresolved.push(change.fullName);
+      unresolved.push(source);
       continue;
     }
-    owners.set(fullName, {
-      fullName,
-      kind: change.kind,
-      name: change.name,
-      xmlRel: `${folder}/${change.name}.xml`,
-      dirRel: `${folder}/${change.name}`,
-    });
+    owners.set(fullName, { fullName, kind, name, xmlRel: `${folder}/${name}.xml`, dirRel: `${folder}/${name}` });
   }
   return { owners: [...owners.values()], unresolved };
 }

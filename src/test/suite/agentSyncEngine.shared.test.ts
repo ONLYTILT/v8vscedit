@@ -7,6 +7,7 @@ import { AgentSyncCancelledError } from '../../infra/agent/sync/AgentSyncEngine'
 import { buildSyncManifestFiles } from '../../infra/agent/sync/SyncManifest';
 import { createHash } from 'crypto';
 import { dbAsText, createHarness, type HarnessKind, type SyncHarness } from './support/agentSyncHarness';
+import { dumpKindOf } from './support/fullDumpAvoidFixtures';
 
 /**
  * Э7: AgentSyncEngine — E2E на эмуляторе агента. Один и тот же набор сценариев идёт поверх ДВУХ
@@ -206,7 +207,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         assert.strictEqual(result.strategy, kind === 'sftp' ? 'delta' : 'compare');
       });
 
-      test('удаление объекта в базе: файлы удалены из P, опустевшие каталоги убраны; sftp — FullDump → архив', async () => {
+      test('удаление объекта в базе: файлы удалены из P, опустевшие каталоги убраны; sftp — FullDump → очистка зеркала по свежему CDI (дельта, без архива)', async () => {
         await start();
         await doImport();
         h.emulator.removeObject('Document.Заказ');
@@ -214,20 +215,20 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
         const result = await doImport();
 
-        expectPMatchesDb(h, true);
+        // sftp: дельта не пишет CDI в P (он прежний); local: P получает весь M вместе с CDI
+        expectPMatchesDb(h, kind === 'local');
         assert.strictEqual(h.existsP('Documents'), false, 'каталог Documents опустел и убран');
         assert.ok(relativeSorted(h, result.changedProjectFiles).includes('Documents/Заказ/Forms/Форма.xml'));
         assert.deepStrictEqual(h.manifest().files, await buildSyncManifestFiles(h.configRoot));
         if (kind === 'sftp') {
-          assert.strictEqual(result.strategy, 'archive');
-          assert.strictEqual(result.reason, 'full-dump');
+          assert.strictEqual(result.strategy, 'delta');
+          assert.deepStrictEqual(result.fullDump, { handling: 'pruned', removedOwners: ['Document.Заказ'], replacedOwners: [] });
           const dumps = h.emulator.dumps().slice(dumpsBefore);
-          // Изменено планом «полная выгрузка — только когда без неё нельзя»: FullDump уходит в архив БЕЗ
-          // предшествующей полной перезаписи M командой --update (раньше было три команды, две полные выгрузки).
-          assert.strictEqual(dumps.length, 2, 'список и архив: --update без --get-changes не выполняется');
-          assert.ok(dumps[0].options['get-changes'] && dumps[0].options.update === true);
-          assert.strictEqual(dumps[1].options.archive, 'full.zip');
-          assert.ok(!dumps[1].options.update);
+          // FullDump больше не уходит в архив: список, свежий CDI (только файл версий), повторный список;
+          // --update пропускается (после очистки зеркало уже совпадает с базой), перезаписи M нет.
+          assert.deepStrictEqual(dumps.map(dumpKindOf), ['get-changes', 'info-only', 'get-changes-retry']);
+          assert.ok(!dumps.some((d) => d.options.archive === 'full.zip'), 'полной выгрузки нет');
+          assert.strictEqual(h.emulator.fullRewriteUpdates, 0);
           assert.strictEqual(h.manifest().mirrorState, 'fresh');
         }
         assert.deepStrictEqual(exchangeLeftovers(h), []);
@@ -349,15 +350,16 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
         h.emulator.removeObject('Configuration.Конфигурация');
         let hookCalls = 0;
 
-        await assert.rejects(doImport({ onProjectFilesWillChange: () => { hookCalls += 1; } }), /Configuration\.xml/);
+        await assert.rejects(doImport({ onProjectFilesWillChange: () => { hookCalls += 1; } }), /Агент не выгрузил конфигурацию/);
 
         assert.deepStrictEqual(h.snapshotP(), before);
         assert.strictEqual(hookCalls, 0);
         assert.deepStrictEqual(h.manifest().files, manifestBefore);
         if (kind === 'sftp') {
-          // Изменено: FullDump → архив без предшествующей мутации M; сбой проверки архива (нет Configuration.xml)
-          // происходит ДО посева, M не тронут — манифест прежний (fresh), а не empty.
-          assert.strictEqual(h.manifest().mirrorState, 'fresh', 'M не тронут: проверка архива до посева');
+          // Изменено: FullDump больше не уходит в архив. Свежий CDI без корня не проходит стража → запасной путь
+          // `--update --force` (M переписан и без корня), а «Агент не выгрузил конфигурацию» — уже ПОСЛЕ мутации M:
+          // манифест empty, P не тронут (agentSyncEngine.fullDumpAvoid.test.ts, сценарий 20).
+          assert.strictEqual(h.manifest().mirrorState, 'empty', 'M переписан запасным путём: следующий импорт полный');
         }
         assert.deepStrictEqual(exchangeLeftovers(h), []);
       });

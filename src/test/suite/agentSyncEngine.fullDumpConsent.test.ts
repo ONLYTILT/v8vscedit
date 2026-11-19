@@ -3,12 +3,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { AgentFileStore } from '../../infra/agent/files/AgentFileStore';
 import { AgentFullDumpDeclinedError, AgentSyncCancelledError } from '../../infra/agent/sync/SyncContext';
-import { ARCHIVE_REASON_POLICY } from '../../infra/agent/sync/SyncPlanner';
+import { ARCHIVE_REASON_POLICY, SERVER_DUMP_POLICY } from '../../infra/agent/sync/SyncPlanner';
 import { buildSyncManifestFiles } from '../../infra/agent/sync/SyncManifest';
 import { createHarness, dbAsText, HARNESS_EXTENSION_NAME, type HarnessTargetKind, type SyncHarness } from './support/agentSyncHarness';
 import { DelegatingAgentFileStore } from './support/delegatingAgentFileStore';
 import { importHookSpy } from './support/archiveAvoidFixtures';
 import { hasOption } from './support/agentConfigEmulator';
+import { removeRootPart, seedRootPart } from './support/fullDumpAvoidFixtures';
 
 // Реальный модуль fs: namespace-импорт TypeScript — копия с геттерами, подмена свойства на ней не видна production-коду.
 const realFs = require('fs') as typeof fs;
@@ -72,6 +73,7 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
           operation: 'load',
           reason: 'mirror-empty',
           reasonText: ARCHIVE_REASON_POLICY['mirror-empty'].text,
+          download: true,
         }]);
         const dumps = h.emulator.dumps().slice(dumpsBefore);
         assert.strictEqual(dumps.length, 1, 'одна полная выгрузка в M');
@@ -124,10 +126,23 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
     suite(`4c: текст отказа по контексту, цель ${kind}`, () => {
       const IMPORT_TEXT = /Выгрузите конфигурацию в файлы вручную \(иерархический формат\) и замените/;
 
+      // Вопрос о полной выгрузке: cf — запасной путь «перезапись зеркала» (часть корня очистить нельзя, причина
+      // mirror-rewrite); cfe — прежний архив full-dump при удалении объекта. Удаление объекта у cf вопроса не задаёт.
+      const seedTrigger = (): void => { if (kind === 'cf') { seedRootPart(h.emulator); } };
+      const fireTrigger = (): void => {
+        if (kind === 'cf') {
+          removeRootPart(h.emulator);
+        } else {
+          h.emulator.removeObject('Document.Заказ');
+        }
+      };
+      const triggerReasonText = (): string => (kind === 'cf' ? SERVER_DUMP_POLICY['mirror-rewrite'].text : ARCHIVE_REASON_POLICY['full-dump'].text);
+
       test("импорт без посева, отказ после FullDump: consent=import, текст прежний дословно", async () => {
         await start(kind);
+        seedTrigger();
         await h.importTarget();
-        h.emulator.removeObject('Document.Заказ');
+        fireTrigger();
 
         await assert.rejects(h.importTarget(importHookSpy({ fullDump: 'cancel' }).hooks), (error: unknown) => {
           assert.ok(error instanceof AgentFullDumpDeclinedError);
@@ -142,8 +157,9 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
 
       test("импорт: хук получает operation=import", async () => {
         await start(kind);
+        seedTrigger();
         await h.importTarget();
-        h.emulator.removeObject('Document.Заказ');
+        fireTrigger();
         const spy = importHookSpy({ fullDump: 'dump' });
 
         await h.importTarget(spy.hooks);
@@ -153,15 +169,16 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
 
       test("посев из проекта (mirror-empty), затем FullDump и отказ: consent=import-after-seed, текст про подготовленное зеркало", async () => {
         await start(kind);
+        seedTrigger();
         h.emulator.snapshotToProject(h.configRoot);
-        h.emulator.removeObject('Document.Заказ');
+        fireTrigger();
         const spy = importHookSpy({ seed: 'seed', fullDump: 'cancel' });
 
         await assert.rejects(h.importTarget(spy.hooks), (error: unknown) => {
           assert.ok(error instanceof AgentFullDumpDeclinedError);
           assert.strictEqual(error.consent, 'import-after-seed');
           assert.match(error.message, /Зеркало агента уже подготовлено/);
-          assert.ok(error.message.includes(ARCHIVE_REASON_POLICY['full-dump'].text), error.message);
+          assert.ok(error.message.includes(triggerReasonText()), error.message);
           assert.doesNotMatch(error.message, IMPORT_TEXT, 'прежний текст импорта не используется');
           assert.match(error.message, /проект не изменён/);
           return true;
@@ -172,6 +189,7 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
 
       test("посев после ручной замены выгрузки проекта (project-replaced), затем FullDump и отказ: consent=import-after-seed", async () => {
         await start(kind);
+        seedTrigger();
         await h.importTarget();
         h.emulator.putFile('Catalogs/Товары.xml', '<Catalog>Товары v2</Catalog>');
         h.emulator.snapshotToProject(h.configRoot);
@@ -179,7 +197,7 @@ suite('AgentSyncEngine: согласие на полную выгрузку — 
         // без сдвига mtime новый CDI той же длины в ту же секунду неотличим от прежнего.
         const replacedAt = new Date('2031-01-02T03:04:05Z');
         fs.utimesSync(path.join(h.configRoot, 'ConfigDumpInfo.xml'), replacedAt, replacedAt);
-        h.emulator.removeObject('Document.Заказ');
+        fireTrigger();
         const spy = importHookSpy({ seed: 'seed', fullDump: 'cancel' });
 
         await assert.rejects(

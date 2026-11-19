@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { readConfigDumpInfoHeader } from '../../infra/xml/dumpInfo/ConfigDumpInfoHeader';
+import { parseConfigDumpInfoHeader, readConfigDumpInfoHeader } from '../../infra/xml/dumpInfo/ConfigDumpInfoHeader';
 import { EXAMPLE_GENERATIONS, skipWithoutCorpus } from './support/corpus';
 import { AgentConfigEmulator } from './support/agentConfigEmulator';
 
@@ -88,5 +88,48 @@ suite('readConfigDumpInfoHeader', () => {
         version: '2.20',
       });
     });
+  });
+});
+
+/**
+ * `parseConfigDumpInfoHeader(prefix)` (plan-fulldump-avoid.md, Т2): тот же разбор заголовка, но по тексту —
+ * им проверяется свежий CDI из архива (страж «версия и формат совпадают с зеркалом»).
+ */
+suite('parseConfigDumpInfoHeader', () => {
+  const HEADER_TEXT = '<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" format="Hierarchical" version="2.21">';
+
+  test('текст с BOM и без: format и version', () => {
+    assert.deepStrictEqual(parseConfigDumpInfoHeader(`${HEADER_TEXT}\n</ConfigDumpInfo>`), { format: 'Hierarchical', version: '2.21' });
+    assert.deepStrictEqual(parseConfigDumpInfoHeader(`\uFEFF<?xml version="1.0"?>\r\n${HEADER_TEXT}`), { format: 'Hierarchical', version: '2.21' });
+  });
+
+  test('порядок атрибутов и посторонние атрибуты не важны', () => {
+    assert.deepStrictEqual(
+      parseConfigDumpInfoHeader('<ConfigDumpInfo version="2.20" extra="1" format="Plain" xmlns="x">'),
+      { format: 'Plain', version: '2.20' }
+    );
+  });
+
+  test('нет корня, нет format или нет version, пустой текст → undefined', () => {
+    assert.strictEqual(parseConfigDumpInfoHeader(''), undefined);
+    assert.strictEqual(parseConfigDumpInfoHeader('<Other format="Hierarchical" version="2.20">'), undefined);
+    assert.strictEqual(parseConfigDumpInfoHeader('<ConfigDumpInfo version="2.20">'), undefined);
+    assert.strictEqual(parseConfigDumpInfoHeader('<ConfigDumpInfo format="Hierarchical">'), undefined);
+  });
+
+  test('равенство с чтением файла: на файле версий эмулятора и на файле с BOM результат один', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'v8-cdi-header-text-'));
+    try {
+      const emulator = new AgentConfigEmulator(tmp);
+      emulator.setObject('Catalog.А', { 'Catalogs/А.xml': '<c/>' });
+      emulator.formatVersion = '2.21';
+      const file = path.join(tmp, 'ConfigDumpInfo.xml');
+      fs.writeFileSync(file, emulator.dbFiles()['ConfigDumpInfo.xml']);
+      const text = fs.readFileSync(file).subarray(0, 8 * 1024).toString('utf-8');
+      assert.deepStrictEqual(parseConfigDumpInfoHeader(text), readConfigDumpInfoHeader(file));
+      assert.deepStrictEqual(parseConfigDumpInfoHeader(text), { format: 'Hierarchical', version: '2.21' });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

@@ -13,7 +13,7 @@ import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
 import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type { MirrorSeedCandidate } from './sync/MirrorSeed';
-import type { ImportArchiveReason } from './sync/SyncPlanner';
+import type { ServerDumpReason } from './sync/SyncPlanner';
 import type {
   DesignerAgentTransportFactory,
   ResettableDesignerAgentTransportFactory,
@@ -53,9 +53,14 @@ export interface AgentFullDumpRequest {
   readonly projectDir: string;
   /** Импорт или загрузка: вопрос и текст отказа у них разные. */
   readonly operation: 'import' | 'load';
-  readonly reason: ImportArchiveReason;
-  /** Текст причины из `ARCHIVE_REASON_POLICY`. */
+  readonly reason: ServerDumpReason;
+  /** Текст причины из `SERVER_DUMP_POLICY`. */
   readonly reasonText: string;
+  /**
+   * Скачивается ли выгрузка целиком (архив). `false` — перезапись зеркала на сервере: выгрузка долгая,
+   * но скачиваются только изменённые файлы, и ручная выгрузка проекта не нужна.
+   */
+  readonly download: boolean;
 }
 
 /** Файлы выгрузки проекта, владельцев которых нет в базе (после посева из выгрузки проекта). */

@@ -143,11 +143,14 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
   });
 
   suite('импорт: сбои и самовосстановление', () => {
-    test('повреждённый архив при FullDump: ArchiveFormatError, P не тронут, хук не вызван, M НЕ тронут (манифест fresh); следующий импорт снова идёт архивом full-dump и чинит', async () => {
+    // Изменено планом «FullDump без полной выгрузки»: удаление объекта у цели cf больше не требует архива,
+    // поэтому архивную ветку с испорченным zip запускает нераспознанный список изменений (unrecognized).
+    test('повреждённый архив (unrecognized): ArchiveFormatError, P не тронут, хук не вызван, M НЕ тронут (манифест fresh); следующий импорт проходит и чинит', async () => {
       await start();
       await doImport();
       const before = h.snapshotP();
-      h.emulator.removeObject('Document.Заказ');
+      h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>Клиенты v2</Catalog>');
+      h.emulator.nextChangesText = `${BOM}Deleted: Catalog.Клиенты\r\n`;
       h.emulator.nextArchiveTamper = (zip) => zip.subarray(0, zip.length - 40);
       let hookCalls = 0;
 
@@ -162,10 +165,12 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
       assert.deepStrictEqual(fs.existsSync(path.join(h.userRoot, 'exchange')) ? fs.readdirSync(path.join(h.userRoot, 'exchange')) : [], []);
 
+      // M не тронут, список теперь честный (nextChangesText одноразовый): правка Клиентов приходит дельтой
       const healed = await doImport();
-      assert.strictEqual(healed.strategy, 'archive');
-      assert.strictEqual(healed.reason, 'full-dump');
-      assert.deepStrictEqual(h.snapshotP(), dbAsText(h.emulator.dbFiles()));
+      assert.strictEqual(healed.strategy, 'delta');
+      const healedP = h.snapshotP();
+      delete healedP['ConfigDumpInfo.xml'];
+      assert.deepStrictEqual(healedP, dbAsText(h.emulator.dbTrackedFiles()));
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
 
@@ -285,7 +290,8 @@ suite('AgentSyncEngine (Э7): sftp-ветка', function () {
       await start();
       await doImport();
       const before = h.snapshotP();
-      h.emulator.removeObject('Document.Заказ');
+      h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>Клиенты v2</Catalog>');
+      h.emulator.nextChangesText = `${BOM}Deleted: Catalog.Клиенты\r\n`;
       h.emulator.nextArchiveTamper = (zip) => {
         const copy = Buffer.from(zip);
         const end = copy.length - 22;

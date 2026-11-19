@@ -384,17 +384,18 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
       assert.strictEqual(mirrorCoverageOf(h.manifest()), 'full');
     });
 
-    test('после посева в БД удалён объект → FullDump → архив; файлы удалённого объекта убраны из P; полнота остаётся sparse', async () => {
+    // Изменено планом «FullDump без полной выгрузки»: удаление объекта чистит зеркало по свежему CDI (дельта), архива нет.
+    test('после посева в БД удалён объект → FullDump → очистка зеркала (дельта); файлы удалённого объекта убраны из P; полнота остаётся sparse', async () => {
       await start();
       await h.importTarget();
       h.emulator.removeObject('Document.Заказ');
 
       const result = await h.importTarget();
 
-      assert.strictEqual(result.strategy, 'archive');
-      assert.strictEqual(result.reason, 'full-dump');
+      assert.strictEqual(result.strategy, 'delta');
+      assert.deepStrictEqual(result.fullDump, { handling: 'pruned', removedOwners: ['Document.Заказ'], replacedOwners: [] });
       assert.strictEqual(h.existsP('Documents'), false);
-      expectPMatchesDb(h, true);
+      expectPMatchesDb(h, false);
       assert.strictEqual(h.manifest().mirrorCoverage, 'sparse');
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
@@ -647,25 +648,27 @@ suite('AgentSyncEngine: потоковый архив и посев зеркал
       assert.strictEqual(h.manifest().mirrorCoverage, 'sparse');
     });
 
-    test('обрыв скачивания архива (отказ READ по full.zip): P не тронут, M не тронут (манифест fresh), оба каталога обмена убраны; повтор успешен', async () => {
+    test('обрыв скачивания архива (unrecognized, отказ READ по full.zip): P не тронут, M не тронут (манифест fresh), оба каталога обмена убраны; повтор успешен', async () => {
       await start();
       await h.importTarget();
-      h.emulator.removeObject('Document.Заказ');
+      // Архив нужен нераспознанному списку: удаление объекта (cf) больше не требует полной выгрузки
+      h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>Клиенты v2</Catalog>');
+      h.emulator.nextChangesText = `${BOM}Deleted: Catalog.Клиенты\r\n`;
       const before = h.snapshotP();
       h.sftp?.failNext({ op: 'READ', pathIncludes: 'full.zip', times: 1, code: 'FAILURE' });
 
       await assert.rejects(h.importTarget(), /full\.zip/);
 
       assert.deepStrictEqual(h.snapshotP(), before);
-      // Изменено: FullDump → архив без предшествующей мутации M; обрыв скачивания — до посева, M цел.
+      // Архив до посева: обрыв скачивания, M цел.
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
       assert.deepStrictEqual(h.serverExchangeLeftovers(), []);
       assert.deepStrictEqual(h.localExchangeLeftovers(), []);
 
+      // Список теперь честный (подмена одноразовая): правка Клиентов приходит дельтой
       const retry = await h.importTarget();
-      assert.strictEqual(retry.strategy, 'archive');
-      assert.strictEqual(retry.reason, 'full-dump');
-      expectPMatchesDb(h, true);
+      assert.strictEqual(retry.strategy, 'delta');
+      expectPMatchesDb(h, false);
       assert.strictEqual(h.manifest().mirrorState, 'fresh');
     });
 

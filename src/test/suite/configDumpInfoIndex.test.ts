@@ -5,7 +5,7 @@ import * as path from 'path';
 import { META_TYPES } from '../../domain/MetaTypes';
 import { ownerOfProjectFile } from '../../infra/agent/sync/ChangedObjectFiles';
 import { findOrphanProjectFiles } from '../../infra/agent/sync/ProjectSeed';
-import { parseConfigDumpInfoIndex, readConfigDumpInfoIndex } from '../../infra/xml/dumpInfo/ConfigDumpInfoIndex';
+import { dumpInfoOwnerOf, parseConfigDumpInfoIndex, readConfigDumpInfoIndex } from '../../infra/xml/dumpInfo/ConfigDumpInfoIndex';
 import { EXAMPLE_GENERATIONS, skipWithoutCorpus } from './support/corpus';
 
 /**
@@ -328,4 +328,63 @@ suite('ConfigDumpInfoIndex: на реальном корпусе example/ (то�
       });
     });
   }
+});
+
+/**
+ * `fileLevelVersions` и `dumpInfoOwnerOf` (plan-fulldump-avoid.md, Т2): сравнение свежего CDI с CDI зеркала
+ * идёт по версиям файловых записей, а владельца записи даёт ОДНА функция — первые два сегмента имени.
+ */
+suite('ConfigDumpInfoIndex: fileLevelVersions', () => {
+  test('имя файловой записи → configVersion, в порядке файла; встроенные записи (без configVersion) не входят', () => {
+    const index = parseConfigDumpInfoIndex(wrap(DOCUMENT));
+    assert.deepStrictEqual([...index.fileLevelVersions], [
+      ['Document.Д', 'v1'],
+      ['Document.Д.ObjectModule', 'v2'],
+      ['Document.Д.ManagerModule', 'v3'],
+      ['Document.Д.Command.К.CommandModule', 'v4'],
+      ['Document.Д.Form.Ф', 'v5'],
+      ['Document.Д.Form.Ф.Form', 'v6'],
+      ['Document.Д.Template.М', 'v7'],
+      ['Document.Д.Template.М.Template', 'v8'],
+    ]);
+  });
+
+  test('значение — строка как в файле (хеш платформы не приводится к числу)', () => {
+    const index = parseConfigDumpInfoIndex(wrap('<Metadata name="Catalog.А" id="1" configVersion="ef17bfe954778b44b47aa6f01350b83000000000"/>'));
+    assert.strictEqual(index.fileLevelVersions.get('Catalog.А'), 'ef17bfe954778b44b47aa6f01350b83000000000');
+  });
+
+  test('порядок атрибутов не важен', () => {
+    const index = parseConfigDumpInfoIndex(wrap('<Metadata configVersion="7" id="1" name="Catalog.А.ObjectModule"/>'));
+    assert.strictEqual(index.fileLevelVersions.get('Catalog.А.ObjectModule'), '7');
+  });
+
+  test('файл без записей → пустая карта; согласована с fileLevelNamesOf на корпусе-образце', () => {
+    assert.strictEqual(parseConfigDumpInfoIndex(wrap('')).fileLevelVersions.size, 0);
+    const index = parseConfigDumpInfoIndex(wrap(DOCUMENT));
+    assert.deepStrictEqual([...index.fileLevelVersions.keys()], [...index.fileLevelNamesOf('Document.Д')]);
+  });
+});
+
+suite('ConfigDumpInfoIndex: dumpInfoOwnerOf', () => {
+  const cases: [string, string][] = [
+    ['Catalog.А', 'Catalog.А'],
+    ['Document.Д.ObjectModule', 'Document.Д'],
+    ['Document.Д.Form.Ф.Form', 'Document.Д'],
+    ['Subsystem.A.Subsystem.B', 'Subsystem.A'],
+    ['Configuration.Конфигурация.HomePageWorkArea', 'Configuration.Конфигурация'],
+    ['Foo', 'Foo'],
+  ];
+  for (const [name, owner] of cases) {
+    test(`${name} → ${owner}`, () => {
+      assert.strictEqual(dumpInfoOwnerOf(name), owner);
+    });
+  }
+
+  test('согласована с разбором: владелец каждой файловой записи индекса — её ключ в fileLevelNamesOf', () => {
+    const index = parseConfigDumpInfoIndex(wrap(DOCUMENT));
+    for (const name of index.fileLevelVersions.keys()) {
+      assert.ok(index.fileLevelNamesOf(dumpInfoOwnerOf(name)).includes(name), name);
+    }
+  });
 });

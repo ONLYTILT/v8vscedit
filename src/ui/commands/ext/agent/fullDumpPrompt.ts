@@ -4,6 +4,7 @@ import type { AgentFullDumpDecision, AgentFullDumpRequest } from '../../../../in
 const DUMP_ACTION = 'Полная выгрузка на сервере';
 const MANUAL_ACTION = 'Выгружу вручную';
 const LOAD_DUMP_ACTION = 'Выгрузить на сервере';
+const REWRITE_ACTION = 'Перезаписать зеркало на сервере';
 const CANCEL_ACTION = 'Отмена';
 
 /**
@@ -14,6 +15,9 @@ const CANCEL_ACTION = 'Отмена';
 export async function promptFullDump(request: AgentFullDumpRequest): Promise<AgentFullDumpDecision> {
   if (request.operation === 'load') {
     return promptLoadMirrorDump(request);
+  }
+  if (!request.download) {
+    return promptMirrorRewrite(request);
   }
   const answer = await vscode.window.showWarningMessage(
     `Импорт «${request.targetName}» требует полной выгрузки конфигурации на сервере: ${request.reasonText}.`,
@@ -29,6 +33,23 @@ export async function promptFullDump(request: AgentFullDumpRequest): Promise<Age
     MANUAL_ACTION
   );
   return answer === DUMP_ACTION ? 'dump' : 'cancel';
+}
+
+/**
+ * Перезапись зеркала на сервере (запасной путь импорта при `FullDump`): архива нет, поэтому и ручная
+ * выгрузка проекта не предлагается — она не дешевле. Цена — долгая выгрузка на сервере.
+ */
+async function promptMirrorRewrite(request: AgentFullDumpRequest): Promise<AgentFullDumpDecision> {
+  const answer = await vscode.window.showWarningMessage(
+    `Импорт «${request.targetName}» требует перезаписать зеркало агента на сервере: ${request.reasonText}.`,
+    {
+      modal: true,
+      detail: 'Скачиваются только изменённые файлы, но выгрузка конфигурации на сервере для большой конфигурации долгая — десятки минут.',
+    },
+    REWRITE_ACTION,
+    CANCEL_ACTION
+  );
+  return answer === REWRITE_ACTION ? 'dump' : 'cancel';
 }
 
 /** На загрузке скачивания нет и ручная выгрузка проекта не помогает: нужна только подготовка зеркала. */

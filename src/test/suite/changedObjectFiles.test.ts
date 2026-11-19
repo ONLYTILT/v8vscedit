@@ -8,7 +8,7 @@ import type { AgentFileStore } from '../../infra/agent/files/AgentFileStore';
 import { AgentTransferError } from '../../infra/agent/files/AgentFileTransfer';
 import type { AgentFileEntry } from '../../infra/agent/files/AgentFileStore';
 import { LocalAgentFileStore } from '../../infra/agent/files/LocalAgentFileStore';
-import { buildFolderByEnglishKind, collectOwnerFiles, resolveChangedOwners } from '../../infra/agent/sync/ChangedObjectFiles';
+import { buildFolderByEnglishKind, collectOwnerFiles, resolveChangedOwners, resolveOwnerNames } from '../../infra/agent/sync/ChangedObjectFiles';
 import { EXAMPLE_GENERATIONS, skipWithoutCorpus } from './support/corpus';
 
 /**
@@ -365,5 +365,46 @@ suite('ChangedObjectFiles: collectOwnerFiles — отказ чтения кат�
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * `resolveOwnerNames(fullNames)` (plan-fulldump-avoid.md): перевод ПОЛНЫХ ИМЁН владельцев `<EnglishKind>.<Name>`
+ * (результат сравнения файлов версий) в файлы выгрузки — та же таблица «вид → папка» из META_TYPES, что у
+ * `resolveChangedOwners`, без второго словаря. Нераспознанные имена возвращаются как есть в `unresolved`.
+ */
+suite('ChangedObjectFiles: resolveOwnerNames', () => {
+  test('обычные владельцы: XML и поддерево, порядок входа сохранён', () => {
+    const { owners, unresolved } = resolveOwnerNames(['Document.Заказ', 'Catalog.Клиенты']);
+
+    assert.deepStrictEqual(unresolved, []);
+    assert.deepStrictEqual(owners, [
+      { fullName: 'Document.Заказ', kind: 'Document', name: 'Заказ', xmlRel: 'Documents/Заказ.xml', dirRel: 'Documents/Заказ' },
+      { fullName: 'Catalog.Клиенты', kind: 'Catalog', name: 'Клиенты', xmlRel: 'Catalogs/Клиенты.xml', dirRel: 'Catalogs/Клиенты' },
+    ]);
+  });
+
+  test('совпадает с resolveChangedOwners на тех же владельцах (одна таблица вид → папка)', () => {
+    const names = ['Catalog.А', 'Role.Б', 'Subsystem.В', 'CommonModule.Г', 'Configuration.Конфигурация'];
+
+    assert.deepStrictEqual(resolveOwnerNames(names), resolveChangedOwners(names.map((name) => line('modified', name))));
+  });
+
+  test('корень конфигурации: Configuration.xml и поддерево Ext', () => {
+    assert.deepStrictEqual(resolveOwnerNames(['Configuration.Конфигурация']).owners, [
+      { fullName: 'Configuration.Конфигурация', kind: 'Configuration', name: 'Конфигурация', xmlRel: 'Configuration.xml', dirRel: 'Ext' },
+    ]);
+  });
+
+  test('неизвестный вид — в unresolved строкой входа, остальные владельцы переведены', () => {
+    const { owners, unresolved } = resolveOwnerNames(['Foo.Bar', 'Catalog.А', 'Baz.Qux']);
+
+    assert.deepStrictEqual(unresolved, ['Foo.Bar', 'Baz.Qux']);
+    assert.deepStrictEqual(owners.map((owner) => owner.fullName), ['Catalog.А']);
+  });
+
+  test('повторы схлопываются; пустой вход — пустой результат', () => {
+    assert.deepStrictEqual(resolveOwnerNames(['Catalog.А', 'Catalog.А']).owners.length, 1);
+    assert.deepStrictEqual(resolveOwnerNames([]), { owners: [], unresolved: [] });
   });
 });

@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { parseConfigDumpInfoHeader, type ConfigDumpInfoHeader } from './ConfigDumpInfoHeader';
 
 /**
  * Индекс файла версий выгрузки (`ConfigDumpInfo.xml`): какие объекты описаны и какие из них агент
@@ -18,31 +19,49 @@ export interface ConfigDumpInfoIndex {
   readonly rootNames: ReadonlySet<string>;
   /** `Configuration.<Имя>` — корень конфигурации/расширения; нет — undefined. */
   readonly configurationOwner: string | undefined;
+  /** Формат и версия формата из корня; нет корня с обоими атрибутами — undefined. */
+  readonly header: ConfigDumpInfoHeader | undefined;
+  /**
+   * Имя файловой записи (с `configVersion`) → версия как строка файла, в порядке файла. По ней свежий файл
+   * версий базы сравнивается с файлом версий зеркала: пропавшая запись — удалённый объект или его часть.
+   */
+  readonly fileLevelVersions: ReadonlyMap<string, string>;
   /** Сам владелец + его подобъекты с `configVersion` (файловые), в порядке файла; неизвестный — []. */
   fileLevelNamesOf(ownerFullName: string): readonly string[];
 }
 
 const METADATA_TAG = /<Metadata\b[^>]*>/g;
 const NAME_ATTRIBUTE = /\sname="([^"]*)"/;
-const CONFIG_VERSION_ATTRIBUTE = /\sconfigVersion="/;
-const CONFIGURATION_PREFIX = 'Configuration.';
+const CONFIG_VERSION_ATTRIBUTE = /\sconfigVersion="([^"]*)"/;
+/** Префикс имени корня конфигурации/расширения в файле версий — общий для разбора, сравнения и правки. */
+export const CONFIGURATION_PREFIX = 'Configuration.';
 const ROOT_TAG = '<ConfigDumpInfo';
+
+/**
+ * Владелец записи файла версий — первые два сегмента имени. Одна функция для разбора, сравнения и
+ * редактирования: правило «вложенная подсистема принадлежит верхней» не должно расходиться между ними.
+ */
+export function dumpInfoOwnerOf(name: string): string {
+  return name.split('.').slice(0, 2).join('.');
+}
 
 export function parseConfigDumpInfoIndex(text: string): ConfigDumpInfoIndex {
   const rootNames = new Set<string>();
   const fileLevel = new Map<string, string[]>();
+  const fileLevelVersions = new Map<string, string>();
   for (const match of text.matchAll(METADATA_TAG)) {
     const tag = match[0];
     const name = NAME_ATTRIBUTE.exec(tag)?.[1];
     if (name === undefined) {
       continue;
     }
-    const segments = name.split('.');
-    const owner = segments.slice(0, 2).join('.');
-    if (segments.length === 2) {
+    const owner = dumpInfoOwnerOf(name);
+    if (name.split('.').length === 2) {
       rootNames.add(name);
     }
-    if (CONFIG_VERSION_ATTRIBUTE.test(tag)) {
+    const version = CONFIG_VERSION_ATTRIBUTE.exec(tag)?.[1];
+    if (version !== undefined) {
+      fileLevelVersions.set(name, version);
       const names = fileLevel.get(owner);
       if (names === undefined) {
         fileLevel.set(owner, [name]);
@@ -55,6 +74,8 @@ export function parseConfigDumpInfoIndex(text: string): ConfigDumpInfoIndex {
   return {
     rootNames,
     configurationOwner,
+    header: parseConfigDumpInfoHeader(text),
+    fileLevelVersions,
     fileLevelNamesOf: (ownerFullName) => fileLevel.get(ownerFullName) ?? [],
   };
 }

@@ -40,9 +40,20 @@ function importInput(overrides: Partial<ImportPlanInput> = {}): ImportPlanInput 
     dirtyAddedFiles: [],
     dirtyAbsentFromMirror: [],
     archiveThresholdFiles: 300,
+    // План «FullDump без полной выгрузки»: прежние ожидания `full-dump → архив` снимаются при выключенной очистке
+    // (так ведёт себя цель cfe), остальные входы по умолчанию нейтральны.
+    fullDumpAvoidance: false,
+    fullDumpStage: 'initial',
+    removedOwnerFiles: [],
+    replacedOwnerFiles: [],
+    updateKind: 'incremental',
+    rewriteOwnersWithRemovedParts: [],
     ...overrides,
   };
 }
+
+/** Фаза 1 без очистки по свежему CDI: FullDump уходит в архив, как до плана. */
+const NO_AVOIDANCE = { fullDumpAvoidance: false, fullDumpStage: 'initial' } as const;
 
 suite('SyncPlanner.planImport (Э7)', () => {
   suite('локальное хранилище: полное сравнение M и P', () => {
@@ -669,37 +680,37 @@ suite('SyncPlanner.planImport: полнота зеркала M (mirrorCoverage)'
 suite('SyncPlanner.planBeforeUpdate (фаза 1 импорта)', () => {
   test('M empty → архив mirror-empty при любом changeSet (в т.ч. без него)', () => {
     for (const changeSet of [undefined, { kind: 'fullDump' } as const, objects('Catalog.А'), { kind: 'objects', objects: [] } as const]) {
-      assert.deepStrictEqual(planBeforeUpdate({ mirrorState: 'empty', changeSet }), { action: 'archive', reason: 'mirror-empty' });
+      assert.deepStrictEqual(planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState: 'empty', changeSet }), { action: 'archive', reason: 'mirror-empty' });
     }
   });
 
   for (const mirrorState of ['fresh', 'stale'] as const) {
     suite(`M ${mirrorState}`, () => {
       test('fullDump → архив full-dump (до --update)', () => {
-        assert.deepStrictEqual(planBeforeUpdate({ mirrorState, changeSet: { kind: 'fullDump' } }), { action: 'archive', reason: 'full-dump' });
+        assert.deepStrictEqual(planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState, changeSet: { kind: 'fullDump' } }), { action: 'archive', reason: 'full-dump' });
       });
 
       test('unrecognized → архив unrecognized (до --update)', () => {
         assert.deepStrictEqual(
-          planBeforeUpdate({ mirrorState, changeSet: { kind: 'unrecognized', reason: 'x' } }),
+          planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState, changeSet: { kind: 'unrecognized', reason: 'x' } }),
           { action: 'archive', reason: 'unrecognized' }
         );
       });
 
       test('пустой список объектов → skip-update (M и так совпадает с базой)', () => {
-        assert.deepStrictEqual(planBeforeUpdate({ mirrorState, changeSet: { kind: 'objects', objects: [] } }), { action: 'skip-update', objects: [] });
+        assert.deepStrictEqual(planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState, changeSet: { kind: 'objects', objects: [] } }), { action: 'skip-update', objects: [] });
       });
 
       test('непустой список объектов → update', () => {
         // Объекты списка — в решении плана: движок берёт их оттуда, а не сужает список повторно.
         for (const changeSet of [objects('Catalog.А'), objects('Catalog.А', 'Document.Б.Form.В')]) {
           assert.ok(changeSet.kind === 'objects');
-          assert.deepStrictEqual(planBeforeUpdate({ mirrorState, changeSet }), { action: 'update', objects: changeSet.objects });
+          assert.deepStrictEqual(planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState, changeSet }), { action: 'update', objects: changeSet.objects });
         }
       });
 
       test('нет changeSet при непустом M — нарушение контракта: исключение, а не молчаливый update', () => {
-        assert.throws(() => planBeforeUpdate({ mirrorState }), /changeSet|список изменений/i);
+        assert.throws(() => planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState }), /changeSet|список изменений/i);
       });
     });
   }
@@ -710,7 +721,7 @@ suite('SyncPlanner.planBeforeUpdate (фаза 1 импорта)', () => {
       [{ kind: 'unrecognized', reason: 'x' }, 'unrecognized'],
     ];
     for (const [changeSet, reason] of cases) {
-      const before = planBeforeUpdate({ mirrorState: 'fresh', changeSet });
+      const before = planBeforeUpdate({ ...NO_AVOIDANCE, mirrorState: 'fresh', changeSet });
       assert.deepStrictEqual(before, { action: 'archive', reason });
       assert.deepStrictEqual(planRemoteImport(importInput({ changeSet, changedFiles: [] })), { action: 'archive', reason });
     }
@@ -722,7 +733,7 @@ suite('SyncPlanner.planBeforeUpdate (фаза 1 импорта)', () => {
  * таблицы (CLAUDE.md, «Инвариант изменений»).
  */
 suite('ARCHIVE_REASON_POLICY (политика причин полной выгрузки)', () => {
-  const ALL: ImportArchiveReason[] = ['mirror-empty', 'full-dump', 'unrecognized', 'unresolved-objects', 'over-threshold', 'sparse-mirror-dirty'];
+  const ALL: ImportArchiveReason[] = ['mirror-empty', 'full-dump', 'unrecognized', 'unresolved-objects', 'over-threshold', 'sparse-mirror-dirty', 'sparse-removed-parts'];
   const BEFORE: ImportArchiveReason[] = ['mirror-empty', 'full-dump', 'unrecognized'];
 
   test('полнота ключей: ровно все ImportArchiveReason', () => {
@@ -747,13 +758,13 @@ suite('ARCHIVE_REASON_POLICY (политика причин полной выг�
   });
 
   test('тексты причин (журнал и вопрос пользователю) закреплены', () => {
-    assert.deepStrictEqual(Object.fromEntries(ALL.map((reason) => [reason, ARCHIVE_REASON_POLICY[reason].text])), {
+    assert.deepStrictEqual(Object.fromEntries(ALL.filter((reason) => reason !== 'sparse-removed-parts').map((reason) => [reason, ARCHIVE_REASON_POLICY[reason].text])), {
       'mirror-empty': 'зеркало агента пусто',
       'full-dump': 'в базе удалены или переименованы объекты (агент сообщил FullDump)',
       'unrecognized': 'список изменений агента не распознан',
       'unresolved-objects': 'изменённые объекты не удалось сопоставить файлам выгрузки',
       'over-threshold': 'изменено больше файлов, чем порог v8vscedit.agent.archiveThresholdFiles',
       'sparse-mirror-dirty': 'локально изменённые файлы не удалось восстановить из базы точечно',
-    });
+    }, 'тексты прежних причин не меняются; текст sparse-removed-parts задаётся отдельно (syncPlannerFullDump.test.ts)');
   });
 });

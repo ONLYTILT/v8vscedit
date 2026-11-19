@@ -29,6 +29,14 @@ export function readConfigDumpInfoHeader(filePath: string): ConfigDumpInfoHeader
   } catch {
     return undefined;
   }
+  return parseConfigDumpInfoHeader(prefix);
+}
+
+/**
+ * Тот же разбор по тексту: им проверяется свежий файл версий из архива агента (страж «формат и версия
+ * совпадают с зеркалом»), который уже прочитан в память и второй раз с диска не читается.
+ */
+export function parseConfigDumpInfoHeader(prefix: string): ConfigDumpInfoHeader | undefined {
   const root = /<ConfigDumpInfo\b([^>]*)>/.exec(prefix)?.[1];
   if (root === undefined) {
     return undefined;

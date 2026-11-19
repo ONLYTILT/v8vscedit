@@ -1,22 +1,23 @@
 import { AgentFullDumpDeclinedError, type FullDumpConsentContext, type SyncOperationContext } from './SyncContext';
-import { ARCHIVE_REASON_POLICY, type ImportArchiveReason } from './SyncPlanner';
+import { SERVER_DUMP_POLICY, type ServerDumpReason } from './SyncPlanner';
 
 export type { FullDumpConsentContext } from './SyncContext';
 
 /**
- * Вопрос перед полной серверной выгрузкой — общий для импорта и загрузки. Нет хука — согласие
+ * Вопрос перед полной серверной выгрузкой — общий для импорта и загрузки: архив или перезапись зеркала
+ * (`download: false` — скачиваются только изменённые файлы, текст вопроса другой). Нет хука — согласие
  * (прежнее поведение без человека), отказ — исключение с текстом по контексту вопроса.
  */
 export async function confirmFullDumpOrThrow(
   context: SyncOperationContext,
-  reason: ImportArchiveReason,
+  reason: ServerDumpReason,
   consent: FullDumpConsentContext
 ): Promise<void> {
   const confirm = context.hooks?.confirmFullDump;
   if (confirm === undefined) {
     return;
   }
-  const reasonText = ARCHIVE_REASON_POLICY[reason].text;
+  const { text: reasonText, download } = SERVER_DUMP_POLICY[reason];
   const decision = await confirm({
     targetKind: context.target.kind,
     targetName: context.extensionName ?? context.target.name,
@@ -24,6 +25,7 @@ export async function confirmFullDumpOrThrow(
     operation: consent === 'load' ? 'load' : 'import',
     reason,
     reasonText,
+    download,
   });
   if (decision === 'cancel') {
     throw new AgentFullDumpDeclinedError(consent, reasonText);

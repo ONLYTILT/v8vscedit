@@ -18,6 +18,7 @@ import {
   type HarnessTargetKind,
   type SyncHarness,
 } from './support/agentSyncHarness';
+import { removeRootPart, seedRootPart } from './support/fullDumpAvoidFixtures';
 import {
   ConcurrencyProbeStore,
   RICH_DOCUMENT_FILES,
@@ -119,7 +120,9 @@ suite('AgentSyncEngine: полная выгрузка только по необ
         },
       ];
 
-      for (const { reason, prepare } of scenarios) {
+      // Для цели cf удаление объекта больше не даёт полной выгрузки: зеркало чистится по свежему CDI
+      // (agentSyncEngine.fullDumpAvoid.test.ts). Архив full-dump остаётся прежним путём цели cfe.
+      for (const { reason, prepare } of scenarios.filter((scenario) => scenario.reason !== 'full-dump' || kind === 'cfe')) {
         test(`${reason} без хука: ровно ОДНА полная выгрузка (--archive), --update без --get-changes в операции нет; M засеян из архива (sparse), P ≡ БД`, async () => {
           await start(kind);
           await firstImport();
@@ -177,6 +180,7 @@ suite('AgentSyncEngine: полная выгрузка только по необ
             operation: 'import',
             reason,
             reasonText: ARCHIVE_REASON_POLICY[reason].text,
+            download: true,
           }]);
           assert.deepStrictEqual(h.serverExchangeLeftovers(), []);
           assert.deepStrictEqual(h.localExchangeLeftovers(), []);
@@ -201,8 +205,16 @@ suite('AgentSyncEngine: полная выгрузка только по необ
 
       test('текст ошибки отказа — инструкция ручной выгрузки: «выгрузите вручную», замена каталога, ConfigDumpInfo.xml, следующий импорт', async () => {
         await start(kind);
+        if (kind === 'cf') {
+          // cf: вопрос задаёт запасной путь (mirror-rewrite) — часть корня очистить нельзя; текст отказа тот же
+          seedRootPart(h.emulator);
+        }
         await firstImport();
-        h.emulator.removeObject('Document.Заказ');
+        if (kind === 'cf') {
+          removeRootPart(h.emulator);
+        } else {
+          h.emulator.removeObject('Document.Заказ');
+        }
 
         await assert.rejects(h.importTarget(importHookSpy({ fullDump: 'cancel' }).hooks), (error: unknown) => {
           assert.ok(error instanceof AgentFullDumpDeclinedError);
@@ -684,7 +696,9 @@ suite('AgentSyncEngine: полная выгрузка только по необ
           assert.deepStrictEqual(h.manifest().projectDumpInfo, fingerprintOfProject());
           const first = h.manifest().projectDumpInfo;
 
-          h.emulator.removeObject('Document.Заказ');
+          // Архив нужен, чтобы CDI проекта был переписан: удаление объекта (cf) идёт дельтой, CDI проекта не пишет
+          h.emulator.putFile('Catalogs/Клиенты.xml', '<Catalog>Клиенты v2</Catalog>');
+          h.emulator.nextChangesText = `${BOM}Deleted: Catalog.Клиенты\r\n`;
           await h.importTarget();
 
           assert.deepStrictEqual(h.manifest().projectDumpInfo, fingerprintOfProject());

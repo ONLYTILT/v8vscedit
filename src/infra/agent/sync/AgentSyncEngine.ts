@@ -9,7 +9,7 @@ import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
 import { createLocalExchange, pruneStaleLocalExchanges } from './LocalExchange';
 import { fingerprintProjectDumpInfo } from './ProjectDumpInfo';
-import { EXCHANGE_RESTORE_LIST_SUFFIX, throwIfCancelled, type SyncOperationContext } from './SyncContext';
+import { EXCHANGE_SIDE_SUFFIXES, throwIfCancelled, type SyncOperationContext } from './SyncContext';
 import {
   buildSyncManifestFiles,
   loadSyncManifest,
@@ -203,7 +203,7 @@ export class AgentSyncEngine {
   private async removeExchange(context: SyncOperationContext): Promise<void> {
     await context.localExchange.dispose();
     const base = `${context.workspace.exchangeRoot}/${context.operationId}`;
-    for (const rel of [base, `${base}.changes`, `${base}${EXCHANGE_RESTORE_LIST_SUFFIX}`]) {
+    for (const rel of [base, ...EXCHANGE_SIDE_SUFFIXES.map((suffix) => `${base}${suffix}`)]) {
       try {
         await context.store.remove(rel, { recursive: true });
       } catch {

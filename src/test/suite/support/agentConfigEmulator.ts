@@ -28,6 +28,7 @@
  * `load --archive` разрешает имя архива относительно `--dir`, как и выгрузка (подтверждено пилотом
  * 2026-11-17, §5b п.15). Эмулятор принимает именно эту форму.
  */
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { META_TYPES } from '../../../domain/MetaTypes';
@@ -100,6 +101,14 @@ interface EmulatedObject {
  */
 export type EmulatorUpdateGranularity = 'owner' | 'changed-files';
 
+/**
+ * Что делает `dump --update` (без `--get-changes`), когда в известном файле версий каталога есть записи, которых
+ * в базе больше нет (удалён владелец или его файловый подобъект — форма, макет, модуль): `rewrite-all` —
+ * сервер переписывает выгрузку целиком (поведение платформы, из-за которого и вводится очистка CDI зеркала);
+ * `changed-and-removals` — выгружаются изменившиеся файлы и убираются файлы пропавших записей.
+ */
+export type EmulatorFullDumpUpdate = 'rewrite-all' | 'changed-and-removals';
+
 export interface EmulatedLoad {
   readonly mode: 'dir' | 'partial' | 'archive';
   /** Файлы, которые агент взял из каталога/списка/архива (относительные пути). */
@@ -123,6 +132,12 @@ export class AgentConfigEmulator {
   /** Искажает байты архива, который агент собирается отдать (однократно). */
   nextArchiveTamper: ((zip: Buffer) => Buffer) | undefined;
   updateGranularity: EmulatorUpdateGranularity = 'owner';
+  /** Режим `--update` при пропавших записях известного CDI (см. {@link EmulatorFullDumpUpdate}). */
+  fullDumpUpdate: EmulatorFullDumpUpdate = 'changed-and-removals';
+  /** Сколько `dump --update` застали в известном CDI записи, которых уже нет в базе (в обоих режимах). */
+  fullRewriteUpdates = 0;
+  /** Сколько раз агент выгружал только файл версий (`--config-dump-info-only`), с архивом и без. */
+  infoOnlyDumps = 0;
   /** Версия формата в заголовке ConfigDumpInfo.xml и `MetaDataObject version` Configuration.xml. */
   formatVersion = '2.20';
   /** Если возвращает Error — команда падает с ним. */
@@ -190,6 +205,23 @@ export class AgentConfigEmulator {
     object.version = this.versionCounter;
     object.parts = parts;
     this.objects.set(owner, object);
+  }
+
+  /**
+   * Удаляет файлы у владельца (форма, макет, модуль, часть корня) и повышает версию владельца: в базе пропадают
+   * файловые записи CDI. Список изменений после этого — `FullDump`: платформа не умеет описать удаление частью списка.
+   */
+  removeFiles(rels: readonly string[]): void {
+    for (const rel of rels) {
+      const owner = ownerOfPath(rel);
+      const object = owner === undefined ? undefined : this.objects.get(owner);
+      if (!object?.files.delete(rel)) {
+        throw new Error(`эмулятор: нет файла ${rel}`);
+      }
+      object.fileVersions.delete(rel);
+      this.versionCounter += 1;
+      object.version = this.versionCounter;
+    }
   }
 
   removeObject(fullName: string): void {
@@ -321,6 +353,9 @@ export class AgentConfigEmulator {
     const getChanges = this.option(cmd, 'get-changes');
     const update = cmd.options.update === true;
     const infoOnly = cmd.options['config-dump-info-only'] === true;
+    if (infoOnly) {
+      this.infoOnlyDumps += 1;
+    }
 
     const listFile = this.option(cmd, 'list-file');
     if (listFile !== undefined) {
@@ -367,16 +402,30 @@ export class AgentConfigEmulator {
       return;
     }
 
-    const known = update ? this.readConfigDumpInfo(dirAbs) : undefined;
-    if (!known) {
+    const knownRecords = update ? this.readConfigDumpInfo(dirAbs) : undefined;
+    if (!knownRecords) {
       removeTree(dirAbs);
       this.writeFiles(dirAbs, this.dbFiles());
       return;
+    }
+    const known = ownerVersions(knownRecords);
+    const records = this.cdiRecords();
+    const vanished = [...knownRecords.keys()].some((name) => !records.has(name));
+    if (vanished) {
+      this.fullRewriteUpdates += 1;
+      if (this.fullDumpUpdate === 'rewrite-all') {
+        removeTree(dirAbs);
+        this.writeFiles(dirAbs, this.dbFiles());
+        return;
+      }
     }
     for (const [name] of known) {
       if (!this.objects.has(name)) {
         this.removeOwnerFiles(dirAbs, name);
       }
+    }
+    if (vanished) {
+      this.removeFilesOfVanishedRecords(dirAbs, records);
     }
     for (const [name, object] of this.objects) {
       const knownVersion = known.get(name);
@@ -392,6 +441,24 @@ export class AgentConfigEmulator {
       this.writeFiles(dirAbs, Object.fromEntries(object.files));
     }
     fs.writeFileSync(path.join(dirAbs, CDI), this.buildConfigDumpInfo());
+  }
+
+  /** Файлы живых владельцев, чьей файловой записи CDI в базе больше нет (удалённая форма, макет, модуль). */
+  private removeFilesOfVanishedRecords(dirAbs: string, records: ReadonlyMap<string, unknown>): void {
+    const toRemove: string[] = [];
+    walkFiles(dirAbs, '', (rel) => {
+      const owner = ownerOfPath(rel);
+      if (owner === undefined || !this.objects.has(owner)) {
+        return;
+      }
+      const suffix = cdiSuffixOfFile(owner, rel);
+      if (suffix !== undefined && !records.has(`${owner}${suffix}`)) {
+        toRemove.push(rel);
+      }
+    });
+    for (const rel of toRemove) {
+      fs.unlinkSync(path.join(dirAbs, ...rel.split('/')));
+    }
   }
 
   /** `dump --list-file`: имена из списка → файлы в `--dir` (CDI не пишется). */
@@ -451,12 +518,15 @@ export class AgentConfigEmulator {
     return records;
   }
 
-  private computeChangesText(known: Map<string, number>): string {
-    for (const name of known.keys()) {
-      if (!this.objects.has(name)) {
+  private computeChangesText(knownRecords: Map<string, number>): string {
+    // Исчезла любая известная файловая запись (владелец, форма, макет, модуль) — платформа отвечает `FullDump`.
+    const records = this.cdiRecords();
+    for (const name of knownRecords.keys()) {
+      if (!records.has(name)) {
         return `${BOM}FullDump\r\n`;
       }
     }
+    const known = ownerVersions(knownRecords);
     const lines: string[] = [];
     for (const name of [...this.objects.keys()].sort()) {
       const object = this.objects.get(name);
@@ -551,21 +621,22 @@ export class AgentConfigEmulator {
 
   private buildConfigDumpInfo(): Buffer {
     const lines: string[] = [];
-    let idCounter = 0;
-    const id = (): string => `id="00000000-0000-0000-0000-${String(++idCounter).padStart(12, '0')}"`;
+    // Идентификатор записи стабилен по имени: удаление владельца не сдвигает идентификаторы остальных записей,
+    // поэтому файл версий зеркала после очистки владельца побайтно совпадает с файлом версий базы.
+    const id = (recordName: string): string => `id="${stableRecordGuid(recordName)}"`;
     for (const [name, object] of [...this.objects.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
       // Как у платформы: тег владельца открывающий, внутри — встроенные (без configVersion) и файловые
       // подобъекты (с configVersion), `</Metadata>`; порядок атрибутов `name`, `id`, `configVersion`.
       const children: string[] = [
-        ...(object.inline ?? defaultInline(name)).map((child) => `    <Metadata name="${name}.${child}" ${id()}/>`),
+        ...(object.inline ?? defaultInline(name)).map((child) => `    <Metadata name="${name}.${child}" ${id(`${name}.${child}`)}/>`),
         ...fileSubobjects(name, object)
           .filter(([suffix]) => suffix !== '')
           .map(([suffix, rels]) => {
             const version = Math.max(...rels.map((rel) => object.fileVersions.get(rel) ?? object.version));
-            return `    <Metadata name="${name}${suffix}" ${id()} configVersion="${String(version)}"/>`;
+            return `    <Metadata name="${name}${suffix}" ${id(`${name}${suffix}`)} configVersion="${String(version)}"/>`;
           }),
       ];
-      const open = `  <Metadata name="${name}" ${id()} configVersion="${String(object.version)}"`;
+      const open = `  <Metadata name="${name}" ${id(name)} configVersion="${String(object.version)}"`;
       if (children.length === 0) {
         lines.push(`${open}/>`);
       } else {
@@ -575,10 +646,10 @@ export class AgentConfigEmulator {
     // Заголовок как у платформы: пространство имён, `format="Hierarchical"` и версия формата — по ним
     // проверяется пригодность файла версий проекта для посева зеркала.
     const header = `<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" format="Hierarchical" version="${this.formatVersion}">`;
-    return Buffer.from(`${BOM}${header}\n${lines.join('\n')}\n</ConfigDumpInfo>\n`, 'utf-8');
+    return Buffer.from(`${BOM}${header}\n<ConfigVersions>\n${lines.join('\n')}\n</ConfigVersions>\n</ConfigDumpInfo>\n`, 'utf-8');
   }
 
-  /** Версии владельцев верхнего уровня (имена из двух сегментов); вложенные записи эмулятору не нужны. */
+  /** Версии ВСЕХ файловых записей (с `configVersion`): владельцы и файловые подобъекты — по имени записи. */
   private readConfigDumpInfo(dirAbs: string): Map<string, number> | undefined {
     const file = path.join(dirAbs, CDI);
     if (!fs.existsSync(file)) {
@@ -588,7 +659,7 @@ export class AgentConfigEmulator {
     for (const tag of fs.readFileSync(file, 'utf-8').matchAll(/<Metadata\b[^>]*>/g)) {
       const name = /\bname="([^"]+)"/.exec(tag[0])?.[1];
       const version = /\bconfigVersion="(\d+)"/.exec(tag[0])?.[1];
-      if (name !== undefined && version !== undefined && name.split('.').length === 2) {
+      if (name !== undefined && version !== undefined) {
         result.set(name, Number(version));
       }
     }
@@ -630,6 +701,17 @@ export function ownerOfPath(rel: string): string | undefined {
     return undefined;
   }
   return `${english}.${parts[1].replace(/\.xml$/, '')}`;
+}
+
+/** GUID-подобный идентификатор записи CDI, выведенный из её имени (стабилен между сборками файла версий). */
+function stableRecordGuid(recordName: string): string {
+  const hex = createHash('sha1').update(recordName, 'utf8').digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/** Версии владельцев верхнего уровня (имена из двух сегментов) из версий всех записей. */
+function ownerVersions(records: ReadonlyMap<string, number>): Map<string, number> {
+  return new Map([...records].filter(([name]) => name.split('.').length === 2));
 }
 
 function defaultInline(owner: string): string[] {

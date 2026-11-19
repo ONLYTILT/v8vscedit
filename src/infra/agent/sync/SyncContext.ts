@@ -107,3 +107,22 @@ export const EXCHANGE_RESTORE_DIR = 'restore';
 
 /** Суффикс списка имён точечной выгрузки — рядом с каталогом обмена, как `.changes`; убирает движок. */
 export const EXCHANGE_RESTORE_LIST_SUFFIX = '.objects.txt';
+
+/** Каталог выгрузки только файла версий (`--config-dump-info-only`) внутри каталога обмена. */
+export const EXCHANGE_DUMP_INFO_DIR = 'cdi';
+
+/** Архив свежего файла версий: zip в разы меньше XML (6 МБ против 34 МБ на большой конфигурации, §5b п.9). */
+export const EXCHANGE_DUMP_INFO_ARCHIVE = 'cdi.zip';
+
+/** Суффикс первого списка изменений — рядом с каталогом обмена. */
+export const EXCHANGE_CHANGES_SUFFIX = '.changes';
+
+/** Суффикс повторного списка изменений после очистки зеркала: первый список остаётся для разбора сбоев. */
+export const EXCHANGE_CHANGES_RETRY_SUFFIX = '.changes-retry';
+
+/** Все файлы обмена рядом с каталогом `exchange/<operationId>`: единый список для уборки движком. */
+export const EXCHANGE_SIDE_SUFFIXES: readonly string[] = [
+  EXCHANGE_CHANGES_SUFFIX,
+  EXCHANGE_CHANGES_RETRY_SUFFIX,
+  EXCHANGE_RESTORE_LIST_SUFFIX,
+];
