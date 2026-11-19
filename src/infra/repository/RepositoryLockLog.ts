@@ -1,5 +1,6 @@
 /**
- * Разбор лога `/ConfigurationRepositoryLock` (Н10).
+ * Разбор лога `/ConfigurationRepositoryLock` (Н10); признак изменения базы (`hasReceivedFromRepository`)
+ * читает и лог `/ConfigurationRepositoryUpdateCfg` — формат строк общий.
  *
  * Пилот 8.3.27.2130: частичный захват — УСПЕХ платформы (exit 0), несуществующие объекты
  * перечисляются отдельной строкой, остальные захватываются. Помечать захваченными все
@@ -55,12 +56,17 @@ export function resolveLockedFullNames(fullNames: readonly string[], log: string
 }
 
 const OPERATION_BEGIN_MARKER = '---- Начало операции';
-const RECEIVED_PREFIX = 'Объект получен из хранилища:';
+/**
+ * Строки, которыми платформа сообщает об изменении основной конфигурации базы операцией хранилища.
+ * Удаление — отдельная строка (эксперимент Э16): при получении поддерева без корня она может
+ * оказаться единственной, и без неё файлы удалённого объекта остались бы в проекте.
+ */
+const BASE_CHANGED_PREFIXES = ['Объект получен из хранилища:', 'Объект удален из конфигурации:'];
 
 /**
- * Получила ли база при захвате новые версии объектов из хранилища (эксперимент Э14: строка
- * «Объект получен из хранилища» пишется и при захвате БЕЗ `-revised`, если объект менялся в
- * хранилище). Лог не распознан (нет маркера начала операции) — `true`: лишний импорт дешевле
+ * Изменила ли операция хранилища основную конфигурацию базы — захват (`/ConfigurationRepositoryLock`,
+ * Э14: версия получается и БЕЗ `-revised`) или получение (`/ConfigurationRepositoryUpdateCfg`, тот же
+ * формат строк). Лог не распознан (нет маркера начала операции) — `true`: лишний импорт дешевле
  * проекта, молча отстающего от базы.
  */
 export function hasReceivedFromRepository(log: string): boolean {
@@ -68,5 +74,5 @@ export function hasReceivedFromRepository(log: string): boolean {
   if (!lines.some((line) => line.startsWith(OPERATION_BEGIN_MARKER))) {
     return true;
   }
-  return lines.some((line) => line.startsWith(RECEIVED_PREFIX));
+  return lines.some((line) => BASE_CHANGED_PREFIXES.some((prefix) => line.startsWith(prefix)));
 }

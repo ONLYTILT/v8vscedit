@@ -8,7 +8,6 @@ import {
   runRepositoryCliCommand,
   runRepositoryCommitAction,
   runRepositoryUnlockAction,
-  runRepositoryUpdateAction,
 } from './RepositoryCommandRunner';
 import {
   buildAddUserOperation,
@@ -18,7 +17,6 @@ import {
   buildDumpOperation,
   buildReportOperation,
   buildSetLabelOperation,
-  normalizeUpdateVersion,
   reportDefaultExtension,
   sanitizeFileName,
   validateBindingForm,
@@ -33,6 +31,7 @@ import {
   promptRequiredText,
 } from './repositoryPrompts';
 import { registerRepositoryLockCommand } from './RepositoryLockCommand';
+import { registerRepositoryUpdateCommand } from './RepositoryUpdateCommand';
 import {
   requireConnectedRootTarget,
   requireRepositoryNode,
@@ -51,6 +50,7 @@ export function registerRepositoryCommands(
   services: CommandServices
 ): void {
   registerRepositoryLockCommand(context, services);
+  registerRepositoryUpdateCommand(context, services);
   context.subscriptions.push(
     vscode.commands.registerCommand('v8vscedit.repository.connect', async (node: NodeArg) => {
       const target = requireRootTarget(services, node);
@@ -240,45 +240,6 @@ export function registerRepositoryCommands(
         }
         return runRepositoryCommitAction(toCliServices(services), repositoryNode, formData);
       });
-      if (ok) {
-        refreshRepositoryUi(services);
-      }
-    }),
-
-    vscode.commands.registerCommand('v8vscedit.repository.update', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
-        return;
-      }
-
-      const recursive = await askRecursiveMode('Получение из хранилища', repositoryNode.label ?? 'выбранный узел');
-      if (recursive === undefined) {
-        return;
-      }
-      const force = await pickBoolean(
-        'Получение из хранилища',
-        'Выполнять принудительное получение?',
-        'С force',
-        'Без force'
-      );
-      if (force === undefined) {
-        return;
-      }
-      const version = await vscode.window.showInputBox({
-        title: 'Получение из хранилища',
-        prompt: 'Версия хранилища для получения. Оставьте пустым для актуальной.',
-        placeHolder: 'Например: 125',
-        ignoreFocusOut: true,
-      });
-      if (version === undefined) {
-        return;
-      }
-
-      const ok = await runWithConfigurationOperationLock(() => runRepositoryUpdateAction(toCliServices(services), repositoryNode, {
-        recursive,
-        force,
-        version: normalizeUpdateVersion(version),
-      }));
       if (ok) {
         refreshRepositoryUi(services);
       }

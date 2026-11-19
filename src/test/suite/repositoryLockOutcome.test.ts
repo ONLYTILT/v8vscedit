@@ -328,4 +328,13 @@ suite('hasReceivedFromRepository — получила ли база новые �
   test('строка «получен» — только как отдельная строка с маркером (LF вместо CRLF тоже)', () => {
     assert.strictEqual(hasReceivedFromRepository(LOG_RECEIVED.replace(/\r\n/g, '\n')), true);
   });
+
+  // Э16: получение поддерева без корня — удаление может быть единственной строкой изменения базы.
+  test('лог получения Э16 только с удалением объекта: true', () => {
+    assert.strictEqual(
+      hasReceivedFromRepository([BEGIN, 'Объект удален из конфигурации: Справочник.Справочник3', END,
+        'Обновление конфигурации из хранилища успешно завершено'].join('\r\n')),
+      true
+    );
+  });
 });

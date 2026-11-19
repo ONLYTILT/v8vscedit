@@ -371,6 +371,12 @@ suite('RepositoryCommands — обработчики команд', () => {
     });
 
     test('update: отмены и версия с обрезкой пробелов; пустая версия не попадает в вектор', async () => {
+      // Лог без «получен»: импорт в проект не запускается (он требует платформы 1С; сценарии импорта — repositoryUpdateCommand.test.ts).
+      runResult = () => ({
+        exitCode: 0,
+        log: ['---- Начало операции с хранилищем конфигурации ----', '---- Операция с хранилищем конфигурации завершена ----'].join('\r\n'),
+        outputs: new Map(),
+      });
       picks.push(PICK_CANCEL);
       await call('v8vscedit.repository.update', catalogNode);
       picks.push(pickLabel('Рекурсивно'), PICK_CANCEL);

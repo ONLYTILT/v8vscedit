@@ -443,6 +443,24 @@ suite('RepositoryCommandRunner', () => {
       assert.strictEqual(args[args.indexOf('-v') + 1], '5');
     });
 
+    test('получение: outcome.receivedFromRepository по логу; exit≠0 — undefined', async () => {
+      const begin = '---- Начало операции с хранилищем конфигурации ----';
+      const end = '---- Операция с хранилищем конфигурации завершена ----';
+      const options = { recursive: false, force: false };
+
+      behavior = () => ok({ log: [begin, 'Объект получен из хранилища: Справочник.Товары', end].join('\r\n') });
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true });
+
+      behavior = () => ok({ log: [begin, end].join('\r\n') });
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: false });
+
+      behavior = () => ok({ log: '' });
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true }, 'лог не распознан — консервативно true');
+
+      behavior = () => ok({ exitCode: 1 });
+      assert.strictEqual(await runRepositoryUpdateAction(services, catalogNode, options), undefined);
+    });
+
     test('метка у узла отсутствует — в заголовках имя цели (получение, захват, освобождение, помещение)', async () => {
       const node: RepositoryNodeRef = { nodeKind: 'Catalog', xmlPath: catalogNode.xmlPath };
       await runRepositoryUpdateAction(services, node, { recursive: false, force: false });

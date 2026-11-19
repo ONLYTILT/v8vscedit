@@ -20,6 +20,7 @@ import {
 } from '../../../infra/repository/RepositoryDesignerArgs';
 import { hasReceivedFromRepository, resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
 import type { RepositoryLockOutcome } from './repositoryLockFlow';
+import type { RepositoryUpdateOutcome } from './repositoryUpdateFlow';
 import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
 import { acquireDesignerBatchExecutor, type DesignerExecutorDeps } from '../ext/designerExecutorRegistry';
 
@@ -301,6 +302,10 @@ export async function runRepositoryCommitAction(
   }, services);
 }
 
+/**
+ * Получение из хранилища. Результат — получила ли база новые версии (по логу): по нему команда
+ * решает, нужен ли импорт в проект. `undefined` — получение не выполнено (ошибку показал раннер).
+ */
 export async function runRepositoryUpdateAction(
   services: RepositoryCliServices,
   node: RepositoryNodeRef,
@@ -309,10 +314,11 @@ export async function runRepositoryUpdateAction(
     force: boolean;
     version?: string;
   }
-): Promise<boolean> {
+): Promise<RepositoryUpdateOutcome | undefined> {
   const target = requireTarget(services.repositoryService, node);
   const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
-  return runRepositoryCliCommand({
+  let outcome: RepositoryUpdateOutcome | undefined;
+  const ok = await runRepositoryCliCommand({
     operation: { kind: 'update', objectsXml: objects.xml, version: options.version, force: options.force },
     target,
     progressTitle: `Получение: ${node.label ?? target.displayName}`,
@@ -320,7 +326,12 @@ export async function runRepositoryUpdateAction(
     successMessage: `Объекты "${node.label ?? target.displayName}" обновлены из хранилища.`,
     errorTitle: `Ошибка получения "${node.label ?? target.displayName}" из хранилища.`,
     failureOperation: 'получении изменений из хранилища',
+    // Формат лога тот же, что у захвата: строки «Объект получен из хранилища».
+    afterSuccess: (result) => {
+      outcome = { receivedFromRepository: hasReceivedFromRepository(result.log) };
+    },
   }, services);
+  return ok ? outcome : undefined;
 }
 
 function requireTarget(repositoryService: RepositoryService, node: RepositoryNodeRef): RepositoryTarget {
