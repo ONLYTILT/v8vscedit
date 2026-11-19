@@ -26,6 +26,12 @@ export interface ConfigDumpInfoIndex {
    * версий базы сравнивается с файлом версий зеркала: пропавшая запись — удалённый объект или его часть.
    */
   readonly fileLevelVersions: ReadonlyMap<string, string>;
+  /**
+   * Встроенные записи (без `configVersion`): реквизиты, ТЧ, измерения, значения перечислений. Их
+   * удаление или переименование агент тоже отвечает FullDump (стенд пользователя: переименованный
+   * реквизит табличной части), поэтому сравнение файлов версий обязано видеть и их.
+   */
+  readonly embeddedNames: ReadonlySet<string>;
   /** Сам владелец + его подобъекты с `configVersion` (файловые), в порядке файла; неизвестный — []. */
   fileLevelNamesOf(ownerFullName: string): readonly string[];
 }
@@ -49,6 +55,7 @@ export function parseConfigDumpInfoIndex(text: string): ConfigDumpInfoIndex {
   const rootNames = new Set<string>();
   const fileLevel = new Map<string, string[]>();
   const fileLevelVersions = new Map<string, string>();
+  const embeddedNames = new Set<string>();
   for (const match of text.matchAll(METADATA_TAG)) {
     const tag = match[0];
     const name = NAME_ATTRIBUTE.exec(tag)?.[1];
@@ -68,6 +75,8 @@ export function parseConfigDumpInfoIndex(text: string): ConfigDumpInfoIndex {
       } else {
         names.push(name);
       }
+    } else {
+      embeddedNames.add(name);
     }
   }
   const configurationOwner = [...rootNames].find((name) => name.startsWith(CONFIGURATION_PREFIX));
@@ -76,6 +85,7 @@ export function parseConfigDumpInfoIndex(text: string): ConfigDumpInfoIndex {
     configurationOwner,
     header: parseConfigDumpInfoHeader(text),
     fileLevelVersions,
+    embeddedNames,
     fileLevelNamesOf: (ownerFullName) => fileLevel.get(ownerFullName) ?? [],
   };
 }

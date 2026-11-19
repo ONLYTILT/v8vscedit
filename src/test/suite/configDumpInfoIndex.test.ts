@@ -349,6 +349,16 @@ suite('ConfigDumpInfoIndex: fileLevelVersions', () => {
     ]);
   });
 
+  test('embeddedNames — ровно записи без configVersion (реквизиты, ТЧ), файловые туда не входят', () => {
+    const index = parseConfigDumpInfoIndex(wrap(DOCUMENT));
+    for (const name of index.embeddedNames) {
+      assert.ok(!index.fileLevelVersions.has(name), `${name} не может быть одновременно встроенной и файловой`);
+    }
+    const all = [...wrap(DOCUMENT).matchAll(/<Metadata name="([^"]+)"/g)].map((m) => m[1]);
+    assert.strictEqual(index.embeddedNames.size + index.fileLevelVersions.size, new Set(all).size);
+    assert.ok(index.embeddedNames.size > 0, 'в фикстуре DOCUMENT есть встроенные записи');
+  });
+
   test('значение — строка как в файле (хеш платформы не приводится к числу)', () => {
     const index = parseConfigDumpInfoIndex(wrap('<Metadata name="Catalog.А" id="1" configVersion="ef17bfe954778b44b47aa6f01350b83000000000"/>'));
     assert.strictEqual(index.fileLevelVersions.get('Catalog.А'), 'ef17bfe954778b44b47aa6f01350b83000000000');

@@ -36,7 +36,7 @@ function documentWithoutForm(name: string, version = 'v1'): CdiOwner {
 suite('diffConfigDumpInfo', () => {
   test('одинаковые файлы версий → пусто', () => {
     const same = index(ROOT_OWNER, documentOwner('Д'), CATALOG);
-    assert.deepStrictEqual(diffConfigDumpInfo(same, index(ROOT_OWNER, documentOwner('Д'), CATALOG)), { added: [], removed: [], modified: [] });
+    assert.deepStrictEqual(diffConfigDumpInfo(same, index(ROOT_OWNER, documentOwner('Д'), CATALOG)), { added: [], removed: [], modified: [], removedEmbedded: [] });
   });
 
   test('запись только в after — added; только в before — removed; другая версия — modified', () => {
@@ -51,13 +51,29 @@ suite('diffConfigDumpInfo', () => {
       added: ['Catalog.А.ManagerModule'],
       removed: ['Catalog.А.ObjectModule'],
       modified: ['Catalog.А'],
+      removedEmbedded: [],
     });
   });
 
-  test('встроенные записи (без configVersion) в сравнении не участвуют', () => {
+  // Стенд пользователя (БП КОРП): переименование реквизита ТЧ дало агенту FullDump, а из файла версий пропала
+  // ТОЛЬКО встроенная запись. Сравнение лишь файловых записей её не видело и уводило импорт в перезапись.
+  test('пропавшая встроенная запись (переименованный реквизит) — removedEmbedded; появившаяся новая встроенная — не added', () => {
     const before = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a1', children: [{ name: 'Catalog.А.Attribute.Р' }] });
-    const after = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a1', children: [{ name: 'Catalog.А.Attribute.Другой' }] });
-    assert.deepStrictEqual(diffConfigDumpInfo(before, after), { added: [], removed: [], modified: [] });
+    const after = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a2', children: [{ name: 'Catalog.А.Attribute.Другой' }] });
+    assert.deepStrictEqual(diffConfigDumpInfo(before, after), {
+      added: [],
+      removed: [],
+      modified: ['Catalog.А'],
+      removedEmbedded: ['Catalog.А.Attribute.Р'],
+    });
+  });
+
+  test('встроенная запись, ставшая файловой, пропавшей не считается', () => {
+    const before = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a1', children: [{ name: 'Catalog.А.Command.К' }] });
+    const after = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a1', children: [{ name: 'Catalog.А.Command.К', version: 'k1' }] });
+    const diff = diffConfigDumpInfo(before, after);
+    assert.deepStrictEqual(diff.removedEmbedded, []);
+    assert.deepStrictEqual(diff.added, ['Catalog.А.Command.К']);
   });
 
   test('детерминированная сортировка: порядок записей в файле не влияет на порядок результата', () => {
@@ -125,6 +141,27 @@ suite('groupDumpInfoDiffByOwner', () => {
     assert.deepStrictEqual(result.removedOwners, ['Catalog.Старый']);
     assert.deepStrictEqual(result.changedOwners, [{ fullName: 'Catalog.Новый', change: 'added' }]);
     assert.deepStrictEqual(result.ownersWithRemovedParts, []);
+  });
+
+  test('3b. переименован реквизит ТЧ (пропала встроенная запись) → живой владелец в ownersWithRemovedParts', () => {
+    const owner = (attr: string): CdiOwner => ({
+      name: 'Document.Д',
+      version: attr === 'СуммаОплаты' ? 'd1' : 'd2',
+      children: [{ name: 'Document.Д.TabularSection.Т' }, { name: `Document.Д.TabularSection.Т.Attribute.${attr}` }],
+    });
+    const before = index(ROOT_OWNER, owner('СуммаОплаты'));
+    const after = index(ROOT_OWNER, owner('Сумма'));
+    const changes = groupDumpInfoDiffByOwner(diffConfigDumpInfo(before, after), before, after);
+    assert.deepStrictEqual(changes.ownersWithRemovedParts, ['Document.Д']);
+    assert.deepStrictEqual(changes.removedOwners, []);
+  });
+
+  test('3c. удалён владелец со встроенными записями → только removedOwners, не ownersWithRemovedParts', () => {
+    const before = index(ROOT_OWNER, { name: 'Catalog.А', version: 'a1', children: [{ name: 'Catalog.А.Attribute.Р' }] });
+    const after = index(ROOT_OWNER);
+    const changes = groupDumpInfoDiffByOwner(diffConfigDumpInfo(before, after), before, after);
+    assert.deepStrictEqual(changes.removedOwners, ['Catalog.А']);
+    assert.deepStrictEqual(changes.ownersWithRemovedParts, []);
   });
 
   test('6. удалена вложенная подсистема Subsystem.A.Subsystem.B → ownersWithRemovedParts = [Subsystem.A]', () => {

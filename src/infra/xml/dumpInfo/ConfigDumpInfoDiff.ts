@@ -2,8 +2,11 @@ import { CONFIGURATION_PREFIX, dumpInfoOwnerOf, type ConfigDumpInfoIndex } from 
 
 /**
  * Сравнение двух файлов версий выгрузки (зеркало агента ↔ свежий файл версий базы; зеркало до и после
- * перезаписи). Сравниваются только файловые записи (с `configVersion`): встроенные (реквизит, ТЧ)
- * хранятся в XML владельца, и их изменение видно по версии самого владельца.
+ * перезаписи). Версии сравниваются по файловым записям (с `configVersion`): изменение встроенной записи
+ * (реквизит, ТЧ) видно по версии её владельца. Но ПРОПАЖА встроенной записи (удалённый или
+ * переименованный реквизит) — тоже причина FullDump агента и по версиям не видна: такие записи
+ * сравниваются по именам (`removedEmbedded`), а их владелец чистится целиком, как владелец с
+ * удалённой формой.
  *
  * Чистые функции: решение «что чистить в зеркале» принимает планировщик, а файлы трогает движок.
  */
@@ -12,6 +15,8 @@ export interface DumpInfoDiff {
   readonly added: string[];
   readonly removed: string[];
   readonly modified: string[];
+  /** Встроенные записи (без `configVersion`), которых нет в `after` ни встроенными, ни файловыми. */
+  readonly removedEmbedded: string[];
 }
 
 export interface DumpInfoOwnerChange {
@@ -22,7 +27,7 @@ export interface DumpInfoOwnerChange {
 export interface DumpInfoOwnerChanges {
   /** Владельцев больше нет в `after`: удалённые объекты и старые имена переименованных. Корня здесь нет никогда. */
   readonly removedOwners: readonly string[];
-  /** Живые владельцы, у которых пропала хотя бы одна файловая запись (форма, макет, модуль, вложенная подсистема). */
+  /** Живые владельцы, у которых пропала хотя бы одна запись: файловая (форма, макет, модуль) или встроенная (реквизит, ТЧ). */
   readonly ownersWithRemovedParts: readonly string[];
   /** Владельцы с добавленными или изменёнными записями; `added` — владельца не было в `before`. */
   readonly changedOwners: readonly DumpInfoOwnerChange[];
@@ -42,8 +47,12 @@ export function diffConfigDumpInfo(before: ConfigDumpInfoIndex, after: ConfigDum
     }
   }
   const added = [...after.fileLevelVersions.keys()].filter((name) => !before.fileLevelVersions.has(name));
+  // Встроенная запись, ставшая файловой (у реквизита не бывает, но формат это допускает), не пропала.
+  const removedEmbedded = [...before.embeddedNames].filter(
+    (name) => !after.embeddedNames.has(name) && !after.fileLevelVersions.has(name)
+  );
   // Порядок записей в файле не должен влиять на решения и сообщения: результат сортируется.
-  return { added: added.sort(), removed: removed.sort(), modified: modified.sort() };
+  return { added: added.sort(), removed: removed.sort(), modified: modified.sort(), removedEmbedded: removedEmbedded.sort() };
 }
 
 export function groupDumpInfoDiffByOwner(
@@ -54,7 +63,7 @@ export function groupDumpInfoDiffByOwner(
   const afterOwners = ownersOf(after);
   const removedOwners = new Set<string>();
   const ownersWithRemovedParts = new Set<string>();
-  for (const name of diff.removed) {
+  for (const name of [...diff.removed, ...diff.removedEmbedded]) {
     const owner = dumpInfoOwnerOf(name);
     if (afterOwners.has(owner)) {
       ownersWithRemovedParts.add(owner);

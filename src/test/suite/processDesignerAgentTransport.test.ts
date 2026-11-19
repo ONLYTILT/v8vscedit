@@ -29,6 +29,16 @@ suite('ProcessDesignerAgentTransport', () => {
     assert.strictEqual(config.readyTimeout, 3000);
   });
 
+  // Без keepalive долгая команда (полная выгрузка) шла молча, промежуточное оборудование закрывало
+  // простаивающее соединение, и ответ агента терялся — расширение ждало вечно (стенд пользователя).
+  // Агент не отвечает на keepalive во время команды (эксперимент 22): допуск пропусков обязан покрывать
+  // самую долгую команду (полная выгрузка БП — десятки минут), иначе keepalive сам обрывает её.
+  test('включает SSH keepalive: пакеты раз в 15 с, допуск без ответа — не меньше 6 часов', () => {
+    const config = buildSshConnectConfig({ host: 'h', port: 1543, user: 'u' });
+    assert.strictEqual(config.keepaliveInterval, 15_000);
+    assert.ok((config.keepaliveCountMax ?? 0) * 15_000 >= 6 * 60 * 60 * 1000, String(config.keepaliveCountMax));
+  });
+
   test('читает приватный ключ из файла настроек', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-agent-key-'));
     const keyPath = path.join(dir, 'id_rsa');

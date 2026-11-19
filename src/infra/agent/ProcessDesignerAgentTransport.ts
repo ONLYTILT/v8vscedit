@@ -312,6 +312,21 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   }
 }
 
+/**
+ * Keepalive SSH. Долгая команда агента (полная выгрузка БП — десятки минут) идёт без единого байта по
+ * соединению, и промежуточное оборудование (межсетевой экран, VPN, NAT) закрывает простаивающее
+ * TCP-соединение: ответ агента не доходит, а клиент без keepalive ждёт его вечно (стенд пользователя:
+ * агент закончил перезапись зеркала, расширение висело). Пакеты раз в 15 с держат соединение живым.
+ *
+ * Допуск пропусков — практически бесконечный (12 ч): агент 1С (libssh) НЕ отвечает на keepalive, пока
+ * выполняет команду (эксперимент 22: при допуске 3 соединение рвалось через 4 с долгой загрузки; при
+ * огромном допуске 25 мин долгой команды и ~1500 запросов без ответа — соединение цело). Малый допуск
+ * обрывал бы любую команду длиннее минуты. Обнаружение мёртвого соединения keepalive здесь не даёт —
+ * это задача таймаута команды по отсутствию прогресса (бэклог).
+ */
+export const SSH_KEEPALIVE_INTERVAL_MS = 15_000;
+export const SSH_KEEPALIVE_COUNT_MAX = 2_880;
+
 export function buildSshConnectConfig(options: DesignerAgentEndpointOptions): ConnectConfig {
   const config: ConnectConfig = {
     host: options.host,
@@ -319,6 +334,8 @@ export function buildSshConnectConfig(options: DesignerAgentEndpointOptions): Co
     username: options.user,
     password: options.password ?? '',
     readyTimeout: (options.connectTimeoutSeconds ?? 10) * 1000,
+    keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+    keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
   };
   if (options.privateKeyPath) {
     config.privateKey = fs.readFileSync(options.privateKeyPath, 'utf-8');
