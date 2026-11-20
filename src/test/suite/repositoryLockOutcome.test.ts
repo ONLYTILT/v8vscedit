@@ -74,6 +74,8 @@ suite('Н10: parseRepositoryLockLog — разбор лога захвата', (
       locked: ['Справочник.Товары'],
       cancelled: ['Документ.Заказ'],
       absent: ['Справочник.Нет1', 'Справочник.Нет2'],
+      // Поле чужих захватов добавлено Э24 (освобождение по логу); у лога захвата оно пусто.
+      lockedByOthers: [],
       recognized: true,
     });
   });
@@ -98,7 +100,7 @@ suite('Н10: parseRepositoryLockLog — разбор лога захвата', (
   ];
   for (const [title, log] of unrecognized) {
     test(`не распознан: ${title}`, () => {
-      assert.deepStrictEqual(parseRepositoryLockLog(log), { locked: [], cancelled: [], absent: [], recognized: false });
+      assert.deepStrictEqual(parseRepositoryLockLog(log), { locked: [], cancelled: [], absent: [], lockedByOthers: [], recognized: false });
     });
   }
 });

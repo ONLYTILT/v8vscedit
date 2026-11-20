@@ -18,6 +18,7 @@ import { registerFormTools } from './registration/McpFormTools';
 import { registerSubsystemTools } from './registration/McpSubsystemTools';
 import { registerRoleTools } from './registration/McpRoleTools';
 import { registerConfigLifecycleTools } from './registration/McpConfigLifecycleTools';
+import { registerRepositoryTools } from './registration/McpRepositoryTools';
 import { registerPropertyTools } from './registration/McpPropertyTools';
 import { McpMetadataPathService } from './McpMetadataPathService';
 import { McpPropertyService } from './McpPropertyService';
@@ -184,6 +185,7 @@ export class V8McpServer implements vscode.Disposable {
     registerSubsystemTools(server, deps);
     registerRoleTools(server, deps);
     registerConfigLifecycleTools(server, deps);
+    registerRepositoryTools(server, deps);
     registerPropertyTools(server, deps);
 
     // Декомпозированные tools добавления (E8): отдельный tool на каждый корневой

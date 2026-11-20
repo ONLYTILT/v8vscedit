@@ -12,12 +12,14 @@
  * провалить именно этот тест.
  *
  * Зафиксировано:
- *  1) Полный каталог из 61 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
+ *  1) Полный каталог из 67 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
  *     `registerTools` (`server.registerTool(...)` прямо в V8McpServer.ts).
  *     Для каждого — имя, title, description (построчно, дословно) и набор
  *     ключей inputSchema с их опциональностью. Было 59 на момент снятия эталона;
  *     +2 — пакетные v8vscedit_dump_all_cfe/v8vscedit_load_all_cfe (новая
- *     функциональность, а не дробление: см. cfeBatch*.test.ts).
+ *     функциональность, а не дробление: см. cfeBatch*.test.ts); ещё +6 — операции хранилища
+ *     v8vscedit_repository_status/lock/update/commit/unlock и v8vscedit_update_database_configuration
+ *     (docs/plans/mcp-repository-tools-plan.md; поведение — mcpRepositoryTools.test.ts).
  *     Отдельно вызываемые `registerAllAddTools` (45 root + 11 child = 56 tools)
  *     сюда не входят — они уже застрахованы `mcpAddTools.test.ts` как
  *     самостоятельный декомпозированный модуль.
@@ -46,6 +48,7 @@ import * as path from 'path';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as vscode from 'vscode';
 import { V8McpServer } from '../../ui/mcp/V8McpServer';
+import { EXTENSION_MCP_TOOLS } from '../../infra/ai/AiMcpConfiguration';
 import { ConfigurationXmlEditor } from '../../infra/xml';
 import { MetadataXmlCreator } from '../../infra/xml/MetadataXmlCreator';
 import { MetadataXmlRemover } from '../../infra/xml/MetadataXmlRemover';
@@ -606,24 +609,60 @@ const EXPECTED_TOOLS: readonly ExpectedTool[] = [
     description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations.',
     schemaKeys: { command: false },
   },
+  {
+    name: 'v8vscedit_repository_status',
+    title: 'Состояние хранилища конфигурации',
+    description: 'Показывает подключение узла к хранилищу конфигурации: привязку (без пароля), подключено ли оно, захваченные вами объекты по локальному учёту и число незагруженных изменённых файлов проекта. Платформу не вызывает. Принимает канонический путь объекта или корня конфигурации/расширения (Справочники.Товары, Конфигурация, Расширение).',
+    schemaKeys: { path: false, configuration: true },
+  },
+  {
+    name: 'v8vscedit_repository_lock',
+    title: 'Захватить объекты в хранилище',
+    description: 'Захватывает объект в хранилище конфигурации для редактирования через пакетный Конфигуратор; после захвата, если из хранилища получены новые версии, импортирует их в файлы проекта. Рекурсивный захват корня требует confirm: true. При незагруженных правках проекта обязателен localChanges: loadFirst (загрузить правки в базу перед захватом), keepProjectBehind (захватить, проект не обновлять) или abort. Принимает канонический путь объекта или корня; дочерний элемент захватывает владельца.',
+    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, confirm: true },
+  },
+  {
+    name: 'v8vscedit_repository_update',
+    title: 'Получить объекты из хранилища',
+    description: 'Получает объект из хранилища конфигурации в базу и импортирует изменившиеся объекты в файлы проекта. Получение возвращает захваченные вами объекты к версии хранилища: правки, загруженные в базу и не помещённые, будут потеряны — для таких объектов нужен overwriteLocked: true. При незагруженных правках проекта обязателен localChanges: loadAfter (загрузить правки после получения), keepProjectBehind (проект не обновлять) или abort. Принимает канонический путь объекта или корня.',
+    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true },
+  },
+  {
+    name: 'v8vscedit_repository_commit',
+    title: 'Поместить объекты в хранилище',
+    description: 'Помещает изменения объекта в хранилище конфигурации через пакетный Конфигуратор. Операция необратима и требует confirm: true и непустого comment. Помещение без предварительной загрузки правок проекта запрещено: при незагруженных правках передайте localChanges: loadFirst. keepLocked оставляет объект захваченным. force: платформа сама удалит из объекта ссылки на удалённые объекты (молчаливая правка объекта в базе и в хранилище), захват не обходит; после такой очистки проект импортируется заново. Принимает канонический путь объекта или корня.',
+    schemaKeys: { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false },
+  },
+  {
+    name: 'v8vscedit_repository_unlock',
+    title: 'Отменить захват объектов в хранилище',
+    description: 'Отменяет захват объекта в хранилище конфигурации. Успех определяется по журналу платформы: объект, захваченный другим пользователем, не освобождается. Принимает канонический путь объекта или корня; рекурсивно — со всеми подчинёнными объектами. Незагруженные правки проекта по освобождённым объектам после этого загрузить в базу будет нельзя.',
+    schemaKeys: { path: false, configuration: true, recursive: true },
+  },
+  {
+    name: 'v8vscedit_update_database_configuration',
+    title: 'Обновить конфигурацию БД',
+    description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_execute_command с updateChangedConfigurations. Принимает канонический путь корня: Конфигурация или Расширение.',
+    schemaKeys: { path: false, configuration: true },
+  },
 ];
 
 suite('V8McpServer.registerTools — golden-каталог перед декомпозицией (характеризационный)', () => {
-  test('регистрирует ровно 61 прямой tool (без учёта registerAllAddTools)', () => {
+  test('регистрирует ровно 67 прямых tool (без учёта registerAllAddTools)', () => {
     const { tools } = registerAllTools(createBaselineServices());
     // registerAllAddTools добавляет ещё 45 root + 11 child = 56 tool-ов поверх
-    // этих 61 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
+    // этих 67 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
     // фиксируем именно прямые регистрации, чтобы дробление не потеряло и не
     // задвоило ни одну из них.
     assert.strictEqual(tools.size, EXPECTED_TOOLS.length + 56,
-      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (61 прямой + 56 add-tools)`);
+      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (67 прямых + 56 add-tools)`);
     for (const expected of EXPECTED_TOOLS) {
       assert.ok(tools.has(expected.name), `должен быть зарегистрирован tool "${expected.name}"`);
     }
   });
 
-  test('ровно 61 прямой tool описан в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
-    assert.strictEqual(EXPECTED_TOOLS.length, 61);
+  test('ровно 67 прямых tool описаны в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
+    assert.strictEqual(EXPECTED_TOOLS.length, 67);
     const uniqueNames = new Set(EXPECTED_TOOLS.map((tool) => tool.name));
     assert.strictEqual(uniqueNames.size, EXPECTED_TOOLS.length, 'имена tools в эталоне не должны повторяться');
   });
@@ -640,6 +679,28 @@ suite('V8McpServer.registerTools — golden-каталог перед деком
         `форма inputSchema "${expected.name}" (ключи + опциональность) разошлась с эталоном`);
     });
   }
+});
+
+suite('V8McpServer.registerTools — сверка каталога EXTENSION_MCP_TOOLS с фактической регистрацией', () => {
+  const registeredNames = (): string[] => [...registerAllTools(createBaselineServices()).tools.keys()].sort();
+  const catalogNames = (): string[] => EXTENSION_MCP_TOOLS.map((tool) => tool.name).sort();
+
+  test('прямая: каждый зарегистрированный инструмент описан в каталоге EXTENSION_MCP_TOOLS (в т.ч. 6 новых и 5 ролевых edit_role/list|add|remove|set_default_role(s))', () => {
+    const catalog = new Set(catalogNames());
+    const missing = registeredNames().filter((name) => !catalog.has(name));
+    assert.deepStrictEqual(missing, [], `зарегистрированы, но не описаны в каталоге для ИИ-агента: ${missing.join(', ')}`);
+  });
+
+  test('обратная: каждый инструмент каталога реально регистрируется (нет устаревших записей)', () => {
+    const registered = new Set(registeredNames());
+    const stale = catalogNames().filter((name) => !registered.has(name));
+    assert.deepStrictEqual(stale, [], `описаны в каталоге, но не зарегистрированы: ${stale.join(', ')}`);
+  });
+
+  test('имена в каталоге уникальны', () => {
+    const names = catalogNames();
+    assert.strictEqual(new Set(names).size, names.length);
+  });
 });
 
 // ─── 2. Инвариант единого post-mutation пути на репрезентативных доменах ───

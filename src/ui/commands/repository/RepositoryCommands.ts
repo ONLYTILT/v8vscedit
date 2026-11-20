@@ -4,11 +4,10 @@ import type { RepositoryTarget } from '../../../infra/repository/RepositoryServi
 import { REPOSITORY_DUMP_OUTPUT, repositoryReportOutputName } from '../../../infra/repository/RepositoryDesignerArgs';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
-import {
-  runRepositoryCliCommand,
-  runRepositoryCommitAction,
-  runRepositoryUnlockAction,
-} from './RepositoryCommandRunner';
+import { describeRepositoryActionSuccess, runRepositoryCliCommand } from './RepositoryCommandRunner';
+import { describeUnlockNotDone, runCommitChain, runUnlockChain } from './repositoryChains';
+import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
+import { planRepositoryCommit, type CommitLocalChangesChoice, type RepositoryCommitPlan } from './repositoryCommitFlow';
 import {
   buildAddUserOperation,
   buildBindOperation,
@@ -34,12 +33,11 @@ import { registerRepositoryLockCommand } from './RepositoryLockCommand';
 import { registerRepositoryUpdateCommand } from './RepositoryUpdateCommand';
 import {
   requireConnectedRootTarget,
-  requireRepositoryNode,
   requireRootTarget,
   resolveRepositoryNode,
   toCliServices,
 } from './repositoryNodeTargets';
-import { findChangedConfiguration, refreshRepositoryUi, runPostRepositorySync, updateTargetDatabase } from './repositoryPostSync';
+import { findChangedConfiguration, refreshRepositoryUi, runPostRepositorySync } from './repositoryPostSync';
 
 
 /**
@@ -178,10 +176,11 @@ export function registerRepositoryCommands(
     }),
 
     vscode.commands.registerCommand('v8vscedit.repository.unlock', async (node: NodeArg) => {
-      const repositoryNode = requireRepositoryNode(services, node);
-      if (!repositoryNode) {
+      const resolved = resolveRepositoryNode(services, node);
+      if (!resolved) {
         return;
       }
+      const { node: repositoryNode, target } = resolved;
 
       const recursive = await askRecursiveMode('Освобождение объектов', repositoryNode.label ?? 'выбранный узел');
       if (recursive === undefined) {
@@ -197,9 +196,25 @@ export function registerRepositoryCommands(
         return;
       }
 
-      const ok = await runWithConfigurationOperationLock(
-        () => runRepositoryUnlockAction(toCliServices(services), repositoryNode, recursive, force)
-      );
+      const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
+      const ok = await runWithConfigurationOperationLock(async () => {
+        try {
+          const result = await runUnlockChain(services, target, repositoryNode, { recursive, force }, dirtyFilesCount);
+          // Э24: освобождение чужого захвата — успех платформы без снятия; «освобождены» здесь было бы неправдой.
+          if (result.unlockedObjects.length === 0 && result.notUnlocked.length > 0) {
+            void vscode.window.showWarningMessage(describeUnlockNotDone(result.notUnlocked, result.lockedByOthers));
+          } else {
+            void vscode.window.showInformationMessage(
+              describeRepositoryActionSuccess('unlock', repositoryNode.label ?? target.displayName)
+            );
+          }
+          showRepositoryChainWarnings(result.warnings);
+          return true;
+        } catch (error) {
+          showRepositoryChainFailure(error);
+          return false;
+        }
+      });
       if (ok) {
         refreshRepositoryUi(services);
       }
@@ -215,8 +230,8 @@ export function registerRepositoryCommands(
       // Все вопросы пользователю — ДО замка (иначе открытая форма держала бы «операция уже
       // выполняется» для всех), а «обновить БД → поместить» — одна секция замка: помещается
       // ровно то, что загружено в базу, без вклинившейся между шагами операции.
-      const updateBeforeCommit = await confirmUpdateBeforeCommit(target, services);
-      if (updateBeforeCommit === undefined) {
+      const plan = await resolveCommitPlan(target, services);
+      if (plan === 'cancel') {
         return;
       }
 
@@ -235,10 +250,17 @@ export function registerRepositoryCommands(
       }
 
       const ok = await runWithConfigurationOperationLock(async () => {
-        if (updateBeforeCommit && !await updateTargetDatabase(target, services)) {
+        try {
+          const result = await runCommitChain(services, target, repositoryNode, formData, plan);
+          void vscode.window.showInformationMessage(
+            describeRepositoryActionSuccess('commit', repositoryNode.label ?? target.displayName)
+          );
+          showRepositoryChainWarnings(result.warnings);
+          return true;
+        } catch (error) {
+          showRepositoryChainFailure(error);
           return false;
         }
-        return runRepositoryCommitAction(toCliServices(services), repositoryNode, formData);
       });
       if (ok) {
         refreshRepositoryUi(services);
@@ -469,24 +491,34 @@ export function registerRepositoryCommands(
 }
 
 /**
- * Нужна ли загрузка локальных изменений в базу перед помещением: `false` — изменений нет,
- * `true` — пользователь согласился обновить, `undefined` — помещение отменено.
+ * План помещения по ответу на вопрос о незагруженных правках. Таблица решения одна
+ * (`planRepositoryCommit`): после ответа она сама скажет, что делать.
  */
-async function confirmUpdateBeforeCommit(
+async function resolveCommitPlan(
   target: RepositoryTarget,
   services: CommandServices
-): Promise<boolean | undefined> {
+): Promise<RepositoryCommitPlan | 'cancel'> {
   const changed = await findChangedConfiguration(services, target);
-  if (!changed) {
-    return false;
+  const dirtyFilesCount = changed?.changedFilesCount ?? 0;
+  const changedName = changed?.name ?? target.displayName;
+  let choice: CommitLocalChangesChoice | undefined;
+  for (;;) {
+    const plan = planRepositoryCommit({ dirtyFilesCount, choice });
+    if (plan !== 'ask') {
+      return plan;
+    }
+    choice = await promptUpdateBeforeCommit(changedName, dirtyFilesCount);
   }
+}
 
+/** Помещение без предварительной загрузки запрещено: помещается то, что в базе, а не в файлах. */
+async function promptUpdateBeforeCommit(name: string, dirtyFilesCount: number): Promise<CommitLocalChangesChoice> {
   const picked = await vscode.window.showQuickPick([
     {
       id: 'update',
       label: '$(sync) Обновить и продолжить',
       description: 'Сначала загрузить локальные изменения в базу, затем выполнить помещение',
-      detail: `${changed.name}: изменённых файлов ${String(changed.changedFilesCount)}`,
+      detail: `${name}: изменённых файлов ${String(dirtyFilesCount)}`,
     },
     {
       id: 'cancel',
@@ -499,5 +531,5 @@ async function confirmUpdateBeforeCommit(
     ignoreFocusOut: true,
   });
 
-  return picked?.id === 'update' ? true : undefined;
+  return picked?.id === 'update' ? 'load-first' : 'cancel';
 }

@@ -16,14 +16,33 @@ import {
  * отдельно от регистрации: вторая копия «decompile → clean → reload» не должна появиться.
  */
 
-export function refreshRepositoryUi(services: CommandServices): void {
+/**
+ * Сервисы, которые нужны цепочкам хранилища (`repositoryChains`): UI-команды и MCP-инструменты
+ * передают один и тот же `CommandServices`, а Pick держит зависимость цепочек узкой и явной.
+ */
+export type RepositoryChainServices = Pick<
+  CommandServices,
+  | 'workspaceFolder'
+  | 'outputChannel'
+  | 'repositoryService'
+  | 'projectSecretStorage'
+  | 'createDesignerExecutor'
+  | 'designerExecutorDeps'
+  | 'treeProvider'
+  | 'refreshActionsView'
+  | 'getChangedConfigurations'
+  | 'markConfigurationsClean'
+  | 'reloadEntries'
+>;
+
+export function refreshRepositoryUi(services: RepositoryChainServices): void {
   services.treeProvider.refresh();
   services.refreshActionsView();
 }
 
 /** Незагруженные правки цели — тот же источник, что у индикатора «конфигурация изменена». */
 export async function findChangedConfiguration(
-  services: CommandServices,
+  services: RepositoryChainServices,
   target: RepositoryTarget
 ): Promise<ChangedConfiguration | undefined> {
   const root = path.resolve(target.configRoot).toLowerCase();
@@ -31,7 +50,7 @@ export async function findChangedConfiguration(
 }
 
 /** Загрузка правок проекта в базу (`false` — сбой или отмена; ошибку уже показал раннер). */
-export async function updateTargetDatabase(target: RepositoryTarget, services: CommandServices): Promise<boolean> {
+export async function updateTargetDatabase(target: RepositoryTarget, services: RepositoryChainServices): Promise<boolean> {
   const updated = target.configKind === 'cfe'
     ? await runUpdateExtension(
         target.extensionName ?? target.displayName,
@@ -60,7 +79,7 @@ export async function updateTargetDatabase(target: RepositoryTarget, services: C
  * Импорт основной конфигурации базы в файлы проекта. Проект помечается чистым только при успехе:
  * иначе «Обновить БД» из устаревших файлов перезаписала бы полученные из хранилища версии.
  */
-export async function importTargetFromDatabase(target: RepositoryTarget, services: CommandServices): Promise<boolean> {
+export async function importTargetFromDatabase(target: RepositoryTarget, services: RepositoryChainServices): Promise<boolean> {
   const imported = target.configKind === 'cfe'
     ? await runDecompileExtension(
         target.extensionName ?? target.displayName,
@@ -85,7 +104,7 @@ export async function importTargetFromDatabase(target: RepositoryTarget, service
 }
 
 /** После подключения/создания хранилища: применить конфигурацию к БД и импортировать её в проект. */
-export async function runPostRepositorySync(target: RepositoryTarget, services: CommandServices): Promise<void> {
+export async function runPostRepositorySync(target: RepositoryTarget, services: RepositoryChainServices): Promise<void> {
   try {
     const updated = await runApplyDatabaseConfiguration({
       kind: target.configKind,

@@ -642,6 +642,12 @@ MCP-инструменты принимают только канон. Люба�
 | `v8vscedit_cfe_borrow` | Заимствует объект, форму или дочерний элемент из CF в CFE. | — (FS-аргументы) |
 | `v8vscedit_cfe_patch_method` | BSL-перехватчик &Перед/&После/&ИзменениеИКонтроль в CFE. | `Справочники.X.МодульОбъекта`, … |
 | `v8vscedit_cfe_diff` | Состав расширения и проверка переноса #Вставка. | — (`extensionPath` FS) |
+| `v8vscedit_repository_status` | Привязка, подключение, захваты (локальный учёт) и состояние узла; пароль не отдаётся. | `Конфигурация` / `Расширение` / любой узел (дочерний — во владельца) |
+| `v8vscedit_repository_lock` | Захват объекта(ов) в хранилище; рекурсивный захват корня — только с `confirm: true`. | как `repository_status` |
+| `v8vscedit_repository_update` | Получение из хранилища; захваченные объекты затирает только при `overwriteLocked: true`. | как `repository_status` |
+| `v8vscedit_repository_commit` | Помещение в хранилище; обязательны `comment` и `confirm: true`. | как `repository_status` |
+| `v8vscedit_repository_unlock` | Отмена захвата (чужой захват не снимается). | как `repository_status` |
+| `v8vscedit_update_database_configuration` | `/UpdateDBCfg`: применяет конфигурацию к БД; файлы проекта не загружает. | `Конфигурация` / `Расширение` (только корень) |
 | `v8vscedit_execute_command` | Allowlist команд расширения: `refresh`, `importConfigurations`, `updateChangedConfigurations`. | — |
 
 Несколько инструментов (`create_epf`/`create_erf`/`validate_external_object`/

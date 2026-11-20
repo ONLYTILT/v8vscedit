@@ -2,17 +2,16 @@ import * as vscode from 'vscode';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
-import { runRepositoryLockAction } from './RepositoryCommandRunner';
-import { resolveRepositoryNode, toCliServices, type RepositoryCommandNode } from './repositoryNodeTargets';
+import { describeRepositoryActionSuccess } from './RepositoryCommandRunner';
+import { runLockChain } from './repositoryChains';
+import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
+import { resolveRepositoryNode, type RepositoryCommandNode } from './repositoryNodeTargets';
 import {
-  describeImportFailureAfterLock,
-  describeProjectBehindAfterLock,
   planRepositoryLock,
-  shouldImportAfterLock,
   type LockLocalChangesChoice,
   type RepositoryLockPlan,
 } from './repositoryLockFlow';
-import { findChangedConfiguration, importTargetFromDatabase, refreshRepositoryUi, updateTargetDatabase } from './repositoryPostSync';
+import { findChangedConfiguration, refreshRepositoryUi } from './repositoryPostSync';
 import { askRecursiveMode } from './repositoryPrompts';
 
 /**
@@ -46,16 +45,21 @@ async function runLockCommand(services: CommandServices, node: NodeArg): Promise
   }
 
   const ok = await runWithConfigurationOperationLock(
-    () => runLockChain(services, target, repositoryNode, recursive, plan)
+    () => runLockChainWithUi(services, target, repositoryNode, recursive, plan)
   );
   if (ok === true) {
     refreshRepositoryUi(services);
   }
 }
 
+/** Настройка `-revised` захвата — одна точка чтения для UI-команды и MCP-инструмента. */
+export function readRevisedOnLockSetting(): boolean {
+  return vscode.workspace.getConfiguration('v8vscedit').get<boolean>('repository.getRevisedOnLock', true);
+}
+
 /** Вопрос задаётся ДО замка: ожидание ответа пользователя не должно держать базу занятой. */
 async function resolveLockPlan(services: CommandServices, target: RepositoryTarget): Promise<RepositoryLockPlan | 'cancel'> {
-  const revisedSetting = vscode.workspace.getConfiguration('v8vscedit').get<boolean>('repository.getRevisedOnLock', true);
+  const revisedSetting = readRevisedOnLockSetting();
   const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
   let choice: LockLocalChangesChoice | undefined;
   // Таблица решения одна: после ответа она сама скажет, что делать (при ответе 'ask' не возвращается).
@@ -102,28 +106,20 @@ async function promptLockWithLocalChanges(target: RepositoryTarget, dirtyFilesCo
 }
 
 /** Вся цепочка — одна секция замка: между захватом и импортом не должна вклиниться другая операция. */
-async function runLockChain(
+async function runLockChainWithUi(
   services: CommandServices,
   target: RepositoryTarget,
   node: RepositoryCommandNode,
   recursive: boolean,
   plan: RepositoryLockPlan
 ): Promise<boolean> {
-  // Сбой загрузки (в т.ч. отказ платформы загрузить незахваченный объект) — захвата не было.
-  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
+  try {
+    const result = await runLockChain(services, target, node, recursive, plan);
+    void vscode.window.showInformationMessage(describeRepositoryActionSuccess('lock', node.label ?? target.displayName));
+    showRepositoryChainWarnings(result.warnings);
+    return true;
+  } catch (error) {
+    showRepositoryChainFailure(error);
     return false;
   }
-  const outcome = await runRepositoryLockAction(toCliServices(services), node, recursive, { revised: plan.revised });
-  if (outcome === undefined) {
-    return false;
-  }
-  if (shouldImportAfterLock(plan, outcome)) {
-    if (!await importTargetFromDatabase(target, services)) {
-      // Без await (запрет №18): иначе замок держался бы до закрытия уведомления.
-      void vscode.window.showWarningMessage(describeImportFailureAfterLock(target.displayName));
-    }
-  } else if (!plan.importAfterLock && outcome.receivedFromRepository) {
-    void vscode.window.showWarningMessage(describeProjectBehindAfterLock(target.displayName));
-  }
-  return true;
 }

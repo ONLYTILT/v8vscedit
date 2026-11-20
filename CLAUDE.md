@@ -227,6 +227,8 @@ src/
 │   │                                  # McpConflictPrompt/McpHost — чистая логика жизненного цикла
 │   │                                  # встроенного MCP-сервера (bind/reuse/conflict, закрытие порта),
 │   │                                  # без vscode; см. docs/mcp-server-lifecycle.md
+│   ├── ai/                           # AiMcpToolCatalog.ts — ДАННЫЕ каталога MCP-инструментов (EXTENSION_MCP_TOOLS,
+│   │                                  # BSL_ANALYZER_MCP_TOOLS); AiMcpConfiguration.ts реэкспортирует
 │   └── skills/                       # AiSkillsInstaller — установка ИИ-навыков
 │
 ├── ui/                               # Всё, что знает про vscode API
@@ -513,6 +515,17 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   согласие на посев из проекта даёт только человек (хук `confirmMirrorSeed`, у MCP его нет). Порция
   SFTP — 31 КиБ, не 32 (лимит ssh2 для libssh-агента). Подробности —
   [architecture.md](./docs/architecture.md#модель-синхронизации-m--p--b).
+- **Новая операция хранилища в MCP** (захват/получение/помещение/освобождение и аналоги, см.
+  [architecture.md](./docs/architecture.md#операции-хранилища-как-mcp-инструменты)): цепочка шагов — в
+  `ui/commands/repository/repositoryChains.ts` (общая для UI и MCP, без тостов, `warnings` в результате) →
+  решение — `planRepository*` (чистые flow-модули), вопросы диалога UI становятся ЯВНЫМИ параметрами
+  инструмента БЕЗ значения по умолчанию (трансляция — `ui/mcp/registration/McpRepositoryDecisions.ts`);
+  необратимое/общее — `confirm: true`, `force` не открывать без замера платформы → ошибки платформы через
+  `RepositoryCliError` (`executeRepositoryCliCommand`), не через тост → результат — по строкам лога
+  (`RepositoryLockLog`), а не по `exitCode` → `gate.afterMutation` НЕ вызывать (файлы проекта меняет только
+  импорт, сам помечая чисто); после успеха `refreshRepositoryUi` → регистрация в
+  `ui/mcp/registration/McpRepositoryTools.ts` + запись в `EXTENSION_MCP_TOOLS`
+  (`infra/ai/AiMcpToolCatalog.ts`).
 - **Любой писатель файла выгрузки (и служебного кэша):** только через `infra/fs/AtomicFileWriter`
   (`writeFileAtomic`) либо `writeTextFilePreservingBomAndEol`, который делегирует туда. Собственный
   `fs.writeFileSync`/`rename` для файла выгрузки заводить нельзя — третьей копии temp+rename быть не
@@ -610,7 +623,7 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   освобождение ИБ делает сам раннер, а допустимость в remote-режиме решает
   `decideLocalDesignerInRemote` (`ui/commands/ext/agent/remoteLocalDesigner.ts`: файловая база и петлевой
   сервер — отказ до побочных эффектов). Перевод такой операции на удалённый исполнитель — отдельная
-  задача по схеме хранилища, а не «правка раннера». Путь к 1cv8 проходит единую проверку стартера (`infra/process/V8ExecutableGuard.ts`: локально `resolveV8ExecutablePath`, на сервере `assertServerDesignerExecutable` в `designerExecutorRegistry`) — третьей точки резолвинга не заводить; захват объектов хранилища — `ui/commands/repository/` (`repositoryLockFlow.ts`, `RepositoryLockCommand.ts`, `repositoryPostSync.ts`, `repositoryNodeTargets.ts`; см. architecture.md).
+  задача по схеме хранилища, а не «правка раннера». Путь к 1cv8 проходит единую проверку стартера (`infra/process/V8ExecutableGuard.ts`: локально `resolveV8ExecutablePath`, на сервере `assertServerDesignerExecutable` в `designerExecutorRegistry`) — третьей точки резолвинга не заводить; захват объектов хранилища — `ui/commands/repository/` (`repositoryLockFlow.ts`, `RepositoryLockCommand.ts`, `repositoryPostSync.ts`, `repositoryNodeTargets.ts`, `repositoryChains.ts` — цепочки, общие для UI и MCP, `repositoryCommitFlow.ts`, `repositoryChainUi.ts`, `repositoryStatusBar.ts`; MCP-часть — `ui/mcp/registration/McpRepositoryTools.ts` и `McpRepositoryDecisions.ts`; см. architecture.md).
 - **Открытие BSL-модулей:** только реальные `file://` документы (виртуальная схема `onec://` удалена). Readonly — через `ui/readonly/BslReadonlyGuard.ts`.
 - **Изменение жизненного цикла/безопасности встроенного MCP-сервера** (порт, идентичность процесса,
   graceful shutdown, Host/Origin, отличается от «новый MCP-инструмент» из раздела выше): чистая логика —

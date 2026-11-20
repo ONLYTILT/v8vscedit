@@ -2,18 +2,16 @@ import * as vscode from 'vscode';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
-import { runRepositoryUpdateAction } from './RepositoryCommandRunner';
+import { describeRepositoryActionSuccess } from './RepositoryCommandRunner';
+import { runUpdateChain } from './repositoryChains';
+import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
 import { normalizeUpdateVersion } from './repositoryOperationBuilders';
-import { resolveRepositoryNode, toCliServices, type RepositoryCommandNode } from './repositoryNodeTargets';
-import { findChangedConfiguration, importTargetFromDatabase, refreshRepositoryUi, updateTargetDatabase } from './repositoryPostSync';
+import { resolveRepositoryNode, type RepositoryCommandNode } from './repositoryNodeTargets';
+import { findChangedConfiguration, refreshRepositoryUi } from './repositoryPostSync';
 import { askRecursiveMode, pickBoolean } from './repositoryPrompts';
 import {
-  describeImportFailureAfterReceive,
-  describeLoadFailureAfterReceive,
   describeLockedOverwrite,
-  describeProjectBehindAfterReceive,
   planRepositoryUpdate,
-  shouldImportAfterReceive,
   type RepositoryUpdatePlan,
   type UpdateLocalChangesChoice,
 } from './repositoryUpdateFlow';
@@ -53,7 +51,7 @@ async function runUpdateCommand(services: CommandServices, node: NodeArg): Promi
   }
 
   const ok = await runWithConfigurationOperationLock(
-    () => runUpdateChain(services, target, repositoryNode, request, plan)
+    () => runUpdateChainWithUi(services, target, repositoryNode, request, plan)
   );
   if (ok === true) {
     refreshRepositoryUi(services);
@@ -169,29 +167,20 @@ async function promptUpdateWithLocalChanges(target: RepositoryTarget, dirtyFiles
  * Вся цепочка — одна секция замка: между получением, загрузкой и импортом не должна вклиниться другая
  * операция. Загрузка правок — после получения (Э24): загруженное до него получение затёрло бы.
  */
-async function runUpdateChain(
+async function runUpdateChainWithUi(
   services: CommandServices,
   target: RepositoryTarget,
   node: RepositoryCommandNode,
   request: UpdateRequest,
   plan: RepositoryUpdatePlan
 ): Promise<boolean> {
-  const outcome = await runRepositoryUpdateAction(toCliServices(services), node, request);
-  if (outcome === undefined) {
+  try {
+    const result = await runUpdateChain(services, target, node, request, plan);
+    void vscode.window.showInformationMessage(describeRepositoryActionSuccess('update', node.label ?? target.displayName));
+    showRepositoryChainWarnings(result.warnings);
+    return true;
+  } catch (error) {
+    showRepositoryChainFailure(error);
     return false;
   }
-  if (plan.loadChangesAfterReceive && !await updateTargetDatabase(target, services)) {
-    // Импорт перезаписал бы незагруженные правки проекта. Без await (запрет №18).
-    void vscode.window.showWarningMessage(describeLoadFailureAfterReceive(target.displayName));
-    return true;
-  }
-  if (shouldImportAfterReceive(plan, outcome)) {
-    if (!await importTargetFromDatabase(target, services)) {
-      // Без await (запрет №18): иначе замок держался бы до закрытия уведомления.
-      void vscode.window.showWarningMessage(describeImportFailureAfterReceive(target.displayName));
-    }
-  } else if (!plan.importAfterReceive && outcome.receivedFromRepository) {
-    void vscode.window.showWarningMessage(describeProjectBehindAfterReceive(target.displayName));
-  }
-  return true;
 }

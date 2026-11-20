@@ -18,11 +18,36 @@ import {
   buildRepositoryDesignerRequest,
   type RepositoryOperation,
 } from '../../../infra/repository/RepositoryDesignerArgs';
-import { hasReceivedFromRepository, resolveLockedFullNames } from '../../../infra/repository/RepositoryLockLog';
+import {
+  hasReceivedFromRepository,
+  hasReferencesCleaned,
+  isUnlockLogRecognized,
+  parseRepositoryLockLog,
+  resolveCommittedFullNames,
+  resolveLockedFullNames,
+  resolveUnlockedFullNames,
+  type LockedByOther,
+} from '../../../infra/repository/RepositoryLockLog';
 import type { RepositoryLockOutcome } from './repositoryLockFlow';
 import type { RepositoryUpdateOutcome } from './repositoryUpdateFlow';
+import type { RepositoryCommitOutcome } from './repositoryCommitFlow';
 import { releaseAgentInfoBaseForBatch } from '../ext/agent/AgentServiceRegistry';
 import { acquireDesignerBatchExecutor, type DesignerExecutorDeps } from '../ext/designerExecutorRegistry';
+import {
+  beginRepositoryOperationStatus,
+  endRepositoryOperationStatus,
+  trimStatusMessage,
+  updateRepositoryOperationStatus,
+} from './repositoryStatusBar';
+
+// Статус-бар вынесен ради размера раннера; прежние точки импорта (Container, тесты) сохраняются.
+export {
+  beginRepositoryOperationStatus,
+  disposeRepositoryCommandStatusBar,
+  endRepositoryOperationStatus,
+  setRepositoryOperationStatus,
+  updateRepositoryOperationStatus,
+} from './repositoryStatusBar';
 
 interface ConnectionParams {
   infoBasePath?: string;
@@ -35,7 +60,8 @@ interface ConnectionParams {
   v8Version?: string;
 }
 
-interface RepositoryCliRunOptions {
+/** Запуск операции хранилища без UI-сообщений: исход — результат или исключение. */
+export interface RepositoryCliExecuteOptions {
   operation: RepositoryOperation;
   target: RepositoryTarget;
   bindingOverride?: RepositoryBinding;
@@ -43,19 +69,49 @@ interface RepositoryCliRunOptions {
   output?: { name: string; targetPath: string };
   progressTitle: string;
   progressStartMessage: string;
-  successMessage: string;
   errorTitle: string;
   failureOperation?: string;
-  showSuccessMessage?: boolean;
   /** Получает результат запуска: по логу платформы уточняется, что именно сделано (Н10). */
   afterSuccess?: (result: DesignerBatchResult) => void | Promise<void>;
+  /**
+   * Получает результат отказа платформы (exit≠0) до исключения: отказ бывает частичным, и сделанное
+   * по логу (освобождение части объектов, Э24) должно попасть в учёт.
+   */
+  afterPlatformFailure?: (result: DesignerBatchResult) => void;
 }
 
-let statusBarItem: vscode.StatusBarItem | undefined;
-let clearStatusTimer: NodeJS.Timeout | undefined;
-// Счётчик активных операций хранилища: параллельные операции делят один статус-бар,
-// поэтому скрывать его по таймеру можно только когда завершилась последняя (count → 0).
-let activeOperationCount = 0;
+interface RepositoryCliRunOptions extends RepositoryCliExecuteOptions {
+  successMessage: string;
+  showSuccessMessage?: boolean;
+}
+
+/**
+ * Отказ операции хранилища после её запуска (платформа, агент, выходной файл). `title` — заголовок
+ * для человека, `message` — «Ошибка при <операции>: <причина>»: тот же текст, что UI показывал всегда.
+ */
+export class RepositoryCliError extends Error {
+  constructor(
+    readonly title: string,
+    message: string,
+    readonly log?: string,
+    readonly exitCode?: number
+  ) {
+    super(message);
+    this.name = 'RepositoryCliError';
+  }
+}
+
+/** Операция прервана пользователем («Отмена» прогресса). Это не отказ платформы: её решение — человека. */
+export class RepositoryCliInterruptedError extends Error {
+  constructor(
+    /** Заголовок прогресса операции: UI показывает «<заголовок>: <текст прерывания>». */
+    readonly title: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'RepositoryCliInterruptedError';
+  }
+}
 
 export interface RepositoryCliServices {
   workspaceFolder: vscode.WorkspaceFolder;
@@ -77,13 +133,17 @@ interface ResolvedExecutor {
   readonly connection: ConnectionParams;
 }
 
+interface PreparedRepositoryRun extends ResolvedExecutor {
+  readonly binding: RepositoryBinding;
+}
+
+/** Подключение из env.json: путь к 1cv8 вычислен всегда (пустая строка — искать стандартную установку). */
+type ResolvedConnection = ConnectionParams & { v8Path: string };
+
 /**
  * Исполнитель и путь к 1cv8. Ошибки конфигурации (env.json, удалённый режим) бросаются здесь,
  * ДО начала операции: статус не включается, на сервер ничего не уходит.
  */
-/** Подключение из env.json: путь к 1cv8 вычислен всегда (пустая строка — искать стандартную установку). */
-type ResolvedConnection = ConnectionParams & { v8Path: string };
-
 async function resolveExecutor(connection: ResolvedConnection, services: RepositoryCliServices): Promise<ResolvedExecutor> {
   if (services.createDesignerExecutor) {
     const v8Path = resolveV8ExecutablePath(connection.v8Path);
@@ -103,10 +163,11 @@ async function resolveExecutor(connection: ResolvedConnection, services: Reposit
   return { executor: lease.executor, v8Path: lease.v8Path, connection: effective };
 }
 
-export async function runRepositoryCliCommand(
-  options: RepositoryCliRunOptions,
+/** Всё, что проверяется до запуска: здесь ошибки — обычные `Error`, исполнитель ещё не занят. */
+async function prepareRepositoryRun(
+  options: RepositoryCliExecuteOptions,
   services: RepositoryCliServices
-): Promise<boolean> {
+): Promise<PreparedRepositoryRun> {
   const connection = await resolveDatabaseConnection(
     services.repositoryService.getEnvJsonPath(),
     services.projectSecretStorage
@@ -116,16 +177,27 @@ export async function runRepositoryCliCommand(
   if (!binding) {
     throw new Error(`Для "${options.target.displayName}" не настроено подключение к хранилищу в env.json.`);
   }
+  return { ...await resolveExecutor(connection, services), binding };
+}
 
-  const { executor, v8Path, connection: effectiveConnection } = await resolveExecutor(connection, services);
-
+/**
+ * Сам запуск: статус-бар, прогресс с «Отмена», лог, перенос выходного файла. Любой сбой после старта —
+ * `RepositoryCliError` (заголовок операции сохраняется для UI), прерывание — `RepositoryCliInterruptedError`.
+ * Исполнитель освобождается всегда: не забранный staging (сбой/отмена) не должен пережить операцию.
+ */
+async function launchRepositoryRun(
+  prepared: PreparedRepositoryRun,
+  options: RepositoryCliExecuteOptions,
+  services: RepositoryCliServices
+): Promise<DesignerBatchResult> {
+  const { executor, v8Path, connection, binding } = prepared;
   beginRepositoryOperationStatus(options.progressTitle, options.progressStartMessage);
 
   try {
     // Пакетный Конфигуратор не войдёт в базу, пока её держит агент: отпускаем до запуска,
-    // а сбой отключения — отказ операции (ошибка показывается, исполнитель освобождается в finally).
+    // а сбой отключения — отказ операции.
     await releaseAgentInfoBaseForBatch(services.workspaceFolder, services.outputChannel);
-    const request = buildRepositoryDesignerRequest(effectiveConnection, binding, options.operation, options.target.extensionName);
+    const request = buildRepositoryDesignerRequest(connection, binding, options.operation, options.target.extensionName);
     // Секреты (пароли базы, хранилища и пользователя операции) маскируются ЗНАЧЕНИЯМИ —
     // это точнее правил по ключам и не зависит от формы записи.
     const commandAsText = formatCommandLineForLog(v8Path, describeDesignerArgs(request.args), request.secrets);
@@ -158,8 +230,7 @@ export async function runRepositoryCliCommand(
     if (result.interrupted) {
       services.outputChannel.appendLine(`[repository] ${result.interrupted}`);
       endRepositoryOperationStatus(options.progressTitle, 'прервано');
-      void vscode.window.showInformationMessage(`${options.progressTitle}: ${result.interrupted}`);
-      return false;
+      throw new RepositoryCliInterruptedError(options.progressTitle, result.interrupted);
     }
 
     if (result.log) {
@@ -167,14 +238,15 @@ export async function runRepositoryCliCommand(
     }
     const operation = options.failureOperation ?? options.progressTitle.toLowerCase();
     if (result.exitCode !== 0) {
+      options.afterPlatformFailure?.(result);
       const reason = extractFailureReason([...outputLines, result.log], result.exitCode);
-      throw new Error(`Ошибка при ${operation}: ${reason}`);
+      throw new RepositoryCliError(options.errorTitle, `Ошибка при ${operation}: ${reason}`, result.log, result.exitCode);
     }
 
     if (options.output) {
       const staged = result.outputs.get(options.output.name);
       if (!staged) {
-        throw new Error(`Ошибка при ${operation}: конфигуратор не создал выходной файл.`);
+        throw new RepositoryCliError(options.errorTitle, `Ошибка при ${operation}: конфигуратор не создал выходной файл.`, result.log, result.exitCode);
       }
       moveStagingToTarget(staged, options.output.targetPath);
     }
@@ -185,22 +257,68 @@ export async function runRepositoryCliCommand(
 
     services.outputChannel.appendLine(`[repository] Завершено: ${commandAsText}`);
     endRepositoryOperationStatus(options.progressTitle, 'завершено');
-    if (options.showSuccessMessage !== false) {
-      void vscode.window.showInformationMessage(options.successMessage);
-    }
-    return true;
+    return result;
   } catch (error) {
+    if (error instanceof RepositoryCliInterruptedError) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     services.outputChannel.appendLine(`[repository][error] ${message}`);
     endRepositoryOperationStatus(options.progressTitle, 'ошибка');
-    // Без await (запрет №18): раннер выполняется внутри секции общего замка, и открытая
-    // нотификация держала бы «операция уже выполняется» до её закрытия.
-    void vscode.window.showErrorMessage(`${options.errorTitle}\n${message}`);
-    return false;
+    throw error instanceof RepositoryCliError ? error : new RepositoryCliError(options.errorTitle, message);
   } finally {
-    // Не забранный staging (сбой/отмена) не должен пережить операцию.
     await executor.dispose();
   }
+}
+
+/**
+ * Операция хранилища без UI-сообщений — для MCP и цепочек (`repositoryChains`): тостов нет, исход —
+ * результат запуска или исключение. Ошибки конфигурации до запуска — обычный `Error`.
+ */
+export async function executeRepositoryCliCommand(
+  options: RepositoryCliExecuteOptions,
+  services: RepositoryCliServices
+): Promise<DesignerBatchResult> {
+  const prepared = await prepareRepositoryRun(options, services);
+  return launchRepositoryRun(prepared, options, services);
+}
+
+/**
+ * UI-обёртка: сбой после запуска показывается уведомлением и даёт `false`; ошибки конфигурации до
+ * запуска, как и прежде, бросаются вызывающему.
+ */
+export async function runRepositoryCliCommand(
+  options: RepositoryCliRunOptions,
+  services: RepositoryCliServices
+): Promise<boolean> {
+  const prepared = await prepareRepositoryRun(options, services);
+  try {
+    await launchRepositoryRun(prepared, options, services);
+  } catch (error) {
+    showRepositoryCliFailure(error);
+    return false;
+  }
+  if (options.showSuccessMessage !== false) {
+    void vscode.window.showInformationMessage(options.successMessage);
+  }
+  return true;
+}
+
+/**
+ * Уведомление о сбое операции хранилища, запущенной под замком. Без await (запрет №18): открытая
+ * нотификация держала бы «операция уже выполняется» до её закрытия. Чужие ошибки (не операции
+ * хранилища) пробрасываются: их показ — забота вызывающего, как было до разделения раннера.
+ */
+export function showRepositoryCliFailure(error: unknown): void {
+  if (error instanceof RepositoryCliInterruptedError) {
+    void vscode.window.showInformationMessage(`${error.title}: ${error.message}`);
+    return;
+  }
+  if (error instanceof RepositoryCliError) {
+    void vscode.window.showErrorMessage(`${error.title}\n${error.message}`);
+    return;
+  }
+  throw error;
 }
 
 export function resolveRepositoryTarget(
@@ -213,6 +331,73 @@ export function resolveRepositoryTarget(
   return repositoryService.resolveTargetByXmlPath(node.xmlPath);
 }
 
+export type RepositoryActionKind = 'lock' | 'unlock' | 'commit' | 'update';
+
+/** Сообщение об успехе операции узла — одно для раннера и UI-команд, вызывающих цепочки. */
+export function describeRepositoryActionSuccess(kind: RepositoryActionKind, label: string): string {
+  switch (kind) {
+    case 'lock':
+      return `Объекты "${label}" захвачены.`;
+    case 'unlock':
+      return `Объекты "${label}" освобождены.`;
+    case 'commit':
+      return `Изменения "${label}" помещены в хранилище.`;
+    case 'update':
+      return `Объекты "${label}" обновлены из хранилища.`;
+  }
+}
+
+/** Действие узла: параметры запуска и исход, который заполняет `afterSuccess` по логу. */
+interface RepositoryNodeAction<T> {
+  readonly options: RepositoryCliRunOptions;
+  readonly outcome: () => T;
+}
+
+async function executeNodeAction<T>(action: RepositoryNodeAction<T>, services: RepositoryCliServices): Promise<T> {
+  await executeRepositoryCliCommand(action.options, services);
+  return action.outcome();
+}
+
+async function runNodeAction<T>(action: RepositoryNodeAction<T>, services: RepositoryCliServices): Promise<T | undefined> {
+  return await runRepositoryCliCommand(action.options, services) ? action.outcome() : undefined;
+}
+
+function nodeLabel(node: RepositoryNodeRef, target: RepositoryTarget): string {
+  return node.label ?? target.displayName;
+}
+
+function lockAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  recursive: boolean,
+  options: { readonly revised: boolean }
+): RepositoryNodeAction<RepositoryLockOutcome> {
+  const target = requireTarget(services.repositoryService, node);
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
+  const label = nodeLabel(node, target);
+  let outcome: RepositoryLockOutcome | undefined;
+  return {
+    options: {
+      operation: { kind: 'lock', objectsXml: objects.xml, revised: options.revised },
+      target,
+      progressTitle: `Захват: ${label}`,
+      progressStartMessage: options.revised
+        ? 'Захватываю объекты и получаю их версии из хранилища...'
+        : 'Получаю объекты из хранилища для редактирования...',
+      successMessage: describeRepositoryActionSuccess('lock', label),
+      errorTitle: `Ошибка захвата объектов "${label}".`,
+      failureOperation: 'захвате объектов хранилища',
+      // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
+      afterSuccess: (result) => {
+        const lockedFullNames = resolveLockedFullNames(objects.fullNames, result.log);
+        services.repositoryService.setLocked(target, lockedFullNames, true);
+        outcome = { lockedFullNames, receivedFromRepository: hasReceivedFromRepository(result.log) };
+      },
+    },
+    outcome: () => requireOutcome(outcome),
+  };
+}
+
 /**
  * Захват объектов. Результат — что захвачено и получила ли база новые версии (по логу): по нему
  * команда решает, нужен ли импорт в проект. `undefined` — захват не выполнен (ошибку показал раннер).
@@ -223,27 +408,70 @@ export async function runRepositoryLockAction(
   recursive: boolean,
   options: { readonly revised: boolean }
 ): Promise<RepositoryLockOutcome | undefined> {
+  return runNodeAction(lockAction(services, node, recursive, options), services);
+}
+
+/** Захват без UI-сообщений: сбой — исключение (`RepositoryCliError`/`RepositoryCliInterruptedError`). */
+export async function executeRepositoryLockAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  recursive: boolean,
+  options: { readonly revised: boolean }
+): Promise<RepositoryLockOutcome> {
+  return executeNodeAction(lockAction(services, node, recursive, options), services);
+}
+
+export interface RepositoryUnlockOutcome {
+  /** Снятые с учёта объекты — по строкам «Захват объекта отменен», в том числе вне запрошенных. */
+  readonly unlocked: string[];
+  readonly lockedByOthers: LockedByOther[];
+  /** Запрошенные объекты, захват которых не отменён (чужой захват, отказ платформы по объекту). */
+  readonly notUnlocked: string[];
+}
+
+function unlockAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  recursive: boolean,
+  force: boolean
+): RepositoryNodeAction<RepositoryUnlockOutcome> {
   const target = requireTarget(services.repositoryService, node);
   const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
-  let outcome: RepositoryLockOutcome | undefined;
-  const ok = await runRepositoryCliCommand({
-    operation: { kind: 'lock', objectsXml: objects.xml, revised: options.revised },
-    target,
-    progressTitle: `Захват: ${node.label ?? target.displayName}`,
-    progressStartMessage: options.revised
-      ? 'Захватываю объекты и получаю их версии из хранилища...'
-      : 'Получаю объекты из хранилища для редактирования...',
-    successMessage: `Объекты "${node.label ?? target.displayName}" захвачены.`,
-    errorTitle: `Ошибка захвата объектов "${node.label ?? target.displayName}".`,
-    failureOperation: 'захвате объектов хранилища',
-    // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
-    afterSuccess: (result) => {
-      const lockedFullNames = resolveLockedFullNames(objects.fullNames, result.log);
-      services.repositoryService.setLocked(target, lockedFullNames, true);
-      outcome = { lockedFullNames, receivedFromRepository: hasReceivedFromRepository(result.log) };
+  const label = nodeLabel(node, target);
+  let outcome: RepositoryUnlockOutcome | undefined;
+  // Э24: освобождение чужого захвата — exit 0 без снятия, поэтому учёт снимается по строкам лога.
+  const applyLog = (log: string): RepositoryUnlockOutcome => {
+    const unlocked = resolveUnlockedFullNames(objects.fullNames, log);
+    services.repositoryService.setLocked(target, unlocked, false);
+    const unlockedKeys = new Set(unlocked.map((name) => name.toLocaleLowerCase('ru')));
+    return {
+      unlocked,
+      lockedByOthers: parseRepositoryLockLog(log).lockedByOthers,
+      notUnlocked: objects.fullNames.filter((name) => !unlockedKeys.has(name.toLocaleLowerCase('ru'))),
+    };
+  };
+  return {
+    options: {
+      operation: { kind: 'unlock', objectsXml: objects.xml, force },
+      target,
+      progressTitle: `Освобождение: ${label}`,
+      progressStartMessage: 'Отменяю захват объектов...',
+      successMessage: describeRepositoryActionSuccess('unlock', label),
+      errorTitle: `Ошибка освобождения объектов "${label}".`,
+      failureOperation: 'освобождении объектов хранилища',
+      afterSuccess: (result) => {
+        outcome = applyLog(result.log);
+      },
+      // Отказ бывает частичным: отпущенное до него платформа называет в логе. Нераспознанный лог
+      // ничего не подтверждает — учёт не трогается.
+      afterPlatformFailure: (result) => {
+        if (isUnlockLogRecognized(result.log)) {
+          applyLog(result.log);
+        }
+      },
     },
-  }, services);
-  return ok ? outcome : undefined;
+    outcome: () => requireOutcome(outcome),
+  };
 }
 
 export async function runRepositoryUnlockAction(
@@ -252,54 +480,111 @@ export async function runRepositoryUnlockAction(
   recursive: boolean,
   force: boolean
 ): Promise<boolean> {
+  return await runNodeAction(unlockAction(services, node, recursive, force), services) !== undefined;
+}
+
+export async function executeRepositoryUnlockAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  recursive: boolean,
+  force: boolean
+): Promise<RepositoryUnlockOutcome> {
+  return executeNodeAction(unlockAction(services, node, recursive, force), services);
+}
+
+interface RepositoryCommitRequest {
+  recursive: boolean;
+  comment: string;
+  keepLocked: boolean;
+  force: boolean;
+}
+
+function commitAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  options: RepositoryCommitRequest
+): RepositoryNodeAction<RepositoryCommitOutcome> {
   const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
-  return runRepositoryCliCommand({
-    operation: { kind: 'unlock', objectsXml: objects.xml, force },
-    target,
-    progressTitle: `Освобождение: ${node.label ?? target.displayName}`,
-    progressStartMessage: 'Отменяю захват объектов...',
-    successMessage: `Объекты "${node.label ?? target.displayName}" освобождены.`,
-    errorTitle: `Ошибка освобождения объектов "${node.label ?? target.displayName}".`,
-    failureOperation: 'освобождении объектов хранилища',
-    afterSuccess: () => {
-      services.repositoryService.setLocked(target, objects.fullNames, false);
+  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
+  const label = nodeLabel(node, target);
+  let outcome: RepositoryCommitOutcome | undefined;
+  return {
+    options: {
+      operation: {
+        kind: 'commit',
+        objectsXml: objects.xml,
+        comment: options.comment,
+        keepLocked: options.keepLocked,
+        force: options.force,
+      },
+      target,
+      progressTitle: `Помещение: ${label}`,
+      progressStartMessage: 'Помещаю изменения в хранилище...',
+      successMessage: describeRepositoryActionSuccess('commit', label),
+      errorTitle: `Ошибка помещения "${label}" в хранилище.`,
+      failureOperation: 'помещении изменений в хранилище',
+      afterSuccess: (result) => {
+        // Э25: снятие захвата после помещения в лог не пишется — учёт снимается у запрошенных.
+        if (!options.keepLocked) {
+          services.repositoryService.setLocked(target, objects.fullNames, false);
+        }
+        outcome = {
+          committedFullNames: resolveCommittedFullNames(objects.fullNames, result.log),
+          referencesCleaned: hasReferencesCleaned(result.log),
+        };
+      },
     },
-  }, services);
+    outcome: () => requireOutcome(outcome),
+  };
 }
 
 export async function runRepositoryCommitAction(
   services: RepositoryCliServices,
   node: RepositoryNodeRef,
-  options: {
-    recursive: boolean;
-    comment: string;
-    keepLocked: boolean;
-    force: boolean;
-  }
+  options: RepositoryCommitRequest
 ): Promise<boolean> {
+  return await runNodeAction(commitAction(services, node, options), services) !== undefined;
+}
+
+export async function executeRepositoryCommitAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  options: RepositoryCommitRequest
+): Promise<RepositoryCommitOutcome> {
+  return executeNodeAction(commitAction(services, node, options), services);
+}
+
+interface RepositoryUpdateRequest {
+  recursive: boolean;
+  force: boolean;
+  version?: string;
+}
+
+function updateAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  options: RepositoryUpdateRequest
+): RepositoryNodeAction<RepositoryUpdateOutcome> {
   const target = requireTarget(services.repositoryService, node);
   const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
-  return runRepositoryCliCommand({
-    operation: {
-      kind: 'commit',
-      objectsXml: objects.xml,
-      comment: options.comment,
-      keepLocked: options.keepLocked,
-      force: options.force,
+  const label = nodeLabel(node, target);
+  let outcome: RepositoryUpdateOutcome | undefined;
+  return {
+    options: {
+      operation: { kind: 'update', objectsXml: objects.xml, version: options.version, force: options.force },
+      target,
+      progressTitle: `Получение: ${label}`,
+      progressStartMessage: 'Получаю изменения из хранилища...',
+      successMessage: describeRepositoryActionSuccess('update', label),
+      errorTitle: `Ошибка получения "${label}" из хранилища.`,
+      failureOperation: 'получении изменений из хранилища',
+      // Формат лога тот же, что у захвата: строки «Объект получен из хранилища».
+      afterSuccess: (result) => {
+        outcome = { receivedFromRepository: hasReceivedFromRepository(result.log) };
+      },
     },
-    target,
-    progressTitle: `Помещение: ${node.label ?? target.displayName}`,
-    progressStartMessage: 'Помещаю изменения в хранилище...',
-    successMessage: `Изменения "${node.label ?? target.displayName}" помещены в хранилище.`,
-    errorTitle: `Ошибка помещения "${node.label ?? target.displayName}" в хранилище.`,
-    failureOperation: 'помещении изменений в хранилище',
-    afterSuccess: () => {
-      if (!options.keepLocked) {
-        services.repositoryService.setLocked(target, objects.fullNames, false);
-      }
-    },
-  }, services);
+    outcome: () => requireOutcome(outcome),
+  };
 }
 
 /**
@@ -309,29 +594,26 @@ export async function runRepositoryCommitAction(
 export async function runRepositoryUpdateAction(
   services: RepositoryCliServices,
   node: RepositoryNodeRef,
-  options: {
-    recursive: boolean;
-    force: boolean;
-    version?: string;
-  }
+  options: RepositoryUpdateRequest
 ): Promise<RepositoryUpdateOutcome | undefined> {
-  const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
-  let outcome: RepositoryUpdateOutcome | undefined;
-  const ok = await runRepositoryCliCommand({
-    operation: { kind: 'update', objectsXml: objects.xml, version: options.version, force: options.force },
-    target,
-    progressTitle: `Получение: ${node.label ?? target.displayName}`,
-    progressStartMessage: 'Получаю изменения из хранилища...',
-    successMessage: `Объекты "${node.label ?? target.displayName}" обновлены из хранилища.`,
-    errorTitle: `Ошибка получения "${node.label ?? target.displayName}" из хранилища.`,
-    failureOperation: 'получении изменений из хранилища',
-    // Формат лога тот же, что у захвата: строки «Объект получен из хранилища».
-    afterSuccess: (result) => {
-      outcome = { receivedFromRepository: hasReceivedFromRepository(result.log) };
-    },
-  }, services);
-  return ok ? outcome : undefined;
+  return runNodeAction(updateAction(services, node, options), services);
+}
+
+export async function executeRepositoryUpdateAction(
+  services: RepositoryCliServices,
+  node: RepositoryNodeRef,
+  options: RepositoryUpdateRequest
+): Promise<RepositoryUpdateOutcome> {
+  return executeNodeAction(updateAction(services, node, options), services);
+}
+
+/** Исход заполняет `afterSuccess`; успешный запуск без него означал бы ошибку в коде раннера. */
+function requireOutcome<T>(outcome: T | undefined): T {
+  /* c8 ignore next 3 -- защитная ветка: успешный запуск всегда вызывает afterSuccess */
+  if (outcome === undefined) {
+    throw new Error('Исход операции хранилища не получен.');
+  }
+  return outcome;
 }
 
 function requireTarget(repositoryService: RepositoryService, node: RepositoryNodeRef): RepositoryTarget {
@@ -399,14 +681,6 @@ function resolveV8PathFromSettings(defaults: Record<string, unknown>): string {
   return asString(defaults['--path']) ?? resolveV8PathHintFromVersion(asString(defaults['--v8version']) ?? '');
 }
 
-function trimStatusMessage(text: string): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim();
-  if (oneLine.length <= 80) {
-    return oneLine;
-  }
-  return `${oneLine.slice(0, 77)}...`;
-}
-
 function extractFailureReason(details: string[], exitCode: number): string {
   const lines = details
     .map((item) => item.replace(/\r/g, '').trim())
@@ -430,93 +704,4 @@ function extractFailureReason(details: string[], exitCode: number): string {
     return true;
   });
   return filtered.at(-1) ?? lines.at(-1) ?? `команда завершилась с кодом ${String(exitCode)}`;
-}
-
-/**
- * Компат-обёртка: `running=true` — граница старта операции (begin), `running=false` —
- * терминал (end). Промежуточные обновления текста прогресса должны идти через
- * {@link updateRepositoryOperationStatus}, иначе счётчик активных операций растёт на
- * каждом прогресс-сообщении и статус-бар перестаёт скрываться (регресс M9).
- */
-export function setRepositoryOperationStatus(title: string, message: string, running: boolean): void {
-  if (running) {
-    beginRepositoryOperationStatus(title, message);
-  } else {
-    endRepositoryOperationStatus(title, message);
-  }
-}
-
-/** Начало операции хранилища: инкремент счётчика + спиннер-текст. */
-export function beginRepositoryOperationStatus(title: string, message: string): void {
-  ensureRepositoryStatusItem();
-  cancelRepositoryHideTimer();
-  activeOperationCount++;
-  showRepositorySpinnerStatus(title, message);
-}
-
-/** Обновление текста прогресса без изменения счётчика активных операций. */
-export function updateRepositoryOperationStatus(title: string, message: string): void {
-  ensureRepositoryStatusItem();
-  cancelRepositoryHideTimer();
-  showRepositorySpinnerStatus(title, message);
-}
-
-/** Терминал операции хранилища: декремент счётчика; при нуле — таймер скрытия. */
-export function endRepositoryOperationStatus(title: string, message: string): void {
-  ensureRepositoryStatusItem();
-  cancelRepositoryHideTimer();
-  activeOperationCount = Math.max(0, activeOperationCount - 1);
-
-  const text = `${title}: ${message}`;
-  if (statusBarItem) {
-    statusBarItem.text = `$(check) ${trimStatusMessage(text)}`;
-    statusBarItem.tooltip = text;
-    statusBarItem.show();
-  }
-
-  // Скрываем статус только когда завершилась последняя активная операция хранилища.
-  if (activeOperationCount === 0) {
-    clearStatusTimer = setTimeout(() => {
-      statusBarItem?.hide();
-      clearStatusTimer = undefined;
-    }, 5_000);
-  }
-}
-
-function ensureRepositoryStatusItem(): void {
-  if (!statusBarItem) {
-    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 95);
-    statusBarItem.name = '1С: хранилище конфигурации';
-  }
-}
-
-function cancelRepositoryHideTimer(): void {
-  if (clearStatusTimer) {
-    clearTimeout(clearStatusTimer);
-    clearStatusTimer = undefined;
-  }
-}
-
-function showRepositorySpinnerStatus(title: string, message: string): void {
-  const text = `${title}: ${message}`;
-  if (statusBarItem) {
-    statusBarItem.text = `$(sync~spin) ${trimStatusMessage(text)}`;
-    statusBarItem.tooltip = text;
-    statusBarItem.show();
-  }
-}
-
-/**
- * Освобождает лениво созданный статус-бар хранилища на остановке расширения.
- * Статус-бар не попадает в context.subscriptions, поэтому его нужно диспозить явно
- * (симметрично disposeCachedAgentOperationServices для ExtensionCommandRunner).
- */
-export function disposeRepositoryCommandStatusBar(): void {
-  if (clearStatusTimer) {
-    clearTimeout(clearStatusTimer);
-    clearStatusTimer = undefined;
-  }
-  statusBarItem?.dispose();
-  statusBarItem = undefined;
-  activeOperationCount = 0;
 }

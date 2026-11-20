@@ -11,6 +11,7 @@
  * Разбор узла расширения не дублируется: используется тот же
  * `extractExtensionTarget`, которым пользуются остальные команды расширений.
  */
+import * as path from 'path';
 import { resolveConfigDir } from '../../../infra/fs/ProjectLayout';
 import type { ConfigTarget } from '../../../infra/fs/ProjectLayout';
 import type { NodeArg } from '../_shared';
@@ -59,4 +60,24 @@ export function buildCfApplyTarget(
     };
   }
   return { kind: 'cf', name: 'Основная конфигурация', rootPath: resolveConfigDir(workspaceRoot, 'cf') };
+}
+
+/**
+ * Цель `/UpdateDBCfg` по корневому узлу дерева; `undefined` — узел не корень конфигурации/расширения.
+ *
+ * В отличие от `buildCfApplyTarget`, корень берётся из РЕАЛЬНОГО `Configuration.xml` узла, а не
+ * выводится из раскладки `src/cf`: `rootPath` участвует в резолвинге подключения, и проект с
+ * нестандартной раскладкой иначе применил бы изменения к базе с чужими параметрами.
+ */
+export function resolveApplyTargetFromNode(
+  node: NodeArg | undefined
+): { kind: ConfigTarget; name: string; rootPath: string; extensionName?: string } | undefined {
+  const target = resolveCfFileTargetFromNode(node);
+  if (!target || !node?.xmlPath) {
+    return undefined;
+  }
+  const rootPath = path.dirname(node.xmlPath);
+  return target.kind === 'extension'
+    ? { kind: 'cfe', name: target.extensionName, rootPath, extensionName: target.extensionName }
+    : { kind: 'cf', name: 'Основная конфигурация', rootPath };
 }

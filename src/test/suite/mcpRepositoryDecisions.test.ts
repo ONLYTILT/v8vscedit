@@ -1,0 +1,240 @@
+import * as assert from 'assert';
+import * as vscode from 'vscode';
+import { describeLockedOverwrite } from '../../ui/commands/repository/repositoryUpdateFlow';
+import {
+  assertCommitArgs,
+  assertRootRecursiveLockConfirmed,
+  resolveMcpCommitPlan,
+  resolveMcpLockPlan,
+  resolveMcpUpdatePlan,
+  toRepositoryNodeRef,
+  type McpCommitLocalChanges,
+  type McpLockLocalChanges,
+  type McpUpdateLocalChanges,
+} from '../../ui/mcp/registration/McpRepositoryDecisions';
+import { MetadataNode } from '../../ui/tree/TreeNode';
+
+/**
+ * Чистые решения MCP-инструментов хранилища (`ui/mcp/registration/McpRepositoryDecisions.ts`):
+ * enum агента → ответы планировщиков `planRepository*`; `resolveMcp*Plan` БРОСАЮТ Error вместо
+ * 'ask'/'cancel' (агент не видит диалогов — вопрос диалога превращается в явный параметр).
+ */
+
+const CONFIRM_ROOT =
+  'Рекурсивный захват корня захватывает всю конфигурацию и блокирует её для всей команды. Передайте confirm: true.';
+const CONFIRM_COMMIT = 'Помещение необратимо записывает версию в общее хранилище команды. Передайте confirm: true.';
+const EMPTY_COMMENT = 'Для помещения требуется непустой комментарий (comment).';
+const OVERWRITE_FALSE = 'Получение не выполнено: в выборке есть захваченные вами объекты (overwriteLocked: false).';
+const OVERWRITE_HINT = ' Передайте overwriteLocked: true, чтобы подтвердить, или сначала поместите правки (v8vscedit_repository_commit).';
+
+const names = (count: number): string[] => Array.from({ length: count }, (_, i) => `Справочник.Объект${String(i + 1)}`);
+
+suite('McpRepositoryDecisions: resolveMcpLockPlan', () => {
+  const REVISED: readonly boolean[] = [true, false];
+  const CHOICES: readonly (McpLockLocalChanges | undefined)[] = [undefined, 'loadFirst', 'keepProjectBehind', 'abort'];
+
+  for (const revisedSetting of REVISED) {
+    for (const localChanges of CHOICES) {
+      test(`dirty=0, revised=${String(revisedSetting)}, localChanges=${String(localChanges)}: ответ не нужен, значение игнорируется`, () => {
+        assert.deepStrictEqual(
+          resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 0, localChanges }),
+          { revised: revisedSetting, updateDatabaseFirst: false, importAfterLock: true }
+        );
+      });
+    }
+
+    test(`dirty=3, revised=${String(revisedSetting)}, loadFirst → update-then-lock`, () => {
+      assert.deepStrictEqual(
+        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'loadFirst' }),
+        { revised: revisedSetting, updateDatabaseFirst: true, importAfterLock: true }
+      );
+    });
+
+    test(`dirty=3, revised=${String(revisedSetting)}, keepProjectBehind → lock-without-import (-revised отключается)`, () => {
+      assert.deepStrictEqual(
+        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'keepProjectBehind' }),
+        { revised: false, updateDatabaseFirst: false, importAfterLock: false }
+      );
+    });
+  }
+
+  test('dirty=3, localChanges не задан → ошибка с числом файлов и перечнем вариантов', () => {
+    assert.throws(
+      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3 }),
+      (error: Error) => error.message.includes('3')
+        && ['loadFirst', 'keepProjectBehind', 'abort'].every((option) => error.message.includes(option))
+        && error.message.includes('localChanges')
+    );
+  });
+
+  test('dirty=3, abort → «Захват не выполнен: …»', () => {
+    assert.throws(
+      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3, localChanges: 'abort' }),
+      (error: Error) => error.message.startsWith('Захват не выполнен:')
+    );
+  });
+});
+
+suite('McpRepositoryDecisions: resolveMcpUpdatePlan', () => {
+  const DIRTY: readonly number[] = [0, 3];
+  const LOCKED = [names(0), names(1), names(7)];
+  const OVERWRITE: readonly (boolean | undefined)[] = [undefined, true, false];
+  const CHOICES: readonly (McpUpdateLocalChanges | undefined)[] = [undefined, 'loadAfter', 'keepProjectBehind', 'abort'];
+
+  for (const dirtyFilesCount of DIRTY) {
+    for (const lockedInSelection of LOCKED) {
+      for (const overwriteLocked of OVERWRITE) {
+        for (const localChanges of CHOICES) {
+          const title = `dirty=${String(dirtyFilesCount)}, locked=${String(lockedInSelection.length)}, overwriteLocked=${String(overwriteLocked)}, localChanges=${String(localChanges)}`;
+          test(title, () => {
+            const run = (): unknown => resolveMcpUpdatePlan({
+              dirtyFilesCount, lockedInSelection, overwriteLocked, localChanges,
+            });
+            // Оракул — порядок вопросов планировщика: сначала захваченные, потом правки проекта.
+            if (lockedInSelection.length > 0 && overwriteLocked === undefined) {
+              assert.throws(run, (error: Error) => error.message === `${describeLockedOverwrite(lockedInSelection)}${OVERWRITE_HINT}`);
+              return;
+            }
+            if (lockedInSelection.length > 0 && overwriteLocked === false) {
+              assert.throws(run, (error: Error) => error.message === OVERWRITE_FALSE);
+              return;
+            }
+            if (dirtyFilesCount === 0) {
+              assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, importAfterReceive: true });
+              return;
+            }
+            switch (localChanges) {
+              case undefined:
+                assert.throws(run, (error: Error) => error.message.includes('3') && error.message.includes('localChanges')
+                  && ['loadAfter', 'keepProjectBehind', 'abort'].every((option) => error.message.includes(option)));
+                return;
+              case 'loadAfter':
+                assert.deepStrictEqual(run(), { loadChangesAfterReceive: true, importAfterReceive: true });
+                return;
+              case 'keepProjectBehind':
+                assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, importAfterReceive: false });
+                return;
+              case 'abort':
+                assert.throws(run, (error: Error) => error.message.startsWith('Получение не выполнено:'));
+            }
+          });
+        }
+      }
+    }
+  }
+
+  test('описание захваченных: 7 объектов → пять имён и «и ещё 2» (текст формирует describeLockedOverwrite)', () => {
+    assert.throws(
+      () => resolveMcpUpdatePlan({ dirtyFilesCount: 0, lockedInSelection: names(7) }),
+      (error: Error) => error.message.includes('и ещё 2') && error.message.endsWith(OVERWRITE_HINT)
+    );
+  });
+});
+
+suite('McpRepositoryDecisions: resolveMcpCommitPlan', () => {
+  const CHOICES: readonly (McpCommitLocalChanges | undefined)[] = [undefined, 'loadFirst', 'abort'];
+
+  for (const localChanges of CHOICES) {
+    test(`dirty=0, localChanges=${String(localChanges)}: помещать без загрузки можно`, () => {
+      assert.deepStrictEqual(
+        resolveMcpCommitPlan({ dirtyFilesCount: 0, localChanges }),
+        { updateDatabaseFirst: false }
+      );
+    });
+  }
+
+  test('dirty=3, loadFirst → загрузка перед помещением', () => {
+    assert.deepStrictEqual(
+      resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'loadFirst' }),
+      { updateDatabaseFirst: true }
+    );
+  });
+
+  test('dirty=3 без localChanges → точный текст с числом файлов и подсказкой loadFirst', () => {
+    assert.throws(
+      () => resolveMcpCommitPlan({ dirtyFilesCount: 3 }),
+      (error: Error) => error.message.startsWith(
+        'В проекте 3 незагруженных изменённых файлов; помещение без предварительной загрузки запрещено. Передайте localChanges: \'loadFirst\''
+      )
+    );
+  });
+
+  test('dirty=3, abort → «Помещение не выполнено: …»', () => {
+    assert.throws(
+      () => resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'abort' }),
+      (error: Error) => error.message.startsWith('Помещение не выполнено:')
+    );
+  });
+});
+
+suite('McpRepositoryDecisions: assertCommitArgs, захват корня, адаптер узла', () => {
+  const NOT_CONFIRMED: readonly (boolean | undefined)[] = [undefined, false];
+
+  for (const confirm of NOT_CONFIRMED) {
+    test(`assertCommitArgs: confirm=${String(confirm)} → точный текст про необратимость (раньше проверки комментария)`, () => {
+      assert.throws(
+        () => assertCommitArgs({ confirm, comment: '' }),
+        (error: Error) => error.message === CONFIRM_COMMIT
+      );
+    });
+  }
+
+  const BLANK_COMMENTS = ['', '   ', '\t\n'];
+  for (const comment of BLANK_COMMENTS) {
+    test(`assertCommitArgs: confirm=true, comment=${JSON.stringify(comment)} → «непустой комментарий»`, () => {
+      assert.throws(
+        () => assertCommitArgs({ confirm: true, comment }),
+        (error: Error) => error.message === EMPTY_COMMENT
+      );
+    });
+  }
+
+  test('assertCommitArgs: confirm=true и содержательный комментарий — молча проходит', () => {
+    assert.doesNotThrow(() => assertCommitArgs({ confirm: true, comment: 'Правка' }));
+  });
+
+  const ROOT_KINDS = ['configuration', 'extension'];
+  for (const nodeKind of ROOT_KINDS) {
+    for (const confirm of [undefined, false]) {
+      test(`assertRootRecursiveLockConfirmed: корень ${nodeKind}, recursive=true, confirm=${String(confirm)} → точный текст`, () => {
+        assert.throws(
+          () => assertRootRecursiveLockConfirmed({ nodeKind, recursive: true, confirm }),
+          (error: Error) => error.message === CONFIRM_ROOT
+        );
+      });
+    }
+    test(`assertRootRecursiveLockConfirmed: корень ${nodeKind}: confirm=true или recursive=false проходят`, () => {
+      assert.doesNotThrow(() => assertRootRecursiveLockConfirmed({ nodeKind, recursive: true, confirm: true }));
+      assert.doesNotThrow(() => assertRootRecursiveLockConfirmed({ nodeKind, recursive: false }));
+    });
+  }
+
+  test('assertRootRecursiveLockConfirmed: не корень (Catalog/undefined) рекурсивно без confirm — проходит', () => {
+    assert.doesNotThrow(() => assertRootRecursiveLockConfirmed({ nodeKind: 'Catalog', recursive: true }));
+    assert.doesNotThrow(() => assertRootRecursiveLockConfirmed({ recursive: true }));
+  });
+
+  test('toRepositoryNodeRef: label берётся из textLabel (label узла может быть TreeItemLabel), остальное — как есть', () => {
+    const metaContext = { rootMetaKind: 'Catalog', ownerObjectXmlPath: 'C:\\p\\Catalogs\\Товары.xml' };
+    const ref = toRepositoryNodeRef({
+      nodeKind: 'Attribute',
+      label: { label: 'ИГНОРИРУЕТСЯ' },
+      textLabel: 'Артикул',
+      xmlPath: 'C:\\p\\Catalogs\\Товары.xml',
+      metaContext,
+    });
+    assert.strictEqual(ref.label, 'Артикул');
+    assert.strictEqual(ref.nodeKind, 'Attribute');
+    assert.strictEqual(ref.xmlPath, 'C:\\p\\Catalogs\\Товары.xml');
+    assert.deepStrictEqual(ref.metaContext, metaContext);
+  });
+
+  test('toRepositoryNodeRef: настоящий MetadataNode без metaContext/xmlPath', () => {
+    const node = new MetadataNode({ label: 'Группа', nodeKind: 'group-type' }, vscode.TreeItemCollapsibleState.None);
+    const ref = toRepositoryNodeRef(node);
+    assert.strictEqual(ref.label, 'Группа');
+    assert.strictEqual(ref.nodeKind, 'group-type');
+    assert.strictEqual(ref.xmlPath, undefined);
+    assert.strictEqual(ref.metaContext, undefined);
+  });
+});

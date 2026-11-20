@@ -2,22 +2,19 @@
  * MCP-инструменты жизненного цикла конфигурации/расширения и мостов CFE.
  *
  * Домен «configLifecycle»: create_configuration, create_extension, cfe_borrow,
- * cfe_patch_method, cfe_diff, execute_command.
+ * cfe_patch_method, cfe_diff, execute_command, update_database_configuration.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as vscode from 'vscode';
 import * as z from 'zod/v4';
-import { canonicalToLegacyModulePath } from '../McpPathResolvers';
 import { runDumpConfigurationToCf, runLoadConfigurationFromCf } from '../../commands/ext/CfFileCommandRunner';
 import { runDumpAllExtensionsToCfe, runLoadAllExtensionsFromCfe } from '../../commands/ext/CfeBatchCommandRunner';
 import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport } from '../../../infra/cfFile';
-import { buildCfApplyTarget } from '../../commands/ext/CfFileTarget';
+import { buildCfApplyTarget, resolveApplyTargetFromNode } from '../../commands/ext/CfFileTarget';
 import { runApplyDatabaseConfiguration } from '../../commands/ext/ExtensionCommandRunner';
-import {
-  CONFIGURATION_OPERATION_BUSY_MESSAGE,
-  endConfigurationOperation,
-  tryBeginConfigurationOperation,
-} from '../../commands/ext/configurationOperationLock';
+import { runWithConfigurationOperationLockOrThrow } from '../../commands/ext/configurationOperationLock';
+import { findChangedConfiguration } from '../../commands/repository/repositoryPostSync';
+import { canonicalToLegacyModulePath, resolveConfigurationXmlByCanonical } from '../McpPathResolvers';
 import type { McpRegistrationDeps } from './McpRegistrationDeps';
 
 const ALLOWED_COMMANDS = new Set([
@@ -105,7 +102,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
       },
     },
     async ({ outputFile, extensionName, overwrite }) => gate.wrapAsync(async () => {
-      const dumped = await withConfigurationOperationLock(() => runDumpConfigurationToCf({
+      const dumped = await runWithConfigurationOperationLockOrThrow(() => runDumpConfigurationToCf({
         workspaceFolder: services.workspaceFolder,
         outputChannel: services.outputChannel,
         outputFile,
@@ -152,7 +149,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           + 'Передайте confirm: true, чтобы подтвердить операцию.'
         ));
       }
-      return gate.wrapAsync(async () => withConfigurationOperationLock(async () => {
+      return gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
         const loaded = await runLoadConfigurationFromCf({
           workspaceFolder: services.workspaceFolder,
           outputChannel: services.outputChannel,
@@ -207,7 +204,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: false,
       },
     },
-    async ({ outputDir, overwrite }) => gate.wrapAsync(async () => withConfigurationOperationLock(async () => {
+    async ({ outputDir, overwrite }) => gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
       const result = await runDumpAllExtensionsToCfe({
         workspaceFolder: services.workspaceFolder,
         outputChannel: services.outputChannel,
@@ -262,7 +259,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           + 'Передайте confirm: true, чтобы подтвердить операцию.'
         ));
       }
-      return gate.wrapAsync(async () => withConfigurationOperationLock(async () => {
+      return gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
         const result = await runLoadAllExtensionsFromCfe({
           workspaceFolder: services.workspaceFolder,
           outputChannel: services.outputChannel,
@@ -411,6 +408,52 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
       return { command, result: result ?? null };
     })
   );
+
+  server.registerTool(
+    'v8vscedit_update_database_configuration',
+    {
+      title: 'Обновить конфигурацию БД',
+      description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_execute_command с updateChangedConfigurations. Принимает канонический путь корня: Конфигурация или Расширение.',
+      inputSchema: z.object({
+        path: z.string(),
+        configuration: z.string().optional(),
+      }),
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    // Без confirm — паритет с «Обновить БД» в UI. gate.afterMutation не вызывается: файлы проекта не
+    // менялись, а пометка «изменено» заставила бы «Обновить БД» залить их поверх базы (как у load_cf).
+    ({ path, configuration }) => gate.wrapAsync(async () => {
+      // Текст отказа для не-корня — тот же, что у остальных инструментов корня конфигурации.
+      resolveConfigurationXmlByCanonical(deps.paths, path, configuration);
+      const target = resolveApplyTargetFromNode(deps.paths.resolveNode(path, configuration));
+      /* c8 ignore next 3 -- защитная ветка: корень с Configuration.xml проверен выше */
+      if (!target) {
+        throw new Error(`Путь "${path}" должен указывать на корень конфигурации или расширения.`);
+      }
+      return runWithConfigurationOperationLockOrThrow(async () => {
+        const updated = await runApplyDatabaseConfiguration(target, services.workspaceFolder, services.outputChannel);
+        if (!updated) {
+          throw new Error('Обновление конфигурации БД не выполнено. Подробности — в журнале «1С Редактор».');
+        }
+        const repositoryTarget = services.repositoryService.resolveTargetByConfigRoot(target.rootPath);
+        const unloadedChangedFilesCount = repositoryTarget
+          ? (await findChangedConfiguration(services, repositoryTarget))?.changedFilesCount ?? 0
+          : 0;
+        return {
+          path,
+          kind: target.kind,
+          name: target.name,
+          databaseConfigurationUpdated: true,
+          unloadedChangedFilesCount,
+          ...(unloadedChangedFilesCount > 0
+            ? { note: '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_execute_command v8vscedit.updateChangedConfigurations' }
+            : {}),
+        };
+      });
+    })
+  );
 }
 
 /**
@@ -432,23 +475,3 @@ function assertBatchReport(report: CfeBatchReport | undefined, failureMessage: s
   }
   return report;
 }
-
-/**
- * Берёт ОБЩИЙ замок операций над конфигурацией на время работы с базой —
- * тот же, что у команд импорта/обновления: MCP-агент и пользователь работают
- * с одной базой, и параллельный запуск повредил бы данные. Валидация входа
- * выполняется внутри `action()`, то есть уже ПОСЛЕ захвата замка: при занятом
- * замке вызывающий получит «операция уже выполняется», а не диагностику
- * формата входа.
- */
-async function withConfigurationOperationLock<T>(action: () => Promise<T>): Promise<T> {
-  if (!await tryBeginConfigurationOperation()) {
-    throw new Error(CONFIGURATION_OPERATION_BUSY_MESSAGE);
-  }
-  try {
-    return await action();
-  } finally {
-    await endConfigurationOperation();
-  }
-}
-

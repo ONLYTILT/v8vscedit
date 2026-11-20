@@ -487,7 +487,7 @@ export class RepositoryService {
     if (!target) {
       return [];
     }
-    const locked = this.getLockedFullNames(target);
+    const locked = this.listLockedFullNames(target);
     if (node.nodeKind === 'configuration' || node.nodeKind === 'extension') {
       const rootLockName = this.getRootLockName(target);
       return recursive ? locked : locked.filter((name) => name === rootLockName);
@@ -876,7 +876,11 @@ export class RepositoryService {
     return target.configKind === 'cfe' ? EXTENSION_ROOT_LOCK_NAME : CONFIGURATION_ROOT_LOCK_NAME;
   }
 
-  private getLockedFullNames(target: RepositoryTarget): string[] {
+  /**
+   * Захваты цели по локальному учёту (отсортированы при записи `setLocked`). Возвращается копия:
+   * вызывающий (MCP-статус, выборка захваченных) не должен менять учёт в обход `setLocked`.
+   */
+  listLockedFullNames(target: RepositoryTarget): string[] {
     const scope = this.loadStateFile().scopes[this.buildScopeKey(target)] as RepositoryScopeState | undefined;
     return [...(scope?.lockedFullNames ?? [])];
   }

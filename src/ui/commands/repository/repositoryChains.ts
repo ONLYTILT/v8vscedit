@@ -1,0 +1,238 @@
+import { formatRepositoryLockName, type RepositoryNodeRef, type RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import type { LockedByOther } from '../../../infra/repository/RepositoryLockLog';
+import {
+  executeRepositoryCommitAction,
+  executeRepositoryLockAction,
+  executeRepositoryUnlockAction,
+  executeRepositoryUpdateAction,
+} from './RepositoryCommandRunner';
+import {
+  describeImportFailureAfterCommit,
+  describeNothingToCommit,
+  shouldImportAfterCommit,
+  type RepositoryCommitPlan,
+} from './repositoryCommitFlow';
+import {
+  describeImportFailureAfterLock,
+  describeProjectBehindAfterLock,
+  shouldImportAfterLock,
+  type RepositoryLockPlan,
+} from './repositoryLockFlow';
+import { toCliServices } from './repositoryNodeTargets';
+import { importTargetFromDatabase, updateTargetDatabase, type RepositoryChainServices } from './repositoryPostSync';
+import {
+  describeImportFailureAfterReceive,
+  describeLoadFailureAfterReceive,
+  describeProjectBehindAfterReceive,
+  shouldImportAfterReceive,
+  type RepositoryUpdatePlan,
+} from './repositoryUpdateFlow';
+
+/**
+ * Цепочки операций хранилища — ОДИН код для UI-команд и MCP-инструментов: решённый план (вопросы
+ * диалога уже отвечены — человеком или параметрами агента) → шаги → структурный результат.
+ *
+ * Контракт: тостов цепочки не показывают (у MCP их нет, UI показывает `warnings` сам), замок
+ * берёт вызывающий (вся цепочка — одна его секция: между шагами не должна вклиниться другая
+ * операция над той же базой), сбой — исключение: `RepositoryCliError`/`RepositoryCliInterruptedError`
+ * операции хранилища или `RepositoryStepFailedError` шага синхронизации до неё.
+ */
+
+/**
+ * Шаг синхронизации базы и проекта (загрузка правок) не выполнен до операции хранилища, и она не
+ * запускалась. Причину шаг уже записал в журнал и показал сам, поэтому UI второго сообщения не даёт.
+ */
+export class RepositoryStepFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RepositoryStepFailedError';
+  }
+}
+
+const LOAD_BEFORE_LOCK_FAILED =
+  'Загрузка правок проекта в базу не выполнена; захват не выполнялся. Подробности — в журнале «1С Редактор».';
+const LOAD_BEFORE_COMMIT_FAILED =
+  'Загрузка правок проекта в базу не выполнена; помещение не выполнялось. Подробности — в журнале «1С Редактор».';
+
+export interface LockChainResult {
+  readonly lockedObjects: string[];
+  readonly requestedObjects: string[];
+  readonly receivedFromRepository: boolean;
+  readonly databaseLoadedBefore: boolean;
+  readonly projectImported: boolean;
+  readonly projectBehind: boolean;
+  readonly warnings: string[];
+}
+
+/**
+ * Захват и, если захват получил новые версии (Э14: и без `-revised`), импорт в проект. «Обновить БД»
+ * (`/UpdateDBCfg`) в цепочку не входит: импорт читает основную конфигурацию, а конфигурация БД нужна
+ * только для запуска Предприятия.
+ */
+export async function runLockChain(
+  services: RepositoryChainServices,
+  target: RepositoryTarget,
+  node: RepositoryNodeRef,
+  recursive: boolean,
+  plan: RepositoryLockPlan
+): Promise<LockChainResult> {
+  const requestedObjects = services.repositoryService.buildObjectsSelectionForNode(node, recursive).fullNames;
+  // Сбой загрузки (в т.ч. отказ платформы загрузить незахваченный объект) — захвата не было.
+  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
+    throw new RepositoryStepFailedError(LOAD_BEFORE_LOCK_FAILED);
+  }
+  const outcome = await executeRepositoryLockAction(toCliServices(services), node, recursive, { revised: plan.revised });
+  const warnings: string[] = [];
+  let projectImported = false;
+  let projectBehind = false;
+  if (shouldImportAfterLock(plan, outcome)) {
+    projectImported = await importTargetFromDatabase(target, services);
+    if (!projectImported) {
+      projectBehind = true;
+      warnings.push(describeImportFailureAfterLock(target.displayName));
+    }
+  } else if (!plan.importAfterLock && outcome.receivedFromRepository) {
+    projectBehind = true;
+    warnings.push(describeProjectBehindAfterLock(target.displayName));
+  }
+  return {
+    lockedObjects: [...outcome.lockedFullNames],
+    requestedObjects,
+    receivedFromRepository: outcome.receivedFromRepository,
+    databaseLoadedBefore: plan.updateDatabaseFirst,
+    projectImported,
+    projectBehind,
+    warnings,
+  };
+}
+
+export interface UpdateChainResult {
+  readonly receivedFromRepository: boolean;
+  readonly changesLoadedAfter: boolean;
+  readonly projectImported: boolean;
+  readonly projectBehind: boolean;
+  readonly warnings: string[];
+}
+
+/** Получение; правки проекта загружаются ПОСЛЕ него (Э24): загруженное до получения оно бы затёрло. */
+export async function runUpdateChain(
+  services: RepositoryChainServices,
+  target: RepositoryTarget,
+  node: RepositoryNodeRef,
+  request: { readonly recursive: boolean; readonly force: boolean; readonly version?: string },
+  plan: RepositoryUpdatePlan
+): Promise<UpdateChainResult> {
+  const outcome = await executeRepositoryUpdateAction(toCliServices(services), node, request);
+  const received = outcome.receivedFromRepository;
+  if (plan.loadChangesAfterReceive && !await updateTargetDatabase(target, services)) {
+    // Импорт перезаписал бы незагруженные правки проекта — не выполняется; получение уже успешно.
+    return {
+      receivedFromRepository: received,
+      changesLoadedAfter: false,
+      projectImported: false,
+      projectBehind: received,
+      warnings: [describeLoadFailureAfterReceive(target.displayName)],
+    };
+  }
+  const warnings: string[] = [];
+  let projectImported = false;
+  let projectBehind = false;
+  if (shouldImportAfterReceive(plan, outcome)) {
+    projectImported = await importTargetFromDatabase(target, services);
+    if (!projectImported) {
+      projectBehind = true;
+      warnings.push(describeImportFailureAfterReceive(target.displayName));
+    }
+  } else if (!plan.importAfterReceive && received) {
+    projectBehind = true;
+    warnings.push(describeProjectBehindAfterReceive(target.displayName));
+  }
+  return {
+    receivedFromRepository: received,
+    changesLoadedAfter: plan.loadChangesAfterReceive,
+    projectImported,
+    projectBehind,
+    warnings,
+  };
+}
+
+export interface CommitChainResult {
+  readonly committedObjects: string[];
+  readonly keptLocked: boolean;
+  readonly referencesCleaned: boolean;
+  readonly databaseLoadedBefore: boolean;
+  readonly projectImported: boolean;
+  readonly warnings: string[];
+}
+
+/** «Загрузить → поместить»: помещается ровно то, что загружено в базу. Очистка ссылок (Э25) — импорт. */
+export async function runCommitChain(
+  services: RepositoryChainServices,
+  target: RepositoryTarget,
+  node: RepositoryNodeRef,
+  request: { readonly recursive: boolean; readonly comment: string; readonly keepLocked: boolean; readonly force: boolean },
+  plan: RepositoryCommitPlan
+): Promise<CommitChainResult> {
+  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
+    throw new RepositoryStepFailedError(LOAD_BEFORE_COMMIT_FAILED);
+  }
+  const outcome = await executeRepositoryCommitAction(toCliServices(services), node, request);
+  const warnings: string[] = [];
+  let projectImported = false;
+  if (shouldImportAfterCommit(outcome)) {
+    projectImported = await importTargetFromDatabase(target, services);
+    if (!projectImported) {
+      warnings.push(describeImportFailureAfterCommit(target.displayName));
+    }
+  }
+  if (outcome.committedFullNames.length === 0) {
+    warnings.push(describeNothingToCommit(node.label ?? target.displayName));
+  }
+  return {
+    committedObjects: [...outcome.committedFullNames],
+    keptLocked: request.keepLocked,
+    referencesCleaned: outcome.referencesCleaned,
+    databaseLoadedBefore: plan.updateDatabaseFirst,
+    projectImported,
+    warnings,
+  };
+}
+
+export interface UnlockChainResult {
+  readonly unlockedObjects: string[];
+  readonly lockedByOthers: LockedByOther[];
+  readonly notUnlocked: string[];
+  readonly warnings: string[];
+}
+
+/** Освобождение: учёт — по строкам лога (Э24), чужой захват — не исключение, а `lockedByOthers`. */
+export async function runUnlockChain(
+  services: RepositoryChainServices,
+  target: RepositoryTarget,
+  node: RepositoryNodeRef,
+  request: { readonly recursive: boolean; readonly force: boolean },
+  dirtyFilesCount: number
+): Promise<UnlockChainResult> {
+  const outcome = await executeRepositoryUnlockAction(toCliServices(services), node, request.recursive, request.force);
+  const warnings = dirtyFilesCount > 0 && outcome.unlocked.length > 0
+    ? [describeUnloadedChangesAfterUnlock(target.displayName, dirtyFilesCount)]
+    : [];
+  return {
+    unlockedObjects: outcome.unlocked,
+    lockedByOthers: outcome.lockedByOthers,
+    notUnlocked: outcome.notUnlocked,
+    warnings,
+  };
+}
+
+function describeUnloadedChangesAfterUnlock(displayName: string, dirtyFilesCount: number): string {
+  return `В проекте "${displayName}" незагруженных изменённых файлов: ${String(dirtyFilesCount)}; после отмены захвата ` +
+    'загрузить их в базу по освобождённым объектам будет нельзя — платформа не загружает незахваченные объекты.';
+}
+
+/** Ничего не освобождено: текст для UI-предупреждения и ошибки MCP-инструмента. */
+export function describeUnlockNotDone(notUnlocked: readonly string[], lockedByOthers: readonly LockedByOther[]): string {
+  const names = notUnlocked.map(formatRepositoryLockName).join(', ');
+  const foreign = lockedByOthers.map((item) => (item.user ? `${item.name} (${item.user})` : item.name)).join(', ');
+  return `Захват не отменён: ${names}${foreign ? `; захвачено другим пользователем: ${foreign}` : ''}`;
+}

@@ -83,3 +83,19 @@ export async function runWithConfigurationOperationLock<T>(operation: () => Prom
     await endConfigurationOperation();
   }
 }
+
+/**
+ * Вариант для MCP: у агента нет тостов, поэтому занятый замок — исключение с
+ * `CONFIGURATION_OPERATION_BUSY_MESSAGE` (его превращает в `isError` обёртка инструмента). Чужой
+ * замок не снимается; исключение операции пробрасывается как есть, замок освобождается.
+ */
+export async function runWithConfigurationOperationLockOrThrow<T>(operation: () => Promise<T>): Promise<T> {
+  if (!await tryBeginConfigurationOperation()) {
+    throw new Error(CONFIGURATION_OPERATION_BUSY_MESSAGE);
+  }
+  try {
+    return await operation();
+  } finally {
+    await endConfigurationOperation();
+  }
+}
