@@ -31,7 +31,10 @@
  *    обосновано в комментарии у самой заглушки) — она НЕ имитирует поведение
  *    платформы, а только подтверждает код завершения 0 и (для dump) кладёт
  *    несколько байт по пути `/DumpCfg <файл>`, который наш же `dumpCfFile.ts`
- *    ожидает найти для переноса staging-файла. На Windows заглушка пропускается
+ *    ожидает найти для переноса staging-файла.
+ *
+ * Результат раннера — объект `CfFileRunOutcome` (plan-remote-extensions §3.4): `success` — прежнее boolean.
+ * Агентская ветка раннера проверяется отдельно (`agentCfFileRunners.test.ts`). На Windows заглушка пропускается
  *    (`this.skip()`) — POSIX-шебанг там не работает, а остальные тесты файла
  *    от платформы не зависят и на Windows остаются полными.
  */
@@ -202,7 +205,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
     // Без установленной платформы CLI не может успешно завершиться — это
     // ОЖИДАЕМОЕ и задокументированное поведение окружения без 1cv8, а не
     // дефект: важно, что раннер ДОШЁЛ до реального запуска (см. проверки ниже).
-    assert.strictEqual(result, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
+    assert.strictEqual(result.success, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
 
     const joined = lines.join('\n');
     const startLine = lines.find((line) => line.startsWith('[actions] Старт:'));
@@ -232,7 +235,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
       silent: true,
     });
 
-    assert.strictEqual(result, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
+    assert.strictEqual(result.success, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
     const startLine = lines.find((line) => line.startsWith('[actions] Старт:'));
     assert.ok(startLine, `ожидалась строка старта CLI, реально накоплено: ${JSON.stringify(lines)}`);
     assert.ok(!lines.join('\n').includes(REAL_PASSWORD), 'реальный пароль не должен попасть в лог');
@@ -256,7 +259,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
       silent: true,
     });
 
-    assert.strictEqual(result, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
+    assert.strictEqual(result.success, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
     const startLine = lines.find((line) => line.startsWith('[actions] Старт:'));
     assert.ok(startLine, `ожидалась строка старта CLI, реально накоплено: ${JSON.stringify(lines)}`);
     assert.ok(!lines.join('\n').includes(REAL_PASSWORD), 'реальный пароль не должен попасть в лог');
@@ -281,7 +284,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
       silent: true,
     });
 
-    assert.strictEqual(result, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
+    assert.strictEqual(result.success, false, 'без платформы 1С раннер обязан вернуть false, а не бросить исключение');
     const startLine = lines.find((line) => line.startsWith('[actions] Старт:'));
     assert.ok(startLine, `ожидалась строка старта CLI, реально накоплено: ${JSON.stringify(lines)}`);
     assert.ok(!lines.join('\n').includes(REAL_PASSWORD), 'реальный пароль не должен попасть в лог');
@@ -312,7 +315,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
       silent: true,
     });
 
-    assert.strictEqual(result, true, 'заглушка завершается с кодом 0 — раннер обязан вернуть true');
+    assert.strictEqual(result.success, true, 'заглушка завершается с кодом 0 — раннер обязан вернуть true');
     assert.ok(!lines.join('\n').includes(REAL_PASSWORD), 'реальный пароль не должен попасть в лог даже на успешной ветке');
     assert.ok(lines.some((line) => line.startsWith('[actions] Завершено:')), 'ожидалась строка завершения успеха');
     assert.ok(!lines.some((line) => line.startsWith('[actions][error]')), 'на успешной ветке не должно быть строки ошибки');
@@ -336,7 +339,7 @@ suite('CfFileCommandRunner — runDumpConfigurationToCf/runLoadConfigurationFrom
       silent: true,
     });
 
-    assert.strictEqual(result, true, 'заглушка завершается с кодом 0 и создаёт staging-файл — раннер обязан вернуть true');
+    assert.strictEqual(result.success, true, 'заглушка завершается с кодом 0 и создаёт staging-файл — раннер обязан вернуть true');
     assert.ok(fs.existsSync(outputFile), 'успешная выгрузка обязана перенести staging-файл на целевой путь');
     assert.strictEqual(fs.readFileSync(outputFile, 'utf-8'), 'fake-cf-bytes');
     assert.ok(!lines.join('\n').includes(REAL_PASSWORD), 'реальный пароль не должен попасть в лог даже на успешной ветке');

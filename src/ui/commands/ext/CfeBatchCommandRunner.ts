@@ -25,6 +25,9 @@ import {
   validateCfeDirectory,
   type CfeBatchReport,
 } from '../../../infra/cfFile';
+import { runAgentCfeBatchDump, runAgentCfeBatchLoad } from './agent/agentCfFileOperations';
+import type { AgentOperationOutcome } from './agent/agentConfigurationOperation';
+import { getAgentExecutionMode } from './agent/agentSettings';
 import {
   buildConnectionCliArgs,
   createWorkspaceTempDir,
@@ -53,8 +56,10 @@ export interface LoadAllExtensionsOptions extends CfeBatchRunnerContext {
 
 export interface CfeBatchRunResult {
   readonly success: boolean;
-  /** Отчёт прогона; `undefined` — CLI не дошёл даже до его записи. */
+  /** Отчёт прогона; `undefined` — CLI не дошёл даже до его записи (агент — операция не состоялась). */
   readonly report: CfeBatchReport | undefined;
+  /** Причина отказа без отчёта (агентская ветка): MCP отдаёт её дословно. */
+  readonly failureReason?: string;
 }
 
 /** Выгружает все расширения базы в каталог через CLI `dump-cfe-all`. */
@@ -64,6 +69,9 @@ export async function runDumpAllExtensionsToCfe(options: DumpAllExtensionsOption
   const validationError = validateCfeDirectory(options.outputDir, 'dump');
   if (validationError) {
     throw new Error(validationError);
+  }
+  if (getAgentExecutionMode() === 'agent') {
+    return toBatchRunResult(await runAgentCfeBatchDump(options, { outputDir: options.outputDir, overwrite: options.overwrite === true }));
   }
 
   return runBatchCli(options, (resultFile, connectionArgs) => [
@@ -90,6 +98,9 @@ export async function runLoadAllExtensionsFromCfe(options: LoadAllExtensionsOpti
   if (validationError) {
     throw new Error(validationError);
   }
+  if (getAgentExecutionMode() === 'agent') {
+    return toBatchRunResult(await runAgentCfeBatchLoad(options, { inputDir: options.inputDir, createMissing: options.createMissing === true }));
+  }
 
   return runBatchCli(options, (resultFile, connectionArgs) => [
     'load-cfe-all',
@@ -107,6 +118,19 @@ export async function runLoadAllExtensionsFromCfe(options: LoadAllExtensionsOpti
     failureOperation: 'загрузке расширений в базу',
     logPrefix: 'load-cfe-all',
   });
+}
+
+/**
+ * Агентская ветка: отчёт приходит объектом (без `-ResultFile`). Успех — как код 0 у CLI: ни отказа до старта,
+ * ни сбойного/необработанного элемента, ни прерывания.
+ */
+function toBatchRunResult(outcome: AgentOperationOutcome<CfeBatchReport>): CfeBatchRunResult {
+  if (!outcome.ok) {
+    return { success: false, report: undefined, failureReason: outcome.reason };
+  }
+  const report = outcome.value;
+  const success = (report.errors ?? []).length === 0 && !report.interrupted && report.items.every((item) => item.status === 'ok');
+  return { success, report };
 }
 
 interface BatchRunMessages {

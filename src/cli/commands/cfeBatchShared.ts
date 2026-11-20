@@ -19,9 +19,11 @@ import {
   serializeCfeBatchReport,
   validateCfeDirectory,
   type CfeBatchReport,
-  type CfeDirectoryEntry,
 } from '../../infra/cfFile';
 import { queryDbExtensionList } from './listDbExtensions';
+
+// Чтение каталога пакета живёт в infra (его использует и агентская ветка пакетов): здесь — реэкспорт, не копия.
+export { readCfeDirectoryEntries, readDirectoryFileNames } from '../../infra/cfFile/CfeDirectoryListing';
 
 /** Код возврата пакетной команды: 0 — успех, 1 — отказ, 2 — прервано сигналом. */
 export const BATCH_EXIT_OK = 0;
@@ -99,24 +101,6 @@ export function installInterruptionFlag(): InterruptionFlag {
       process.off('SIGINT', onSignal);
     },
   };
-}
-
-/** Записи файлов первого уровня каталога (имя + размер) для `planCfeLoad`. */
-export function readCfeDirectoryEntries(directoryPath: string): CfeDirectoryEntry[] {
-  return fs.readdirSync(directoryPath, { withFileTypes: true })
-    .filter((entry) => entry.isFile())
-    .map((entry) => ({ name: entry.name, sizeBytes: fs.statSync(path.join(directoryPath, entry.name)).size }));
-}
-
-/** Имена файлов первого уровня каталога; недоступный каталог — пустой список. */
-export function readDirectoryFileNames(directoryPath: string): string[] {
-  try {
-    return fs.readdirSync(directoryPath, { withFileTypes: true })
-      .filter((entry) => !entry.isDirectory())
-      .map((entry) => entry.name);
-  } catch {
-    return [];
-  }
 }
 
 /** Размер готового файла; недоступный файл — `undefined` (в отчёте поле просто отсутствует). */

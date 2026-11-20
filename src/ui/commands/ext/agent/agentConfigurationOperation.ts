@@ -1,7 +1,12 @@
 // Перенесено из ExtensionCommandRunner.ts (Э2) без изменения поведения; публичный API реэкспортируется оттуда.
 import * as vscode from 'vscode';
 import type { AgentMessage } from '../../../../domain/agent';
-import { AgentCommandError, type AgentOperationHooks, type AgentOperationService } from '../../../../infra/agent';
+import {
+  AgentCommandError,
+  describeAgentCommandFailure,
+  type AgentOperationHooks,
+  type AgentOperationService,
+} from '../../../../infra/agent';
 import { AgentFullDumpDeclinedError, AgentSyncCancelledError } from '../../../../infra/agent/sync/SyncContext';
 import type { ConfigurationImportHooks, ConfigurationProgressHooks } from '../configurationOperationTypes';
 import {
@@ -10,8 +15,9 @@ import {
   trimStatusMessage,
   updateConfigurationOperationStatus,
 } from '../configurationOperationStatus';
-import { getAgentOperationService, logAgentDiagnostics } from './AgentServiceRegistry';
+import { getAgentOperationService, logAgentDiagnostics, recoverAgentAfterHang } from './AgentServiceRegistry';
 import { agentQuestionText, isSecretQuestion, withQuestionJournal } from './agentQuestionJournal';
+import { readAgentLocation } from './agentSettings';
 
 export interface RunAgentOptions {
   readonly progressTitle: string;
@@ -31,11 +37,19 @@ export interface RunAgentOptions {
   /** Вопрос об удалении «осиротевших» файлов выгрузки проекта; без него — только сообщение. */
   readonly confirmOrphanRemoval?: AgentOperationHooks['confirmOrphanRemoval'];
   /**
-   * Кнопка «Отмена» в уведомлении и токен в хуках операции. Только у импорта: его отмена проверяется в
-   * безопасных точках и не оставляет P наполовину записанным; загрузка без аудита отмены (бэклог Б3).
+   * Кнопка «Отмена» в уведомлении и токен в хуках операции. Включают операции, чья отмена проверяется в
+   * безопасных точках: импорт (P не остаётся наполовину записанным) и CF/CFE-файлы и пакеты через агента
+   * (отмена — до изменения базы и между элементами). Загрузка из файлов проекта — без аудита отмены (бэклог Б3).
    */
   readonly cancellable?: boolean;
+  /** `false` — без всплывающего окна ошибки (MCP `silent`): причину получает вызывающий из исхода. */
+  readonly showErrorMessage?: boolean;
 }
+
+/** Исход агентской операции: значение или причина отказа (у отмены пользователем — `cancelled`). */
+export type AgentOperationOutcome<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly reason: string; readonly cancelled?: boolean };
 
 /** Хуки, которые операция получает от обёртки: журнал, вопросы, прогресс и (у отменяемых) токен отмены. */
 export interface AgentOperationUiHooks {
@@ -62,6 +76,14 @@ export async function runAgentConfigurationOperation(
   options: RunAgentOptions,
   operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<void>
 ): Promise<boolean> {
+  return (await runAgentOperation(options, operation)).ok;
+}
+
+/** Обобщение {@link runAgentConfigurationOperation}: значение операции или причина отказа. */
+export async function runAgentOperation<T>(
+  options: RunAgentOptions,
+  operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<T>
+): Promise<AgentOperationOutcome<T>> {
   options.outputChannel.appendLine(`[agent] Старт: ${options.progressTitle}`);
   beginConfigurationOperationStatus(options.progressTitle, options.progressStartMessage);
   options.hooks?.onProgressMessage?.(options.progressStartMessage);
@@ -73,12 +95,12 @@ export async function runAgentConfigurationOperation(
   );
 }
 
-async function runInProgress(
+async function runInProgress<T>(
   options: RunAgentOptions,
-  operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<void>,
+  operation: (service: AgentOperationService, hooks: AgentOperationUiHooks) => Promise<T>,
   progress: vscode.Progress<{ message?: string }>,
   cancellation: vscode.CancellationToken | undefined
-): Promise<boolean> {
+): Promise<AgentOperationOutcome<T>> {
   const importHooks = isImportHooks(options.hooks) ? options.hooks : undefined;
   const showStatus = (statusMessage: string): void => {
     updateConfigurationOperationStatus(options.progressTitle, statusMessage);
@@ -118,17 +140,19 @@ async function runInProgress(
     confirmOrphanRemoval: options.confirmOrphanRemoval,
   }, onMessage);
   const cancelSubscription = cancellation?.onCancellationRequested(() => { onMessage(CANCEL_REQUESTED_MESSAGE); });
+  // Место агента — на момент старта операции: настройку могли сменить, пока операция ждала ответа.
+  const location = readAgentLocation();
 
   try {
     const service = await getAgentOperationService(options.workspaceFolder, options.rootPath, options.outputChannel);
-    await operation(service, buildOperationHooks());
+    const value = await operation(service, buildOperationHooks());
 
     endConfigurationOperationStatus(options.progressTitle, 'завершено');
     options.outputChannel.appendLine(`[agent] Завершено: ${options.progressTitle}`);
     if (options.showSuccessMessage !== false) {
       void vscode.window.showInformationMessage(options.successMessage);
     }
-    return true;
+    return { ok: true, value };
   } catch (error) {
     if (error instanceof AgentFullDumpDeclinedError) {
       // Отказ от полной выгрузки — решение пользователя, а не сбой: текст ошибки — инструкция по контексту
@@ -136,7 +160,7 @@ async function runInProgress(
       options.outputChannel.appendLine(`[agent] ${error.message}`);
       endConfigurationOperationStatus(options.progressTitle, 'отменено');
       void vscode.window.showInformationMessage(error.message);
-      return false;
+      return { ok: false, reason: error.message, cancelled: true };
     }
     if (error instanceof AgentSyncCancelledError) {
       // Отмена пользователем (Esc в вопросе о посеве, кнопка отмены прогресса) — не ошибка: без тоста
@@ -144,27 +168,47 @@ async function runInProgress(
       options.outputChannel.appendLine(`[agent] Отменено: ${options.progressTitle}`);
       endConfigurationOperationStatus(options.progressTitle, 'отменено');
       void vscode.window.showInformationMessage(`${options.progressTitle}: операция отменена.`);
-      return false;
+      return { ok: false, reason: error.message, cancelled: true };
     }
-    const message = error instanceof Error ? error.message : String(error);
+    // Зависание агента (ФАКТ Э29): свой локальный процесс останавливается для перезапуска, иначе — просьба.
+    const hangText = await recoverAgentAfterHang(error, location, options.workspaceFolder, options.outputChannel);
+    const message = hangText ?? describeAgentCommandFailure(error);
     options.outputChannel.appendLine(`[agent][error] ${message}`);
     if (error instanceof AgentCommandError) {
       options.outputChannel.appendLine(`[agent][error] Команда: ${error.command}`);
     }
     logAgentDiagnostics(options.workspaceFolder, options.outputChannel);
     endConfigurationOperationStatus(options.progressTitle, 'ошибка');
-    void vscode.window.showErrorMessage(
-      `${options.errorTitle}\n${message}`,
-      'Открыть журнал'
-    ).then((action) => {
-      if (action === 'Открыть журнал') {
-        options.outputChannel.show(true);
-      }
-    });
-    return false;
+    if (options.showErrorMessage !== false) {
+      void vscode.window.showErrorMessage(
+        `${options.errorTitle}\n${message}`,
+        'Открыть журнал'
+      ).then((action) => {
+        /* c8 ignore next 3 -- нажатие кнопки уведомления без пользователя не воспроизводится */
+        if (action === 'Открыть журнал') {
+          options.outputChannel.show(true);
+        }
+      });
+    }
+    return { ok: false, reason: message };
   } finally {
     cancelSubscription?.dispose();
   }
+}
+
+/**
+ * Предупреждения агентской операции (E11 после применения расширения) — уведомлением без `await` (запрет №18:
+ * вызывающий может держать замок операции). Возвращает те же предупреждения для исхода; `silent` (MCP) —
+ * без уведомлений: предупреждения получает вызывающий агент в ответе.
+ */
+export function notifyAgentWarnings(result: { readonly warnings?: readonly string[] }, silent = false): readonly string[] {
+  const warnings = result.warnings ?? [];
+  if (!silent) {
+    for (const warning of warnings) {
+      void vscode.window.showWarningMessage(warning);
+    }
+  }
+  return warnings;
 }
 
 export async function showAgentQuestion(message: AgentMessage): Promise<string | undefined> {

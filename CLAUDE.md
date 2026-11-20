@@ -198,12 +198,17 @@ src/
 │   │                                  # принадлежности staging-файла), CfeBatch* (пакетная
 │   │                                  # выгрузка/загрузка всех расширений: Naming/Manifest/
 │   │                                  # Plan/Report) — см. docs/architecture.md
-│   ├── agent/                        # агент конфигуратора (SSH /AgentMode): AgentOperationService (тонкий
+│   ├── agent/                        # (domain/agent/: AgentExtensionCommands — команды расширений, AgentExtensionPlan — чистые решения
+│   │                                  # load/dump/сверка, ExtensionProperties — разбор списка); infra/agent/AgentHangRecovery — решение по неответу за срок
+│   │                                  # агент конфигуратора (SSH /AgentMode): AgentOperationService (тонкий
 │   │                                  # фасад), AgentInfoBaseSession (жизненный цикл connect-ib),
 │   │                                  # BatchDesignerGuard (release перед пакетным запуском),
 │   │                                  # AgentConnectRetry/SshConnectErrorClassifier (политика готовности),
 │   │                                  # RemoteConnectionCheck (диагностика) — docs/architecture.md,
 │   │                                  # «Удалённый сервер 1С»; пользовательская часть — docs/remote-designer.md
+│   │   ├── extensions/               # CF/CFE и расширения через агента: AgentExtensionList (список, сверка, срок 30 с),
+│   │   │                              # AgentCfFileExchange (одиночный обмен), AgentCfeBatch (пакеты), AgentExtensionMessages (тексты E3-E12);
+│   │   │                              # рядом: cfFile/CfeDirectoryListing, fs/TreeRemoval, ui/commands/ext/ExtensionListRunner
 │   │   ├── files/                    # AgentFileStore: Local (каталог агента) и Sftp (отдельное SSH-соединение),
 │   │   │                              # AgentFileTransfer (конкурентная передача с отменой),
 │   │   │                              # SftpChunkedIo (потоковый обмен, IO_CHUNK 31 КиБ)
@@ -583,6 +588,18 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
 - **Новая настройка:** `package.json → contributes.configuration.properties` с префиксом `v8vscedit.<область>.<ключ>`, `description` на русском → читать только через `vscode.workspace.getConfiguration('v8vscedit')` в UI/Container → при рантайм-влиянии подписка на `onDidChangeConfiguration`.
 - **Новый watcher:** `FileSystemWatcher` — только в `Container` или `ui/support/`; обработчик делегирует в сервис.
 - **Внешняя интеграция (vrunner):** запуск процесса в `ui/commands/ext/`; декодирование OEM/Win1251 через `iconv-lite`; прогресс/отмена через `vscode.window.withProgress`.
+- **Операция с расширениями/CF/CFE через агента** (`operationMode = agent`, local и remote; устройство —
+  [architecture.md](./docs/architecture.md#cfcfe-файлы-и-список-расширений-через-агента)): раннер UI ветвится по
+  `getAgentExecutionMode()`, UI и MCP зовут ОДИН раннер. Команды агента строятся только в
+  `domain/agent/AgentExtensionCommands.ts`, решения (цель загрузки/выгрузки, сверка) - чистые функции
+  `domain/agent/AgentExtensionPlan.ts`, потоки и тексты E-сообщений - `infra/agent/extensions/`. Список расширений
+  читается ТОЛЬКО `properties get --all-extensions` (строить `properties get --extension` не нужно: при одном
+  расширении ответ - одиночное `extension-properties` без `success`, транспорт завершает его узко по
+  `terminalTypes`, а не «любым массивом»). После `load-cfg` НОВОГО расширения `update-db-cfg` идёт в той же
+  операции; итог проверяется по списку (E11 - предупреждение, заглушка/нет имени - E12), `update-db-cfg`
+  существующего имени - только после guard E6 (молчаливый success у несуществующего). Короткая команда имеет срок
+  (`AGENT_SHORT_COMMAND_DEADLINE_MS`), повтор по сроку запрещён. MCP получает `warnings` без тостов (silent).
+  Хранилище, интерактивный Конфигуратор, batch и CLI остаются локальными путями.
 - **Новая операция чтения данных из базы через пакетный Конфигуратор** (данных, которых нет в
   XML-выгрузке — список/состояние; образец — список подключённых расширений для
   `v8vscedit.connectExtension`): CLI-команда `cli/commands/<name>.ts` с гейтом по `exitCode` процесса

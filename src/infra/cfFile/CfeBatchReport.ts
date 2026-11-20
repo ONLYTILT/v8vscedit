@@ -36,6 +36,8 @@ export interface CfeBatchReportItem {
   readonly status: CfeBatchItemStatus;
   readonly sizeBytes?: number;
   readonly message?: string;
+  /** Агентская загрузка НОВОГО расширения применяет его сразу (иначе в базе остаётся заглушка, Э28). */
+  readonly appliedToDatabase?: boolean;
 }
 
 export interface CfeBatchFailedAt {
@@ -68,6 +70,13 @@ export interface CfeBatchReport {
   readonly restoredByFileName?: string[];
   /** Причины отказа ДО старта: ни одного спавна Конфигуратора не было. */
   readonly errors?: string[];
+  /** Прогон оборван потерей связи с агентом (агентская ветка): обработаны не все элементы. */
+  readonly abortReason?: string;
+  /**
+   * Сверка по списку расширений после загрузки (агентская ветка): имя из файла, оставшаяся заглушка. Пустой
+   * список — «проверено, расхождений нет», отсутствие поля — «не проверялось».
+   */
+  readonly verificationWarnings?: readonly string[];
 }
 
 export function serializeCfeBatchReport(report: CfeBatchReport): string {
@@ -82,9 +91,12 @@ export function serializeCfeBatchReport(report: CfeBatchReport): string {
         status: item.status,
         ...(item.sizeBytes === undefined ? {} : { sizeBytes: item.sizeBytes }),
         ...(item.message === undefined ? {} : { message: item.message }),
+        ...(item.appliedToDatabase === undefined ? {} : { appliedToDatabase: item.appliedToDatabase }),
       })),
       ...(report.failedAt === undefined ? {} : { failedAt: report.failedAt }),
       ...presentOptionalLists(report),
+      ...(report.abortReason === undefined ? {} : { abortReason: report.abortReason }),
+      ...(report.verificationWarnings === undefined ? {} : { verificationWarnings: report.verificationWarnings }),
     },
     null,
     2
@@ -117,6 +129,7 @@ export function parseCfeBatchReport(text: string): CfeBatchReport | undefined {
   }
 
   const failedAt = parseFailedAt(root.failedAt);
+  const warnings = root.verificationWarnings;
   return {
     version: REPORT_VERSION,
     operation: root.operation,
@@ -124,6 +137,9 @@ export function parseCfeBatchReport(text: string): CfeBatchReport | undefined {
     items,
     ...(failedAt === undefined ? {} : { failedAt }),
     ...parseOptionalLists(root),
+    // Справочные поля агентской ветки: испорченное значение читается как «поля нет».
+    ...(typeof root.abortReason === 'string' ? { abortReason: root.abortReason } : {}),
+    ...(isStringList(warnings) ? { verificationWarnings: warnings } : {}),
   };
 }
 
@@ -151,6 +167,7 @@ function parseReportItem(raw: unknown): CfeBatchReportItem | undefined {
     ...entry,
     status: item.status as CfeBatchItemStatus,
     ...(typeof item.message === 'string' ? { message: item.message } : {}),
+    ...(typeof item.appliedToDatabase === 'boolean' ? { appliedToDatabase: item.appliedToDatabase } : {}),
   };
 }
 
@@ -202,9 +219,13 @@ function parseOptionalLists(root: Record<string, unknown>): OptionalReportLists 
   const result: MutableOptionalLists = {};
   for (const key of OPTIONAL_LIST_KEYS) {
     const value = root[key];
-    if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) {
+    if (isStringList(value)) {
       result[key] = value;
     }
   }
   return result;
+}
+
+function isStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
 }

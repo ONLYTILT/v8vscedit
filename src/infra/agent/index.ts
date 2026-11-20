@@ -19,3 +19,4 @@ export * from './AgentConnectRetry';
 export * from './files/SftpConnection';
 export * from './files/SftpAgentFileStore';
 export * from './RemoteConnectionCheck';
+export * from './AgentHangRecovery';

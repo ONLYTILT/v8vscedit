@@ -7,6 +7,7 @@
  * переподключается, а не уходит в мёртвый канал».
  * Таймеры — детерминированные: срабатывание только явным `fireAll()`, реального времени нет.
  */
+import type { AgentMessage } from '../../../domain/agent';
 import {
   AgentCommandError,
   type AgentCommandHooks,
@@ -17,13 +18,17 @@ import {
 
 export type TransportBehavior = (command: string, hooks?: AgentCommandHooks) => Error | Promise<void> | undefined;
 
+/** Ответ агента на команду: сообщения результата (например `success` с `body` списка расширений). */
+export type TransportResponder = (command: string) => AgentMessage[] | undefined;
+
 export class ScriptedTransport implements DesignerAgentTransport {
   readonly commands: string[] = [];
   lastHooks: AgentCommandHooks | undefined;
 
   constructor(
     private readonly log: string[],
-    private readonly behavior?: TransportBehavior
+    private readonly behavior?: TransportBehavior,
+    private readonly responder?: TransportResponder
   ) {}
 
   execute(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
@@ -35,10 +40,11 @@ export class ScriptedTransport implements DesignerAgentTransport {
       return Promise.reject(outcome);
     }
     hooks?.onMessage?.({ type: 'log', message: `выполнено: ${command}` });
+    const messages = this.responder?.(command) ?? [];
     if (outcome) {
-      return outcome.then(() => ({ messages: [] }));
+      return outcome.then(() => ({ messages }));
     }
-    return Promise.resolve({ messages: [] });
+    return Promise.resolve({ messages });
   }
 
   dispose(): Promise<void> {
@@ -54,7 +60,7 @@ export class ScriptedFactory implements ResettableDesignerAgentTransportFactory 
   resetError: Error | undefined;
   private current: ScriptedTransport | undefined;
 
-  constructor(private readonly behavior?: TransportBehavior) {}
+  constructor(private readonly behavior?: TransportBehavior, private readonly responder?: TransportResponder) {}
 
   get createCount(): number {
     return this.transports.length;
@@ -66,7 +72,7 @@ export class ScriptedFactory implements ResettableDesignerAgentTransportFactory 
 
   create(): Promise<DesignerAgentTransport> {
     if (!this.current) {
-      this.current = new ScriptedTransport(this.log, this.behavior);
+      this.current = new ScriptedTransport(this.log, this.behavior, this.responder);
       this.transports.push(this.current);
     }
     return Promise.resolve(this.current);

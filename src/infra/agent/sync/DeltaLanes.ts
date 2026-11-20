@@ -171,7 +171,7 @@ async function assertFreeSpace(context: SyncOperationContext, large: readonly De
 }
 
 /** `Скачивание изменённых файлов: 27 из 28, 312,4 МБ из 1,19 ГБ (25%), 5,8 МБ/с, осталось ~3 мин 31 с`. */
-function transferFormat(title: string): TransferFormat {
+export function transferFormat(title: string): TransferFormat {
   return (state) => {
     const percent = state.totalBytes > 0
       ? Math.floor((state.doneBytes * 100) / state.totalBytes)

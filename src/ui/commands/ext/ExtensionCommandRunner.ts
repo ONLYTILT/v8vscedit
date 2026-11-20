@@ -7,13 +7,11 @@ import {
   maskSensitiveCliArgs,
   runProcess,
 } from '../../../infra/process';
-import { readExtensionListFromDumpFile } from '../../../infra/environment';
 import {
   buildConnectionCliArgs,
   resolveConnectionFromSettings,
   resolveProjectSettingsPath,
   resolveSettingsPath,
-  type ConnectionParams,
 } from './connectionSettings';
 import type { ConfigurationImportHooks, ConfigurationProgressHooks } from './configurationOperationTypes';
 import {
@@ -24,7 +22,7 @@ import {
 } from './configurationOperationStatus';
 // Режим, а не булев флаг: remote без агентского режима — отказ, а не тихий откат на пакетный.
 import { getAgentExecutionMode } from './agent/agentSettings';
-import { runAgentConfigurationOperation } from './agent/agentConfigurationOperation';
+import { notifyAgentWarnings, runAgentConfigurationOperation, runAgentOperation } from './agent/agentConfigurationOperation';
 import { promptFullDump } from './agent/fullDumpPrompt';
 import { promptMirrorSeed } from './agent/mirrorSeedPrompt';
 import { promptOrphanRemoval } from './agent/orphanFilesPrompt';
@@ -55,6 +53,8 @@ export {
   resolveAgentExecutionMode,
   splitAgentModeArgs,
 } from './agent/agentSettings';
+// Список расширений базы перенесён в ExtensionListRunner (агентская ветка + batch), здесь — реэкспорт.
+export { listConnectedDatabaseExtensions } from './ExtensionListRunner';
 export {
   disposeCachedAgentOperationServices,
   getAgentOperationServiceForInteractiveDesigner,
@@ -169,26 +169,49 @@ export async function runDecompileMainConfiguration(
   );
 }
 
+export interface ApplyDatabaseTarget {
+  kind: 'cf' | 'cfe';
+  name: string;
+  rootPath: string;
+  extensionName?: string;
+}
+
+/** Исход применения к базе; `warnings` — предупреждения сверки агентской ветки (E11: имя взято из файла). */
+export interface ApplyDatabaseOutcome {
+  readonly success: boolean;
+  /** Пусто в batch-режиме и при отказе. */
+  readonly warnings: readonly string[];
+}
+
 export async function runApplyDatabaseConfiguration(
-  target: {
-    kind: 'cf' | 'cfe';
-    name: string;
-    rootPath: string;
-    extensionName?: string;
-  },
+  target: ApplyDatabaseTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
   showSuccessMessage = false
 ): Promise<boolean> {
+  return (await runApplyDatabaseConfigurationWithOutcome(target, workspaceFolder, outputChannel, showSuccessMessage)).success;
+}
+
+/**
+ * То же применение с исходом: MCP отдаёт предупреждения сверки агенту (`silentWarnings` — без уведомлений),
+ * UI показывает их уведомлением.
+ */
+export async function runApplyDatabaseConfigurationWithOutcome(
+  target: ApplyDatabaseTarget,
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  showSuccessMessage = false,
+  silentWarnings = false
+): Promise<ApplyDatabaseOutcome> {
   if (getAgentExecutionMode() === 'batch') {
-    return runBatchApplyDatabaseConfiguration(target, workspaceFolder, outputChannel, showSuccessMessage);
+    return { success: await runBatchApplyDatabaseConfiguration(target, workspaceFolder, outputChannel, showSuccessMessage), warnings: [] };
   }
 
   const targetLabel = target.kind === 'cfe'
     ? `расширения ${target.name}`
     : `конфигурации ${target.name}`;
 
-  return runAgentConfigurationOperation(
+  const outcome = await runAgentOperation(
     {
       progressTitle: `Обновление ${targetLabel} в БД`,
       progressStartMessage: 'Применение изменений конфигурации через агент...',
@@ -199,10 +222,9 @@ export async function runApplyDatabaseConfiguration(
       outputChannel,
       rootPath: target.rootPath,
     },
-    async (service, operationHooks) => {
-      await service.updateDatabaseConfiguration(target, operationHooks);
-    }
+    (service, operationHooks) => service.updateDatabaseConfiguration(target, operationHooks)
   );
+  return outcome.ok ? { success: true, warnings: notifyAgentWarnings(outcome.value, silentWarnings) } : { success: false, warnings: [] };
 }
 
 export async function runCompileExtension(
@@ -228,10 +250,7 @@ export async function runCompileExtension(
       rootPath: extensionRoot,
     },
     async (service, operationHooks) => {
-      await service.loadFullAndUpdate(
-        { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName },
-        operationHooks
-      );
+      notifyAgentWarnings(await service.loadFullAndUpdate({ kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName }, operationHooks));
     }
   );
 }
@@ -263,10 +282,7 @@ export async function runUpdateExtension(
       confirmFullDump: promptFullDump,
     },
     async (service, operationHooks) => {
-      await service.loadChangedAndUpdate(
-        { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName },
-        operationHooks
-      );
+      notifyAgentWarnings(await service.loadChangedAndUpdate({ kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName }, operationHooks));
     }
   );
 }
@@ -362,60 +378,6 @@ async function runBatchDecompileExtension(
   }
 }
 
-/**
- * Возвращает список имён расширений, подключённых к базе проекта, через
- * внутренний CLI (`list-db-extensions` → Конфигуратор). Если подключение к базе
- * не настроено (нет env.json/`--ibconnection`) или CLI завершился ошибкой —
- * возвращает `undefined`, чтобы вызывающая сторона откатилась на ручной ввод.
- */
-/* c8 ignore start -- спавн node-CLI и реального Конфигуратора не юнит-тестируется в CI (правило CLAUDE.md №4); тестируемая логика разбора списка вынесена в infra/environment/ExtensionListParser */
-export async function listConnectedDatabaseExtensions(
-  workspaceFolder: vscode.WorkspaceFolder,
-  outputChannel: vscode.OutputChannel
-): Promise<string[] | undefined> {
-  const settingsPath = resolveProjectSettingsPath(workspaceFolder.uri.fsPath);
-  let connection: ConnectionParams;
-  try {
-    connection = await resolveConnectionFromSettings(settingsPath);
-  } catch {
-    return undefined;
-  }
-
-  const tempRoot = createWorkspaceTempDir(workspaceFolder.uri.fsPath, 'list-ext-');
-  const resultFile = path.join(tempRoot, 'extensions.txt');
-  try {
-    const cliArgs = [
-      'list-db-extensions',
-      '-ProjectRoot',
-      workspaceFolder.uri.fsPath,
-      '-ResultFile',
-      resultFile,
-      ...buildConnectionCliArgs(connection),
-    ];
-    const ok = await runInternalCliCommand(
-      {
-        cliArgs,
-        progressTitle: 'Получение списка расширений базы',
-        progressStartMessage: 'Запрос списка расширений из базы...',
-        successMessage: 'Список расширений базы получен.',
-        errorTitle: 'Не удалось получить список расширений базы.',
-        failureOperation: 'получении списка расширений базы',
-        logPrefix: 'list-db-extensions',
-        showSuccessMessage: false,
-        showErrorMessage: false,
-      },
-      workspaceFolder,
-      outputChannel
-    );
-    if (!ok) {
-      return undefined;
-    }
-    return readExtensionListFromDumpFile(resultFile);
-  } finally {
-    removeTempDir(tempRoot, outputChannel);
-  }
-}
-/* c8 ignore stop */
 
 async function runBatchDecompileMainConfiguration(
   configName: string,

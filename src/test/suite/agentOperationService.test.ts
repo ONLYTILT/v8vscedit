@@ -11,6 +11,7 @@ import {
   type AgentCommandResult,
 } from '../../infra/agent';
 import { buildHashSnapshot, buildScopeKey, saveHashCache } from '../../infra/cache/HashCache';
+import { PROPERTIES_GET_ALL, extensionListMessages } from './support/agentExtensionsEmulator';
 import { FakeTimers, ScriptedFactory, agentError } from './support/agentInfoBaseFakes';
 import { mirrorDirOf, newService } from './support/agentWorkspaceFixtures';
 
@@ -372,8 +373,11 @@ suite('AgentOperationService: Э4, все операции идут через �
     assert.strictEqual(service.isInfoBaseConnected(), true);
   });
 
-  test('cfe: имя расширения уходит в команды; без extensionName — имя цели', async () => {
-    const factory = new ScriptedFactory();
+  test('cfe: имя расширения уходит в команды; без extensionName — имя цели; перед каждым update — список расширений (guard Э28), после — сверка', async () => {
+    // Агент «знает» все три расширения: guard применения требует их наличия в списке.
+    const factory = new ScriptedFactory(undefined, (command) =>
+      command === PROPERTIES_GET_ALL ? extensionListMessages(['Расш1', 'Расш2', 'Расш3']) : undefined
+    );
     const service = newService(tempRoot, factory);
     await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Расш1', rootPath: configRoot });
     await service.updateDatabaseConfiguration({ kind: 'cfe', name: 'Узел', extensionName: 'Расш2', rootPath: configRoot });
@@ -384,6 +388,22 @@ suite('AgentOperationService: Э4, все операции идут через �
     assert.match(updates[2], /--extension=Расш3/);
     assert.ok(factory.log.some((c) => c.startsWith('config load-config-from-files') && c.includes('--extension=Расш3')));
     assert.strictEqual(factory.count('common connect-ib'), 1);
+    // Порядок первых двух операций: connect-ib, список (guard), update, список (сверка имени после применения).
+    assert.deepStrictEqual(factory.log.slice(0, 4), [
+      'common connect-ib', PROPERTIES_GET_ALL, 'config update-db-cfg --extension=Расш1', PROPERTIES_GET_ALL,
+    ]);
+    // loadFullAndUpdate: загрузка из файлов, затем guard → update → сверка (последние три команды журнала).
+    assert.ok(factory.log.findIndex((c) => c.startsWith('config load-config-from-files')) > 3);
+    assert.deepStrictEqual(factory.log.slice(-3), [
+      PROPERTIES_GET_ALL, 'config update-db-cfg --extension=Расш3', PROPERTIES_GET_ALL,
+    ]);
+    assert.strictEqual(factory.count(PROPERTIES_GET_ALL), 6, 'по два списка на каждое из трёх применений');
+  });
+
+  test('cf: применение не запрашивает список расширений (guard только для cfe)', async () => {
+    const factory = new ScriptedFactory();
+    await newService(tempRoot, factory).updateDatabaseConfiguration(cf());
+    assert.deepStrictEqual(factory.log, ['common connect-ib', 'config update-db-cfg']);
   });
 
   function messagesOf(run: (hooks: { onMessage: (m: string) => void }) => Promise<unknown>): Promise<string[]> {

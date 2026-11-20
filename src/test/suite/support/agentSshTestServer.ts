@@ -27,6 +27,14 @@ export interface AgentSshTestServerOptions {
 export type AgentWireMessage = Readonly<Record<string, unknown>>;
 export type ShellResponder = (line: string) => Promise<readonly AgentWireMessage[]>;
 
+/**
+ * Режим «агент не отвечает» (ФАКТ Э29: процесс жив, ответа и `close` нет): обработчик возвращает этот промис.
+ * Он не разрешается никогда — срок короткой команды проверяется заданием МАЛОГО `deadlineMs`, а не ожиданием.
+ */
+export function neverAnswer(): Promise<never> {
+  return new Promise<never>(() => undefined);
+}
+
 async function respondWith(
   responder: ShellResponder,
   line: string,
@@ -37,8 +45,12 @@ async function respondWith(
     const answered = await responder(line);
     messages = answered.length > 0 ? answered : [{ type: 'success' }];
   } catch (error) {
-    const finalMessage = (error as { finalMessage?: AgentWireMessage }).finalMessage;
-    messages = [finalMessage ?? { type: 'error', message: (error as Error).message }];
+    const failure = error as { finalMessage?: AgentWireMessage; precedingMessages?: readonly AgentWireMessage[] };
+    // Настоящий агент отдаёт ВСЕ сообщения команды одним массивом: `log`-строки идут перед `error`.
+    messages = [
+      ...(failure.precedingMessages ?? []),
+      failure.finalMessage ?? { type: 'error', message: (error as Error).message },
+    ];
   }
   stream.write(`${JSON.stringify(messages)}\n`);
 }

@@ -8,7 +8,9 @@ export type AgentMessageType =
   | 'generation-id'
   | 'loading-issue'
   | 'progress'
-  | 'extension-info';
+  | 'extension-info'
+  /** Свойства расширения; при одном расширении — единственное сообщение ответа, без `success` (Э30–Э31). */
+  | 'extension-properties';
 
 export interface AgentMessage {
   readonly type: AgentMessageType;

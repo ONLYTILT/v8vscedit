@@ -99,9 +99,11 @@ export class RemoteHarness {
       if (custom) {
         return custom;
       }
-      await this.emulator.execute(line);
-      return [];
+      const result = await this.emulator.execute(line);
+      return result.messages as unknown as readonly AgentWireMessage[];
     });
+    // Падение процесса агента (ловушка эмулятора `crashOn(…, 'drop')`) — обрыв всех SSH-соединений сервера.
+    this.emulator.extensions.onDrop = () => this.server.dropClients();
 
     this.writeEnv();
     this.secrets = new Map<string, string>();

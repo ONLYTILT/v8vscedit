@@ -14,7 +14,7 @@ import { runDumpConfigurationToCf, runLoadConfigurationFromCf } from '../../comm
 import { runDumpAllExtensionsToCfe, runLoadAllExtensionsFromCfe } from '../../commands/ext/CfeBatchCommandRunner';
 import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport } from '../../../infra/cfFile';
 import { buildCfApplyTarget, resolveApplyTargetFromNode } from '../../commands/ext/CfFileTarget';
-import { runApplyDatabaseConfiguration } from '../../commands/ext/ExtensionCommandRunner';
+import { runApplyDatabaseConfigurationWithOutcome } from '../../commands/ext/ExtensionCommandRunner';
 import {
   MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
   isConfigurationOperationRunning,
@@ -102,7 +102,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     {
       title: 'Выгрузить конфигурацию в CF-файл',
       description: [
-        'Выгружает конфигурацию базы в бинарный файл через пакетный Конфигуратор: основную конфигурацию в .cf,',
+        'Выгружает конфигурацию базы в бинарный файл через пакетный Конфигуратор (режим batch) или агента конфигуратора (режим agent; файлы передаются на сервер агента и обратно): основную конфигурацию в .cf,',
         'расширение — в .cfe (если задан extensionName).',
         'Файл появляется на целевом пути только при успешном завершении; overwrite разрешает заменить существующий файл.',
         'Для выгрузки ВСЕХ расширений базы одной операцией используйте v8vscedit_dump_all_cfe — этот инструмент работает с одним объектом за вызов.',
@@ -127,8 +127,8 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         overwrite: overwrite ?? false,
         silent: true,
       }));
-      if (!dumped) {
-        throw new Error('Выгрузка в файл не выполнена. Подробности — в журнале «1С Редактор».');
+      if (!dumped.success) {
+        throw new Error(dumped.failureReason ?? 'Выгрузка в файл не выполнена. Подробности — в журнале «1С Редактор».');
       }
       return { outputFile, extensionName: extensionName ?? '', overwrite: overwrite ?? false };
     })
@@ -139,8 +139,10 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     {
       title: 'Загрузить конфигурацию из CF-файла',
       description: [
-        'Загружает конфигурацию из бинарного файла в базу через пакетный Конфигуратор: .cf — в основную конфигурацию,',
+        'Загружает конфигурацию из бинарного файла в базу через пакетный Конфигуратор (режим batch) или агента конфигуратора (режим agent; файлы передаются на сервер агента и обратно): .cf — в основную конфигурацию,',
         '.cfe — в расширение (если задан extensionName; несуществующее расширение при этом создаётся в базе).',
+        'В режиме agent загрузка в НОВОЕ расширение сразу применяет его к базе (иначе в базе остаётся неприменённая заглушка):',
+        'тогда databaseConfigurationUpdated = true и createdInDatabase = true; extensionNameInDatabase — имя в базе, если оно взято из файла.',
         'Операция необратима и требует confirm: true.',
         'Конфигурация БАЗЫ при загрузке не обновляется — примените изменения отдельно через applyToDatabase: true.',
         'XML-выгрузка проекта после загрузки перестаёт соответствовать базе: выполните импорт конфигураций.',
@@ -174,19 +176,24 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           extensionName,
           silent: true,
         });
-        if (!loaded) {
-          throw new Error(
+        if (!loaded.success) {
+          throw new Error(loaded.failureReason ?? (
             'Загрузка из файла не выполнена. Часть изменений могла быть применена — проверьте состояние базы. '
             + 'Подробности — в журнале «1С Редактор».'
-          );
+          ));
         }
-        const applied = applyToDatabase === true
-          ? await runApplyDatabaseConfiguration(
+        const appliedAutomatically = loaded.appliedToDatabase === true;
+        // Уже применённое агентом новое расширение повторно не применяется.
+        const applyOutcome = applyToDatabase === true && !appliedAutomatically
+          ? await runApplyDatabaseConfigurationWithOutcome(
               buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName ?? ''),
               services.workspaceFolder,
-              services.outputChannel
+              services.outputChannel,
+              false,
+              true
             )
-          : false;
+          : undefined;
+        const applied = applyOutcome?.success === true;
         // Конфигурация проекта НЕ помечается изменённой: файлы проекта не
         // менялись, а пометка привела бы к тому, что «обновить изменённые
         // конфигурации» залило бы СТАРЫЕ файлы обратно в базу поверх
@@ -194,8 +201,15 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         return {
           inputFile,
           extensionName: extensionName ?? '',
-          databaseConfigurationUpdated: applied,
+          databaseConfigurationUpdated: applied || appliedAutomatically,
           projectSourcesOutdated: true,
+          // Поля агентской ветки; в batch-ответе их нет (ключи без значения не публикуются).
+          ...definedFields({
+            createdInDatabase: loaded.createdInDatabase,
+            extensionNameInDatabase: loaded.extensionNameInDatabase,
+            // Предупреждения загрузки и применения (E11: имя в базе взято из файла) — агенту дословно.
+            warnings: mergeWarnings(loaded.warnings, applyOutcome?.warnings),
+          }),
         };
       }));
     }
@@ -206,7 +220,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     {
       title: 'Выгрузить все расширения базы в CFE-файлы',
       description: [
-        'Выгружает КАЖДОЕ подключённое к базе расширение в отдельный .cfe-файл каталога outputDir.',
+        'Выгружает КАЖДОЕ подключённое к базе расширение в отдельный .cfe-файл каталога outputDir через пакетный Конфигуратор (режим batch) или агента конфигуратора (режим agent; файлы передаются на сервер агента и обратно).',
         'Список расширений берётся у самой базы; рядом с файлами пишется манифест cfe-dump.json,',
         'по которому загрузка восстанавливает исходные имена расширений (имя файла санитизируется необратимо).',
         'Отказ по отдельному расширению не останавливает операцию: такие расширения возвращаются в failed,',
@@ -229,7 +243,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         overwrite: overwrite ?? false,
         silent: true,
       });
-      const report = assertBatchReport(result.report, 'Пакетная выгрузка расширений не выполнена.');
+      const report = assertBatchReport(result.report, 'Пакетная выгрузка расширений не выполнена.', result.failureReason);
       // Частичный отказ — УСПЕХ со списком failed: выгрузка базу не меняет, а
       // готовые бэкапы ценны сами по себе и исключение их бы скрыло.
       return {
@@ -249,7 +263,10 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     {
       title: 'Загрузить все расширения базы из CFE-файлов',
       description: [
-        'Загружает в базу КАЖДОЕ расширение из .cfe-файлов каталога inputDir (имена восстанавливаются по манифесту cfe-dump.json).',
+        'Загружает в базу КАЖДОЕ расширение из .cfe-файлов каталога inputDir (имена восстанавливаются по манифесту cfe-dump.json)',
+        'через пакетный Конфигуратор (режим batch) или агента конфигуратора (режим agent; файлы передаются на сервер агента и обратно).',
+        'В режиме agent загрузка в НОВОЕ расширение сразу применяет его к базе (иначе в базе остаётся неприменённая заглушка):',
+        'такие расширения возвращаются в appliedAutomatically и через applyToDatabase повторно не применяются.',
         'Операция необратима и требует confirm: true.',
         'При отказе на любом расширении загрузка ОСТАНАВЛИВАЕТСЯ: состояние сбойного расширения в базе неопределённо,',
         'остальные не трогаются. createMissing разрешает создавать в базе расширения, которых в ней ещё нет.',
@@ -284,30 +301,42 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           createMissing: createMissing ?? false,
           silent: true,
         });
-        const report = assertBatchReport(result.report, 'Пакетная загрузка расширений не выполнена.');
+        const report = assertBatchReport(result.report, 'Пакетная загрузка расширений не выполнена.', result.failureReason);
         if (report.failedAt) {
           // Частичный отказ загрузки — исключение, а не «успех со списком»:
           // база в промежуточном состоянии, и штатным итогом это не является.
-          throw new Error(
+          // В агентском режиме новые расширения ДО сбоя уже применены (update-db-cfg) — об этом сказать явно.
+          const notes = appliedBeforeFailureNotes(report);
+          throw new Error([
             `Загрузка остановлена на расширении "${report.failedAt.extensionName}" (файл ${report.failedAt.fileName}): `
             + 'состояние этого расширения в базе НЕОПРЕДЕЛЕНО (неудачная загрузка всё равно регистрирует расширение в базе). '
-            + 'Расширения после него не загружались, конфигурация базы не обновлялась.'
-          );
+            + (notes.length === 0
+              ? 'Расширения после него не загружались, конфигурация базы не обновлялась.'
+              : 'Расширения после него не загружались.'),
+            ...notes,
+          ].join(' '));
         }
 
         const loaded = report.items.filter((item) => item.status === 'ok').map((item) => item.extensionName);
+        const appliedAutomatically = report.items
+          .filter((item) => item.status === 'ok' && item.appliedToDatabase === true)
+          .map((item) => item.extensionName);
         const applied: string[] = [];
+        const applyWarnings: string[] = [];
         if (applyToDatabase === true) {
           // Применение — по расширению на вызов через ТОТ ЖЕ путь, что у
           // одиночной загрузки: `/UpdateDBCfg -AllExtensions` применил бы и
           // расширения, которых мы не грузили.
-          for (const extensionName of loaded) {
-            const ok = await runApplyDatabaseConfiguration(
+          for (const extensionName of loaded.filter((name) => !appliedAutomatically.includes(name))) {
+            const outcome = await runApplyDatabaseConfigurationWithOutcome(
               buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName),
               services.workspaceFolder,
-              services.outputChannel
+              services.outputChannel,
+              false,
+              true
             );
-            if (!ok) {
+            applyWarnings.push(...outcome.warnings);
+            if (!outcome.success) {
               throw new Error(`Расширения загружены, но применение к базе не выполнено на "${extensionName}". Подробности — в журнале «1С Редактор».`);
             }
             applied.push(extensionName);
@@ -326,8 +355,14 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           // манифеста (`A_B.cfe` — это и `A:B`, и `A/B`): единственный признак,
           // что в базу могло уехать чужое поколение бэкапа.
           restoredByFileName: report.restoredByFileName,
-          databaseConfigurationUpdated: applyToDatabase === true,
+          databaseConfigurationUpdated: applyToDatabase === true || appliedAutomatically.length > 0,
           projectSourcesOutdated: true,
+          appliedAutomatically,
+          ...definedFields({
+            verificationWarnings: report.verificationWarnings,
+            // Предупреждения сверки после применения существующих расширений (E11).
+            warnings: applyWarnings.length > 0 ? applyWarnings : undefined,
+          }),
         };
       }));
     }
@@ -453,8 +488,8 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         throw new Error(`Путь "${path}" должен указывать на корень конфигурации или расширения.`);
       }
       return runWithConfigurationOperationLockOrThrow(async () => {
-        const updated = await runApplyDatabaseConfiguration(target, services.workspaceFolder, services.outputChannel);
-        if (!updated) {
+        const updated = await runApplyDatabaseConfigurationWithOutcome(target, services.workspaceFolder, services.outputChannel, false, true);
+        if (!updated.success) {
           throw new Error('Обновление конфигурации БД не выполнено. Подробности — в журнале «1С Редактор».');
         }
         const repositoryTarget = services.repositoryService.resolveTargetByConfigRoot(target.rootPath);
@@ -470,6 +505,8 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           ...(unloadedChangedFilesCount > 0
             ? { note: '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_execute_command v8vscedit.updateChangedConfigurations' }
             : {}),
+          // Предупреждения сверки после применения расширения (E11: имя в базе взято из файла).
+          ...definedFields({ warnings: mergeWarnings(updated.warnings) }),
         };
       });
     })
@@ -485,13 +522,57 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
  * (обработаны не все расширения). «Успехом с пустым результатом» агент принял
  * бы любой из них за штатный итог.
  */
-function assertBatchReport(report: CfeBatchReport | undefined, failureMessage: string): CfeBatchReport {
+function assertBatchReport(report: CfeBatchReport | undefined, failureMessage: string, failureReason?: string): CfeBatchReport {
+  // Агентская операция без отчёта несёт причину: агент MCP получает её дословно.
+  if (!report && failureReason !== undefined) {
+    throw new Error(`${failureMessage} ${failureReason}`);
+  }
   if (!report) {
     throw new Error(`${failureMessage} Подробности — в журнале «1С Редактор».`);
   }
   const errors = report.errors ?? [];
-  if (errors.length > 0 || report.interrupted) {
-    throw new Error([failureMessage, ...errors, 'Подробности — в журнале «1С Редактор».'].join(' '));
+  // Потеря связи с агентом (`abortReason`) — тоже не итог: обработаны не все расширения.
+  const abort = report.abortReason === undefined ? [] : [report.abortReason];
+  if (errors.length > 0 || report.interrupted || abort.length > 0) {
+    // Загрузка через агента до обрыва уже могла применить новые расширения — об этом сказать явно.
+    const applied = report.operation === 'load' ? appliedBeforeFailureNotes(report) : [];
+    throw new Error([failureMessage, ...errors, ...abort, ...applied, 'Подробности — в журнале «1С Редактор».'].join(' '));
   }
   return report;
+}
+
+/** Непустые списки предупреждений; `undefined` — предупреждений нет (ответ не получает ключа `warnings`). */
+function mergeWarnings(...lists: (readonly string[] | undefined)[]): string[] | undefined {
+  let merged: string[] | undefined;
+  for (const list of lists) {
+    if (list !== undefined && list.length > 0) {
+      merged = [...(merged ?? []), ...list];
+    }
+  }
+  return merged;
+}
+
+/**
+ * Что уже изменено в базе до сбоя пакетной загрузки (агентская ветка): новые расширения применены сразу, плюс
+ * предупреждения сверки. Пусто — в базе применено ничего не было (batch или сбой на первом новом).
+ */
+function appliedBeforeFailureNotes(report: CfeBatchReport): string[] {
+  const applied = report.items
+    .filter((item) => item.status === 'ok' && item.appliedToDatabase === true)
+    .map((item) => item.extensionName);
+  return [
+    ...(applied.length > 0 ? [`Уже созданы в базе и применены (update-db-cfg выполнен): ${applied.join(', ')}.`] : []),
+    ...(report.verificationWarnings ?? []),
+  ];
+}
+
+/** Только заданные поля: batch-ответ не получает ключей агентской ветки со значением `undefined`. */
+function definedFields(fields: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) {
+      result[key] = value;
+    }
+  }
+  return result;
 }

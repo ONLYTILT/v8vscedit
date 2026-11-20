@@ -1,7 +1,9 @@
 import {
   buildUpdateDbCfgCommand,
+  type AgentExtensionInfo,
   type AgentMessage,
 } from '../../domain/agent';
+import type { CfeBatchReport } from '../cfFile/CfeBatchReport';
 import { buildScopeKey } from '../cache/HashCache';
 import { saveMetadataCacheForEntry } from '../cache/MetadataCache';
 import { AgentWorkspaceService, buildAgentProjectId } from './AgentWorkspaceService';
@@ -11,6 +13,17 @@ import type { AgentTransferCancellation } from './files/AgentFileTransfer';
 import { createLocalAgentFileStore } from './files/LocalAgentFileStore';
 import { connectSftpAgentFileStore } from './files/SftpAgentFileStore';
 import type { DesignerAgentConnectionOptions } from './ProcessDesignerAgentTransport';
+import {
+  dumpCfFileViaAgent,
+  loadCfFileViaAgent,
+  type AgentCfFileContext,
+  type AgentCfFileDumpRequest,
+  type AgentCfFileDumpResult,
+  type AgentCfFileLoadRequest,
+  type AgentCfFileLoadResult,
+} from './extensions/AgentCfFileExchange';
+import { dumpAllExtensionsViaAgent, loadAllExtensionsViaAgent, type AgentCfeDumpAllRequest, type AgentCfeLoadAllRequest } from './extensions/AgentCfeBatch';
+import { listDatabaseExtensions, requireExtensionInDatabase, verifyAppliedExtension } from './extensions/AgentExtensionList';
 import { AgentSyncEngine } from './sync/AgentSyncEngine';
 import type { MirrorSeedCandidate } from './sync/MirrorSeed';
 import type { AgentProgressEvent } from './sync/SyncProgress';
@@ -100,6 +113,8 @@ export interface AgentOperationHooks {
 export interface AgentOperationResult {
   readonly changedProjectFiles: string[];
   readonly skipped?: boolean;
+  /** Предупреждения сверки после применения расширения (E11: имя в базе взято из файла). Нет — поля нет. */
+  readonly warnings?: readonly string[];
 }
 
 /**
@@ -141,6 +156,7 @@ export interface DesignerAgentInfoBaseSession {
  */
 export class AgentOperationService implements DesignerAgentInfoBaseSession {
   private readonly session: AgentInfoBaseSession;
+  private readonly clock: () => number;
   private files: AgentFiles | undefined;
 
   constructor(
@@ -150,6 +166,7 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     private readonly filesOptions?: AgentOperationFilesOptions,
     private readonly syncOptions: AgentOperationSyncOptions = {}
   ) {
+    this.clock = sessionOptions.clock ?? Date.now;
     this.session = new AgentInfoBaseSession(transportFactory, {
       // По умолчанию база держится до явного release (план: idleDisconnectMinutes = 0).
       idleDisconnectMs: sessionOptions.idleDisconnectMs ?? 0,
@@ -214,8 +231,8 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
         hooks?.onMessage?.('изменений для загрузки нет');
         return { changedProjectFiles: [], skipped: true };
       }
-      await this.updateDatabaseConfigurationConnected(target, exec, hooks);
-      return { changedProjectFiles: [] };
+      // Предупреждения сверки (E11) не теряются: их показывает UI и отдаёт MCP.
+      return this.updateDatabaseConfigurationConnected(target, exec, hooks);
     }, hooks);
   }
 
@@ -223,16 +240,61 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     return this.session.run((exec) => this.updateDatabaseConfigurationConnected(target, exec, hooks), hooks);
   }
 
+  /** Список расширений базы (`properties get --all-extensions`); файлы агента не нужны. */
+  listDatabaseExtensions(hooks?: AgentOperationHooks): Promise<AgentExtensionInfo[]> {
+    return this.session.run((exec) => listDatabaseExtensions(exec), hooks);
+  }
+
+  dumpCfFile(request: AgentCfFileDumpRequest, hooks?: AgentOperationHooks): Promise<AgentCfFileDumpResult> {
+    return this.runWithFiles((ctx) => dumpCfFileViaAgent(ctx, request), hooks);
+  }
+
+  loadCfFile(request: AgentCfFileLoadRequest, hooks?: AgentOperationHooks): Promise<AgentCfFileLoadResult> {
+    return this.runWithFiles((ctx) => loadCfFileViaAgent(ctx, request), hooks);
+  }
+
+  dumpAllExtensionsToCfe(request: AgentCfeDumpAllRequest, hooks?: AgentOperationHooks): Promise<CfeBatchReport> {
+    return this.runWithFiles((ctx) => dumpAllExtensionsViaAgent(ctx, request), hooks);
+  }
+
+  loadAllExtensionsFromCfe(request: AgentCfeLoadAllRequest, hooks?: AgentOperationHooks): Promise<CfeBatchReport> {
+    return this.runWithFiles((ctx) => loadAllExtensionsViaAgent(ctx, request), hooks);
+  }
+
+  private runWithFiles<T>(operation: (ctx: AgentCfFileContext) => Promise<T>, hooks?: AgentOperationHooks): Promise<T> {
+    const filesOptions = this.requireFilesOptions();
+    return this.session.run(async (exec) => {
+      const { store } = await this.getFiles(filesOptions);
+      return operation({ exec, store, projectId: buildAgentProjectId(this.projectRoot), hooks, now: this.clock });
+    }, hooks);
+  }
+
+  /**
+   * Для cfe — guard Э28: агент на `update-db-cfg` отсутствующего расширения отвечает успехом молча, поэтому
+   * наличие проверяется заранее (E6). После применения — сверка списком (`verifyAppliedExtension`): имя из файла
+   * (ФАКТ Э29, П4) — предупреждение E11 (цель проекта `cfe/<имя>` могла перестать существовать); заглушка или
+   * отсутствие имени — ошибка E12, как у загрузки нового расширения.
+   */
   private async updateDatabaseConfigurationConnected(
     target: AgentConfigurationOperationTarget,
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentOperationResult> {
+    const extensionName = target.kind === 'cfe' ? target.extensionName ?? target.name : undefined;
+    const before = extensionName === undefined ? undefined : await requireExtensionInDatabase(exec, extensionName);
     hooks?.onMessage?.('Обновление конфигурации базы данных.');
-    await exec.execute(
-      buildUpdateDbCfgCommand({ extensionName: target.kind === 'cfe' ? target.extensionName ?? target.name : undefined })
-    );
-    return { changedProjectFiles: [] };
+    await exec.execute(buildUpdateDbCfgCommand({ extensionName }));
+    if (extensionName === undefined || before === undefined) {
+      return { changedProjectFiles: [] };
+    }
+    const { warnings } = await verifyAppliedExtension(exec, before, extensionName, 'apply');
+    if (warnings.length === 0) {
+      return { changedProjectFiles: [] };
+    }
+    for (const warning of warnings) {
+      hooks?.onMessage?.(warning);
+    }
+    return { changedProjectFiles: [], warnings };
   }
 
   /** Кэш метаданных дерева строится по новому P; B и кэш хэшей уже сохранил движок. */

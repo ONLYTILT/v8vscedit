@@ -121,7 +121,7 @@ suite('ProcessDesignerAgentTransport', () => {
 
     await assert.rejects(
       transport.execute('config dump-config-to-files --dir=workspace/test'),
-      /SSH-соединение с агентом закрыто с кодом 255/
+      /SSH-соединение с агентом закрыто во время команды/
     );
   });
 

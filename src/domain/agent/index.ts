@@ -4,3 +4,6 @@ export * from './AgentMessage';
 export * from './AgentBaseDirIndex';
 export * from './DumpChangesParser';
 export * from './InfoBaseLockRetryPolicy';
+export * from './AgentExtensionCommands';
+export * from './AgentExtensionPlan';
+export * from './ExtensionProperties';

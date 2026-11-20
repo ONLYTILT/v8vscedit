@@ -8,6 +8,7 @@ import {
   DesignerAgentSessionManager,
   ProcessDesignerAgentTransportFactory,
   buildDesignerAgentModeArgs,
+  decideAgentHangRecovery,
   describeError,
   releaseInfoBase,
   resolveAgentBaseDir,
@@ -28,6 +29,7 @@ import {
   toAgentEndpointOptions,
   toDesignerAgentConnection,
   type AgentCommandSettings,
+  type AgentLocation,
 } from './agentSettings';
 
 export interface CachedAgentService {
@@ -114,14 +116,47 @@ export async function disposeCachedAgentOperationServices(): Promise<void> {
     if (!entry) {
       return;
     }
-    try {
-      // Сначала снимается idle-таймер: иначе он сработал бы уже на закрытом транспорте.
-      await entry.service.dispose();
-      await entry.sessions.disposeAll();
-    } finally {
-      await entry.process?.stop();
-    }
+    await disposeAgentEntry(entry);
   }));
+}
+
+async function disposeAgentEntry(entry: CachedAgentService): Promise<void> {
+  try {
+    // Сначала снимается idle-таймер: иначе он сработал бы уже на закрытом транспорте.
+    await entry.service.dispose();
+    await entry.sessions.disposeAll();
+  } finally {
+    await entry.process?.stop();
+  }
+}
+
+/**
+ * Восстановление после неответа агента на короткую команду за срок (общая защита; известного триггера нет —
+ * ФАКТ Э30–Э31): решение — в infra (`decideAgentHangRecovery`), здесь — исполнение. Свой локальный процесс
+ * (автозапуск) останавливается и убирается из кэша: следующая операция запустит агента заново. Повтора команды
+ * нет. `location` — место агента той операции, что получила отказ. Возвращает текст причины для человека;
+ * `undefined` — ошибка не неответ за срок.
+ */
+export async function recoverAgentAfterHang(
+  error: unknown,
+  location: AgentLocation,
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel
+): Promise<string | undefined> {
+  const key = getAgentServiceCacheKey(workspaceFolder.uri.fsPath);
+  const cached = agentServices.get(key);
+  const entry = await cached?.catch(() => undefined);
+  const decision = decideAgentHangRecovery(error, { location, ownsProcess: entry?.process !== undefined });
+  if (decision?.restartOwnProcess === true && entry !== undefined) {
+    outputChannel.appendLine('[agent] Агент конфигуратора не отвечает: соединение закрывается, процесс останавливается для перезапуска.');
+    agentServices.delete(key);
+    try {
+      await disposeAgentEntry(entry);
+    } catch (stopError) {
+      outputChannel.appendLine(`[agent][warn] Не удалось остановить не отвечающий агент конфигуратора: ${describeError(stopError)}`);
+    }
+  }
+  return decision?.text;
 }
 
 export async function getAgentOperationServiceForInteractiveDesigner(

@@ -17,9 +17,11 @@ import {
   updateConfigurationOperationStatus,
   runUpdateMainConfiguration,
   runUpdateExtension,
-  listConnectedDatabaseExtensions,
 } from './ExtensionCommandRunner';
+import { describeExtensionListFailure, listConnectedDatabaseExtensions } from './ExtensionListRunner';
+import { getAgentExecutionMode } from './agent/agentSettings';
 import { planExtensionChoices } from '../../../infra/environment';
+import { removeTreeSync } from '../../../infra/fs/TreeRemoval';
 import {
   endConfigurationOperation,
   isConfigurationOperationRunning,
@@ -241,7 +243,9 @@ export function registerExtensionCommands(
             services.bslAnalyzerConfigService.updateSource(getConnectedExtensionRoots(services, extensionRoot));
           },
           afterFailure: async () => {
-            fs.rmSync(extensionRoot, { recursive: true, force: true });
+            // Обход unlink/rmdir, а не fs.rmSync: имя расширения бывает кириллическим (запрет №19).
+            /* c8 ignore next -- ветка отказа vscode-команды подключения без полного харнесса CommandServices; само удаление покрыто treeRemoval.test.ts */
+            removeTreeSync(extensionRoot);
             await services.reloadEntries();
           },
         },
@@ -598,14 +602,14 @@ function isDirectory(directoryPath: string): boolean {
 /* c8 ignore start -- диалоги vscode (QuickPick) и чтение ФС списка подключённых расширений; не юнит-тестируется (правило CLAUDE.md №4), решающая логика — в planExtensionChoices */
 async function resolveExtensionNameToConnect(services: CommandServices): Promise<string | undefined> {
   const workspaceRoot = services.workspaceFolder.uri.fsPath;
-  const dbNames = await listConnectedDatabaseExtensions(services.workspaceFolder, services.outputChannel);
+  const list = await listConnectedDatabaseExtensions(services.workspaceFolder, services.outputChannel);
 
-  if (dbNames === undefined) {
-    await vscode.window.showErrorMessage(
-      'Не удалось получить список расширений из базы. Проверьте подключение к базе (env.json) и версию платформы — список расширений доступен начиная с 8.3.11.'
-    );
+  if (list.kind === 'unavailable') {
+    await vscode.window.showErrorMessage(describeExtensionListFailure(getAgentExecutionMode(), list.reason));
     return undefined;
   }
+  // Неприменённые заглушки в список не попадают: импорт заглушки рискует уронить агента (не проверялось).
+  const dbNames = list.names;
   if (dbNames.length === 0) {
     await vscode.window.showInformationMessage('В подключённой базе нет расширений.');
     return undefined;

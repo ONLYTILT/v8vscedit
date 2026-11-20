@@ -9,6 +9,7 @@ import {
   AgentCommandError,
   type AgentCommandHooks,
   type AgentCommandResult,
+  type AgentExecuteOptions,
   type DesignerAgentTransport,
   type DesignerAgentTransportFactory,
   type ResettableDesignerAgentTransportFactory,
@@ -22,7 +23,13 @@ export interface TimerApi {
 
 /** Исполнитель команд агента внутри одной операции: подключение ИБ уже гарантировано сессией. */
 export interface AgentCommandExecutor {
-  execute(command: string): Promise<AgentCommandResult>;
+  execute(command: string, options?: AgentExecuteOptions): Promise<AgentCommandResult>;
+  /**
+   * `disconnect-ib` (ответ «не подключено» проглатывается) и `connect-ib` с повтором блокировки — на ТОМ ЖЕ
+   * транспорте. Правило Э28: после сбоя загрузки/выгрузки агент мог остаться в плохом состоянии, а перед
+   * повторной загрузкой в имя нужно переподключение ИБ.
+   */
+  reconnectInfoBase(): Promise<void>;
 }
 
 export interface AgentInfoBaseSessionOptions {
@@ -161,13 +168,33 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
     }
 
     try {
-      const result = await op({ execute: (command) => transport.execute(command, commandHooks) });
+      const result = await op({
+        execute: (command, options) => transport.execute(command, commandHooks, options),
+        reconnectInfoBase: () => this.reconnectOnTransport(transport, commandHooks, hooks),
+      });
       this.lastActivityAt = this.options.clock();
       return result;
     } catch (error) {
       await this.releaseAfterFailure(transport, commandHooks, hooks);
       throw error;
     }
+  }
+
+  private async reconnectOnTransport(
+    transport: DesignerAgentTransport,
+    commandHooks: AgentCommandHooks,
+    hooks: AgentOperationHooks | undefined
+  ): Promise<void> {
+    this.connectedTransport = undefined;
+    hooks?.onMessage?.(DISCONNECT_MESSAGE);
+    try {
+      await transport.execute(AGENT_DISCONNECT_IB_COMMAND, commandHooks);
+    } catch (error) {
+      if (!isInfoBaseNotConnectedError(error)) {
+        throw error;
+      }
+    }
+    await this.ensureConnected(transport, commandHooks, hooks);
   }
 
   private async ensureConnected(

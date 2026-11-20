@@ -122,6 +122,7 @@ const RUNNER_FUNCTIONS = [
   'runUpdateMainConfiguration',
   'runUpdateExtension',
   'runApplyDatabaseConfiguration',
+  'runApplyDatabaseConfigurationWithOutcome',
 ] as const;
 const WINDOW_FUNCTIONS = ['showErrorMessage', 'showWarningMessage', 'showInformationMessage', 'showQuickPick', 'showInputBox'] as const;
 
@@ -281,6 +282,11 @@ export async function createRepoProject(): Promise<RepoProject> {
     project.events.push(event); held(event); project.applyCalls.push(args);
     return Promise.resolve(project.applyResult);
   };
+  // MCP `update_database_configuration` берёт исход применения (предупреждения сверки): та же запись событий.
+  runnerRef.runApplyDatabaseConfigurationWithOutcome = async (...args: unknown[]) => ({
+    success: await (runnerRef.runApplyDatabaseConfiguration as (...a: unknown[]) => Promise<boolean>)(...args),
+    warnings: [],
+  });
 
   (project as { services: CommandServices }).services = {
     workspaceFolder: { uri: vscode.Uri.file(root), name: 'repo-mcp', index: 0 },

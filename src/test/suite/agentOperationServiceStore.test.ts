@@ -5,6 +5,7 @@ import * as path from 'path';
 import { AgentOperationService } from '../../infra/agent';
 import { buildAgentProjectId } from '../../infra/agent/AgentWorkspaceService';
 import { buildHashSnapshot, buildScopeKey, loadHashCache, saveHashCache } from '../../infra/cache/HashCache';
+import { PROPERTIES_GET_ALL, extensionListMessages } from './support/agentExtensionsEmulator';
 import { ScriptedFactory } from './support/agentInfoBaseFakes';
 import {
   AGENT_USER,
@@ -68,7 +69,10 @@ suite('AgentOperationService: Э5, файлы рабочей области че
   });
 
   test('cfe: зеркало workspace/<projectId>/cfe/<имя>, расширение уходит в команду', async () => {
-    const factory = new ScriptedFactory();
+    // Guard применения cfe запрашивает список расширений: агент «знает» загружаемое расширение.
+    const factory = new ScriptedFactory(undefined, (command) =>
+      command === PROPERTIES_GET_ALL ? extensionListMessages(['Расш']) : undefined
+    );
     await newService(tempRoot, factory).loadFullAndUpdate({ kind: 'cfe', name: 'Узел', extensionName: 'Расш', rootPath: configRoot });
     assert.ok(fs.existsSync(path.join(cfeMirrorDirOf(tempRoot, 'Расш'), 'Configuration.xml')));
     const load = factory.log.find((c) => c.startsWith('config load-config-from-files'));

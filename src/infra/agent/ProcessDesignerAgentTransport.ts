@@ -6,8 +6,14 @@ import { getAgentMessageText, isTerminalAgentMessage } from '../../domain/agent'
 import { SSH_CLOSED_BEFORE_READY_CODE } from './SshConnectErrorClassifier';
 import { AgentConnectRetryLoop, type AgentConnectRetryDeps } from './AgentConnectRetry';
 import { DesignerAgentJsonReader } from './DesignerAgentJsonReader';
-import type { AgentCommandHooks, AgentCommandResult, DesignerAgentTransport, DesignerAgentTransportFactory } from './AgentTransport';
-import { AgentCommandError } from './AgentTransport';
+import type {
+  AgentCommandHooks,
+  AgentCommandResult,
+  AgentExecuteOptions,
+  DesignerAgentTransport,
+  DesignerAgentTransportFactory,
+} from './AgentTransport';
+import { AgentCommandError, AgentConnectionLostError, agentCommandVerb } from './AgentTransport';
 
 export interface DesignerAgentSshClient {
   on(event: 'ready' | 'close', listener: () => void): this;
@@ -163,10 +169,10 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     }
   }
 
-  async execute(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+  async execute(command: string, hooks?: AgentCommandHooks, options?: AgentExecuteOptions): Promise<AgentCommandResult> {
     this.queue = this.queue
       .catch(() => undefined)
-      .then(() => this.executeQueued(command, hooks));
+      .then(() => this.executeQueued(command, hooks, options));
     return this.queue as Promise<AgentCommandResult>;
   }
 
@@ -212,14 +218,19 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
     }
   }
 
-  private async executeQueued(command: string, hooks?: AgentCommandHooks): Promise<AgentCommandResult> {
+  private async executeQueued(command: string, hooks?: AgentCommandHooks, options?: AgentExecuteOptions): Promise<AgentCommandResult> {
     this.assertUsable();
     await this.connect();
     const channel = this.requireChannel();
     const messages: AgentMessage[] = [];
+    const verb = agentCommandVerb(command);
 
     return new Promise<AgentCommandResult>((resolve, reject) => {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
+        if (deadline !== undefined) {
+          clearTimeout(deadline);
+        }
         this.output.off('messages', onMessages);
         this.output.off('stderr', onStderr);
         this.output.off('error', onError);
@@ -227,7 +238,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
       };
 
       const onMessages = (batch: AgentMessage[]) => {
-        void this.handleMessages(batch, messages, hooks)
+        void this.handleMessages(batch, messages, hooks, options?.terminalTypes ?? [])
           .then((terminal) => {
             if (!terminal) {
               return;
@@ -235,7 +246,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
             cleanup();
             const last = messages.at(-1);
             if (last?.type === 'error' || last?.type === 'canceled') {
-              reject(new AgentCommandError(getAgentMessageText(last), command, last));
+              reject(new AgentCommandError(getAgentMessageText(last), command, last, [...messages]));
               return;
             }
             resolve({ messages });
@@ -251,19 +262,33 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
           hooks?.onMessage?.({ type: 'log', message: text.trim() });
         }
       };
+      // Обрыв канала посреди команды — признак падения процесса агента (Э28), а не «таймаут».
       const onError = (error: Error) => {
         cleanup();
-        reject(error);
+        reject(new AgentConnectionLostError(verb, 'error', error.message));
       };
-      const onClose = (code: number) => {
+      const onClose = () => {
         cleanup();
-        reject(new Error(`SSH-соединение с агентом закрыто с кодом ${String(code)}.`));
+        reject(new AgentConnectionLostError(verb, 'closed'));
       };
+      if (options?.deadlineMs !== undefined) {
+        const deadlineMs = options.deadlineMs;
+        deadline = setTimeout(() => {
+          cleanup();
+          // Не отвечающий агент держит базу, пока жив канал: сброс SSH её отпускает.
+          this.lost = true;
+          void this.reset();
+          reject(new AgentConnectionLostError(verb, 'no-response', undefined, { deadlineMs }));
+        }, deadlineMs);
+      }
 
       this.output.on('messages', onMessages);
       this.output.on('stderr', onStderr);
       this.output.on('error', onError);
       this.output.on('close', onClose);
+      // Недочитанный хвост прошлого ответа (обрывок JSON после завершающего сообщения) к новой команде не
+      // относится: без сброса он склеился бы с её ответом. См. `AgentExecuteOptions.terminalTypes`.
+      this.reader.reset();
       channel.write(`${command}\n`);
     });
   }
@@ -271,7 +296,8 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
   private async handleMessages(
     batch: AgentMessage[],
     target: AgentMessage[],
-    hooks?: AgentCommandHooks
+    hooks: AgentCommandHooks | undefined,
+    terminalTypes: readonly AgentMessage['type'][]
   ): Promise<boolean> {
     let terminal = false;
     for (const message of batch) {
@@ -283,7 +309,7 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
           this.requireChannel().write(`${answer}\n`);
         }
       }
-      terminal = isTerminalAgentMessage(message) || terminal;
+      terminal = isTerminalAgentMessage(message) || terminalTypes.includes(message.type) || terminal;
     }
     return terminal;
   }

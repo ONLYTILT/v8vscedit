@@ -477,6 +477,10 @@ suite('McpConfigLifecycleTools — v8vscedit_dump_cf/v8vscedit_load_cf (успе
     assert.strictEqual(data.databaseConfigurationUpdated, false, 'applyToDatabase не передан — /UpdateDBCfg не должен запускаться');
     assert.strictEqual(data.projectSourcesOutdated, true,
       'ответ обязан предупреждать, что XML-выгрузка проекта больше не соответствует базе — иначе агент решит, что дерево проекта уже актуально');
+    // Регресс batch: поля агентской ветки в ответе отсутствуют (plan-remote-extensions §5.3).
+    for (const key of ['createdInDatabase', 'extensionNameInDatabase', 'warnings']) {
+      assert.ok(!(key in data), `в batch-ответе нет поля ${key}: ${JSON.stringify(data)}`);
+    }
   });
 
   test('v8vscedit_load_cf: успешный путь, applyToDatabase=true, основная конфигурация → databaseConfigurationUpdated=true (buildApplyTarget: ветка cf)', async function () {

@@ -31,7 +31,9 @@
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { AgentMessage } from '../../../domain/agent';
 import { META_TYPES } from '../../../domain/MetaTypes';
+import { AgentExtensionsEmulator } from './agentExtensionsEmulator';
 import { agentError } from './agentInfoBaseFakes';
 import { buildZip, readZipAsMap } from './zipFixtures';
 
@@ -168,10 +170,15 @@ export class AgentConfigEmulator {
     return this.listDumpNames.at(-1);
   }
 
+  /** Команды расширений и CF/CFE-файлов (`dump-cfg`/`load-cfg`/`update-db-cfg`/`properties get`) — отдельный модуль. */
+  readonly extensions: AgentExtensionsEmulator;
+
   private readonly objects = new Map<string, EmulatedObject>();
   private versionCounter = 1;
 
-  constructor(private readonly userRoot: string) {}
+  constructor(private readonly userRoot: string) {
+    this.extensions = new AgentExtensionsEmulator(userRoot);
+  }
 
   // ── Модель базы ─────────────────────────────────────────────────────────
 
@@ -301,8 +308,8 @@ export class AgentConfigEmulator {
 
   // ── Исполнитель команд ─────────────────────────────────────────────────
 
-  /** Контракт `AgentCommandExecutor`: ошибки агента — отклонённый промис. */
-  execute(commandLine: string): Promise<{ messages: [] }> {
+  /** Контракт `AgentCommandExecutor`: ошибки агента — отклонённый промис; `messages` — тело ответа (список расширений). */
+  execute(commandLine: string): Promise<{ messages: AgentMessage[] }> {
     const parsed = parseAgentCommandLine(commandLine);
     this.commands.push(parsed);
     try {
@@ -310,6 +317,16 @@ export class AgentConfigEmulator {
       const failure = this.failWhen?.(parsed);
       if (failure) {
         throw failure;
+      }
+      if (parsed.command === 'config update-db-cfg') {
+        this.updateDbCalls += 1;
+      }
+      const handled = this.extensions.handle(parsed);
+      if (handled?.kind === 'crash') {
+        return this.extensions.crash(handled.mode, commandLine);
+      }
+      if (handled) {
+        return Promise.resolve({ messages: handled.messages });
       }
       this.run(parsed);
       return Promise.resolve({ messages: [] });
@@ -333,9 +350,6 @@ export class AgentConfigEmulator {
         return;
       case 'config load-config-from-files':
         this.load(cmd);
-        return;
-      case 'config update-db-cfg':
-        this.updateDbCalls += 1;
         return;
       default:
         // connect-ib, disconnect-ib и прочие команды жизненного цикла: ответ «успешно».

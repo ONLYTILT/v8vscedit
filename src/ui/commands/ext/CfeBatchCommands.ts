@@ -64,6 +64,10 @@ export function buildBatchOutcomeMessage(
   if (report.interrupted) {
     parts.push('Операция прервана.');
   }
+  if (report.abortReason !== undefined) {
+    // Потеря связи с агентом (агентская ветка): без причины «прервано» выглядело бы отменой пользователя.
+    parts.push(`Причина: ${report.abortReason}`);
+  }
   const notAttempted = namesWith('notAttempted');
   if (notAttempted.length > 0) {
     parts.push(`Не обрабатывались: ${notAttempted.join(', ')}.`);
@@ -85,6 +89,26 @@ export function buildRestoredByFileNameMessage(report: CfeBatchReport | undefine
   }
   return `Имя расширения восстановлено по имени файла, а не по манифесту ${CFE_MANIFEST_FILE_NAME}: ${restored.join(', ')}. `
     + 'Проверьте, что загружено то, что ожидалось.';
+}
+
+/**
+ * Предупреждения сверки по списку расширений после агентской загрузки (имя из файла, оставшаяся заглушка);
+ * `undefined` — сверки не было или расхождений нет.
+ */
+export function buildVerificationWarningsMessage(report: CfeBatchReport | undefined): string | undefined {
+  const warnings = report?.verificationWarnings ?? [];
+  return warnings.length > 0 ? `Проверка по списку расширений базы: ${warnings.join(' ')}` : undefined;
+}
+
+/**
+ * Новые расширения, которые агентская загрузка применила к базе сразу (иначе в базе осталась бы заглушка,
+ * Э28): применять их вручную не нужно. `undefined` — таких нет.
+ */
+export function buildAppliedImmediatelyMessage(report: CfeBatchReport | undefined): string | undefined {
+  const applied = (report?.items ?? [])
+    .filter((item) => item.status === 'ok' && item.appliedToDatabase === true)
+    .map((item) => item.extensionName);
+  return applied.length > 0 ? `Новые расширения созданы в базе и применены сразу: ${applied.join(', ')}.` : undefined;
 }
 
 async function dumpAllExtensionsToCfe(services: CommandServices): Promise<void> {
@@ -168,6 +192,13 @@ async function loadAllExtensionsFromCfe(services: CommandServices): Promise<void
     await endConfigurationOperation();
   }
 
+  // Новые расширения, применённые агентом сразу, и итог сверки — в любом исходе, в т.ч. при остановке на сбое:
+  // база уже изменена, и молчать об этом нельзя.
+  const appliedMessage = buildAppliedImmediatelyMessage(report);
+  if (appliedMessage !== undefined) {
+    void vscode.window.showInformationMessage(appliedMessage);
+  }
+  showWarning(buildVerificationWarningsMessage(report));
   if (report?.failedAt) {
     void vscode.window.showErrorMessage(
       `Загрузка остановлена на расширении "${report.failedAt.extensionName}". `

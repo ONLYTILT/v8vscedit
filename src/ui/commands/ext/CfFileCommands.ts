@@ -8,9 +8,11 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { CommandServices, NodeArg } from '../_shared';
-import { runDumpConfigurationToCf, runLoadConfigurationFromCf } from './CfFileCommandRunner';
+import { runDumpConfigurationToCf, runLoadConfigurationFromCf, type CfFileRunOutcome } from './CfFileCommandRunner';
 import { buildCfApplyTarget, resolveCfFileTargetFromNode } from './CfFileTarget';
-import { listConnectedDatabaseExtensions, runApplyDatabaseConfiguration } from './ExtensionCommandRunner';
+import { getAgentExecutionMode } from './agent/agentSettings';
+import { runApplyDatabaseConfiguration } from './ExtensionCommandRunner';
+import { describeExtensionListFailure, listConnectedDatabaseExtensions } from './ExtensionListRunner';
 import {
   endConfigurationOperation,
   isConfigurationOperationRunning,
@@ -106,7 +108,7 @@ async function loadConfigurationFromCf(services: CommandServices, node?: NodeArg
     showOperationAlreadyRunning();
     return;
   }
-  let loaded = false;
+  let loaded: CfFileRunOutcome | undefined;
   try {
     loaded = await runLoadConfigurationFromCf({
       workspaceFolder: services.workspaceFolder,
@@ -127,8 +129,8 @@ async function loadConfigurationFromCf(services: CommandServices, node?: NodeArg
     await endConfigurationOperation();
   }
 
-  if (loaded) {
-    await offerPostLoadSteps(services, target.extensionName);
+  if (loaded?.success === true) {
+    await offerPostLoadSteps(services, target.extensionName, loaded);
   }
   /* c8 ignore stop */
 }
@@ -141,13 +143,22 @@ async function loadConfigurationFromCf(services: CommandServices, node?: NodeArg
  * проекта НЕ помечаем — иначе «обновить изменённые конфигурации» залило бы
  * СТАРЫЕ файлы проекта обратно в базу поверх только что загруженного CF.
  */
-async function offerPostLoadSteps(services: CommandServices, extensionName: string): Promise<void> {
+async function offerPostLoadSteps(services: CommandServices, extensionName: string, outcome: CfFileRunOutcome): Promise<void> {
+  const plan = planPostLoadPrompts(outcome, extensionName);
+  for (const warning of plan.warnings) {
+    void vscode.window.showWarningMessage(warning);
+  }
+  if (plan.info !== undefined) {
+    void vscode.window.showInformationMessage(plan.info);
+  }
   const applyAction = 'Применить к базе';
-  const action = await vscode.window.showWarningMessage(
-    'Конфигурация загружена, но конфигурация базы ещё не обновлена. Применить изменения к базе?',
-    applyAction,
-    'Позже'
-  );
+  const action = plan.askApply
+    ? await vscode.window.showWarningMessage(
+      'Конфигурация загружена, но конфигурация базы ещё не обновлена. Применить изменения к базе?',
+      applyAction,
+      'Позже'
+    )
+    : undefined;
   if (action === applyAction) {
     // Замок мог перехватить кто-то ещё, пока пользователь читал вопрос. Молча
     // ничего не делать нельзя: пользователь нажал кнопку и вправе понимать,
@@ -195,11 +206,8 @@ async function pickDumpTarget(services: CommandServices): Promise<CfFileTarget |
   // Имя расширения берём ТОЛЬКО из базы: выгрузить можно лишь то расширение,
   // которое в базе реально есть, а ручной ввод дал бы ошибку платформы уже
   // после спавна Конфигуратора.
-  const extensions = await listConnectedDatabaseExtensions(services.workspaceFolder, services.outputChannel);
+  const extensions = await pickableExtensions(services);
   if (!extensions) {
-    void vscode.window.showErrorMessage(
-      'Не удалось получить список расширений базы: проверьте параметры подключения (env.json) и доступность платформы.'
-    );
     return undefined;
   }
   if (extensions.length === 0) {
@@ -223,11 +231,8 @@ async function pickLoadTarget(services: CommandServices): Promise<CfFileTarget |
     return { extensionName: '' };
   }
 
-  const extensions = await listConnectedDatabaseExtensions(services.workspaceFolder, services.outputChannel);
+  const extensions = await pickableExtensions(services);
   if (!extensions) {
-    void vscode.window.showErrorMessage(
-      'Не удалось получить список расширений базы: проверьте параметры подключения (env.json) и доступность платформы.'
-    );
     return undefined;
   }
 
@@ -254,6 +259,16 @@ async function pickLoadTarget(services: CommandServices): Promise<CfFileTarget |
     return undefined;
   }
   return { extensionName: trimmed };
+}
+
+/** Имена расширений базы для выбора (без неприменённых заглушек); отказ — сообщение и `undefined`. */
+async function pickableExtensions(services: CommandServices): Promise<string[] | undefined> {
+  const list = await listConnectedDatabaseExtensions(services.workspaceFolder, services.outputChannel);
+  if (list.kind === 'unavailable') {
+    void vscode.window.showErrorMessage(describeExtensionListFailure(getAgentExecutionMode(), list.reason));
+    return undefined;
+  }
+  return list.names;
 }
 
 async function pickTargetKind(title: string): Promise<'cf' | 'cfe' | undefined> {
@@ -316,6 +331,25 @@ export function toDialogTarget(node: NodeArg | undefined): CfFileTarget | undefi
     return undefined;
   }
   return { extensionName: target.kind === 'extension' ? target.extensionName : '' };
+}
+
+export interface PostLoadPromptPlan {
+  /** Задавать ли вопрос «Применить к базе?»: у применённого сразу расширения — нет. */
+  readonly askApply: boolean;
+  /** Информация вместо вопроса (агентская загрузка нового расширения применяет его сразу, Э28). */
+  readonly info: string | undefined;
+  /** Предупреждения операции (E11 — имя в базе взято из файла, отмена после загрузки). */
+  readonly warnings: readonly string[];
+}
+
+/** Какие вопросы и сообщения показать после успешной загрузки CF/CFE. Чистая: все ветки — под тестом. */
+export function planPostLoadPrompts(outcome: CfFileRunOutcome, extensionName: string): PostLoadPromptPlan {
+  const applied = outcome.appliedToDatabase === true;
+  return {
+    askApply: !applied,
+    info: applied ? `Расширение «${outcome.extensionNameInDatabase ?? extensionName}» создано в базе и применено.` : undefined,
+    warnings: outcome.warnings ?? [],
+  };
 }
 
 function showOperationAlreadyRunning(): void {

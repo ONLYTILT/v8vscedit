@@ -210,7 +210,9 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     }
     return out.sort();
   };
-  const exec: AgentCommandExecutor = { execute: (command) => emulator.execute(command) };
+  // Через промежуточную переменную: контракт исполнителя дополнен `reconnectInfoBase`, а движку синхронизации он не нужен.
+  const execImpl = { execute: (command: string) => emulator.execute(command), reconnectInfoBase: () => Promise.resolve() };
+  const exec: AgentCommandExecutor = execImpl;
 
   return {
     kind,
