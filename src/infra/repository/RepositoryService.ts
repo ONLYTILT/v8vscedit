@@ -473,6 +473,32 @@ export class RepositoryService {
     return !this.isLocked(target, fullName);
   }
 
+  /**
+   * Захваченные (по локальному учёту) объекты, которые попадут в выборку операции хранилища для
+   * узла. Э24: `/ConfigurationRepositoryUpdateCfg` возвращает захваченный объект к версии
+   * хранилища (с `-force` и без), и правки, загруженные в базу, но не помещённые, теряются —
+   * по этому списку команда спрашивает подтверждение.
+   *
+   * Состав подсистемы здесь не разрешается, поэтому её рекурсивная выборка считается
+   * покрывающей все захваты цели: лишний вопрос дешевле молча потерянной правки.
+   */
+  findLockedInSelection(node: RepositoryNodeRef, recursive: boolean): string[] {
+    const target = node.xmlPath ? this.resolveTargetByXmlPath(node.xmlPath) : null;
+    if (!target) {
+      return [];
+    }
+    const locked = this.getLockedFullNames(target);
+    if (node.nodeKind === 'configuration' || node.nodeKind === 'extension') {
+      const rootLockName = this.getRootLockName(target);
+      return recursive ? locked : locked.filter((name) => name === rootLockName);
+    }
+    if (node.nodeKind === 'Subsystem' && recursive) {
+      return locked;
+    }
+    const fullName = this.resolveFullName(node);
+    return fullName && locked.includes(fullName) ? [fullName] : [];
+  }
+
   clearLocks(target: RepositoryTarget): void {
     const state = this.loadStateFile();
     const scopeKey = this.buildScopeKey(target);
@@ -849,6 +875,19 @@ export class RepositoryService {
   private getRootLockName(target: RepositoryTarget): string {
     return target.configKind === 'cfe' ? EXTENSION_ROOT_LOCK_NAME : CONFIGURATION_ROOT_LOCK_NAME;
   }
+
+  private getLockedFullNames(target: RepositoryTarget): string[] {
+    const scope = this.loadStateFile().scopes[this.buildScopeKey(target)] as RepositoryScopeState | undefined;
+    return [...(scope?.lockedFullNames ?? [])];
+  }
+}
+
+/** Имя из учёта захватов для показа человеку: служебные имена корня — подписью, остальное как есть. */
+export function formatRepositoryLockName(name: string): string {
+  if (name === CONFIGURATION_ROOT_LOCK_NAME) {
+    return 'корень конфигурации';
+  }
+  return name === EXTENSION_ROOT_LOCK_NAME ? 'корень расширения' : name;
 }
 
 function getFileMtimeMs(filePath: string): number | undefined {

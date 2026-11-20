@@ -9,6 +9,8 @@ import { findChangedConfiguration, importTargetFromDatabase, refreshRepositoryUi
 import { askRecursiveMode, pickBoolean } from './repositoryPrompts';
 import {
   describeImportFailureAfterReceive,
+  describeLoadFailureAfterReceive,
+  describeLockedOverwrite,
   describeProjectBehindAfterReceive,
   planRepositoryUpdate,
   shouldImportAfterReceive,
@@ -44,7 +46,8 @@ async function runUpdateCommand(services: CommandServices, node: NodeArg): Promi
     return;
   }
 
-  const plan = await resolveUpdatePlan(services, target);
+  const lockedInSelection = services.repositoryService.findLockedInSelection(repositoryNode, request.recursive);
+  const plan = await resolveUpdatePlan(services, target, lockedInSelection);
   if (plan === 'cancel') {
     return;
   }
@@ -78,18 +81,55 @@ async function askUpdateRequest(node: RepositoryCommandNode): Promise<UpdateRequ
   return { recursive, force, version: normalizeUpdateVersion(version) };
 }
 
-/** Вопрос задаётся ДО замка: ожидание ответа пользователя не должно держать базу занятой. */
-async function resolveUpdatePlan(services: CommandServices, target: RepositoryTarget): Promise<RepositoryUpdatePlan | 'cancel'> {
+/** Вопросы задаются ДО замка: ожидание ответа пользователя не должно держать базу занятой. */
+async function resolveUpdatePlan(
+  services: CommandServices,
+  target: RepositoryTarget,
+  lockedInSelection: readonly string[]
+): Promise<RepositoryUpdatePlan | 'cancel'> {
   const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
+  let lockedOverwriteConfirmed: boolean | undefined;
   let choice: UpdateLocalChangesChoice | undefined;
-  // Таблица решения одна: после ответа она сама скажет, что делать (при ответе 'ask' не возвращается).
+  // Таблица решения одна: после каждого ответа она сама скажет, что делать дальше.
   for (;;) {
-    const plan = planRepositoryUpdate({ dirtyFilesCount, choice });
-    if (plan !== 'ask') {
+    const plan = planRepositoryUpdate({ dirtyFilesCount, lockedInSelection, lockedOverwriteConfirmed, choice });
+    if (plan === 'ask-locked-overwrite') {
+      lockedOverwriteConfirmed = await promptOverwriteLocked(lockedInSelection);
+    } else if (plan === 'ask-local-changes') {
+      choice = await promptUpdateWithLocalChanges(target, dirtyFilesCount);
+    } else {
       return plan;
     }
-    choice = await promptUpdateWithLocalChanges(target, dirtyFilesCount);
   }
+}
+
+interface OverwriteLockedItem extends vscode.QuickPickItem {
+  readonly id: 'receive' | 'cancel';
+}
+
+/**
+ * Платформа не бережёт захваченные объекты при получении (Э24), а вернуть потерянные правки базы
+ * расширению нечем, поэтому решает человек. Вопрос с ответом — запрет №18 его не касается.
+ */
+async function promptOverwriteLocked(lockedInSelection: readonly string[]): Promise<boolean> {
+  const items: OverwriteLockedItem[] = [
+    {
+      id: 'receive',
+      label: '$(warning) Получить, вернув захваченные объекты к версии хранилища',
+      detail: 'Незагруженные правки проекта будут загружены после получения, если вы выберете это на следующем шаге',
+    },
+    {
+      id: 'cancel',
+      label: '$(close) Отменить получение',
+      detail: 'Сначала поместите правки захваченных объектов в хранилище или получите другой узел',
+    },
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    title: 'Получение из хранилища: в выборке есть захваченные вами объекты',
+    placeHolder: describeLockedOverwrite(lockedInSelection),
+    ignoreFocusOut: true,
+  });
+  return picked?.id === 'receive';
 }
 
 interface UpdateChoiceItem extends vscode.QuickPickItem {
@@ -103,8 +143,8 @@ interface UpdateChoiceItem extends vscode.QuickPickItem {
 async function promptUpdateWithLocalChanges(target: RepositoryTarget, dirtyFilesCount: number): Promise<UpdateLocalChangesChoice> {
   const items: UpdateChoiceItem[] = [
     {
-      id: 'update-then-receive',
-      label: '$(sync) Загрузить правки в базу, затем получить',
+      id: 'receive-then-load',
+      label: '$(sync) Получить, затем загрузить правки в базу',
       detail: 'Правки должны относиться к захваченным объектам: незахваченный объект платформа загрузить не даст',
     },
     {
@@ -125,7 +165,10 @@ async function promptUpdateWithLocalChanges(target: RepositoryTarget, dirtyFiles
   return picked?.id ?? 'cancel';
 }
 
-/** Вся цепочка — одна секция замка: между получением и импортом не должна вклиниться другая операция. */
+/**
+ * Вся цепочка — одна секция замка: между получением, загрузкой и импортом не должна вклиниться другая
+ * операция. Загрузка правок — после получения (Э24): загруженное до него получение затёрло бы.
+ */
 async function runUpdateChain(
   services: CommandServices,
   target: RepositoryTarget,
@@ -133,12 +176,14 @@ async function runUpdateChain(
   request: UpdateRequest,
   plan: RepositoryUpdatePlan
 ): Promise<boolean> {
-  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
-    return false;
-  }
   const outcome = await runRepositoryUpdateAction(toCliServices(services), node, request);
   if (outcome === undefined) {
     return false;
+  }
+  if (plan.loadChangesAfterReceive && !await updateTargetDatabase(target, services)) {
+    // Импорт перезаписал бы незагруженные правки проекта. Без await (запрет №18).
+    void vscode.window.showWarningMessage(describeLoadFailureAfterReceive(target.displayName));
+    return true;
   }
   if (shouldImportAfterReceive(plan, outcome)) {
     if (!await importTargetFromDatabase(target, services)) {

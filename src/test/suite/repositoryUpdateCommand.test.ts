@@ -22,8 +22,10 @@ import { disposeRepositoryCommandStatusBar } from '../../ui/commands/repository/
 import { registerRepositoryCommands } from '../../ui/commands/repository/RepositoryCommands';
 import {
   describeImportFailureAfterReceive,
+  describeLoadFailureAfterReceive,
   describeProjectBehindAfterReceive,
 } from '../../ui/commands/repository/repositoryUpdateFlow';
+import { removeTreeSync } from './support/tempTree';
 
 /**
  * Команда `v8vscedit.repository.update` целиком: настоящие `registerRepositoryCommands`, RepositoryService,
@@ -242,7 +244,7 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       runnerRef[key] = saved[key];
     }
     disposeRepositoryCommandStatusBar();
-    fs.rmSync(root, { recursive: true, force: true });
+    removeTreeSync(root);
   });
 
   suite('чистый проект', () => {
@@ -369,7 +371,7 @@ suite('v8vscedit.repository.update: получение, импорт по лог
   suite('незагруженные правки проекта — вопрос до замка', () => {
     const dirty = (): void => { changed = [{ rootPath: cfRoot, name: 'Основная', changedFilesCount: 2 }]; };
 
-    test('вопрос из трёх пунктов (update-then-receive, receive-without-import, cancel) в этом порядке; замок во время вопроса свободен; cancel — ничего не запущено', async () => {
+    test('вопрос из трёх пунктов (receive-then-load, receive-without-import, cancel) в этом порядке; замок во время вопроса свободен; cancel — ничего не запущено', async () => {
       dirty();
       answerRequest([(items) => {
         assert.strictEqual(isConfigurationOperationRunning(), false, 'вопрос задаётся ДО замка');
@@ -380,8 +382,8 @@ suite('v8vscedit.repository.update: получение, импорт по лог
 
       assert.strictEqual(pickItems.length, 3);
       const items = pickItems[2];
-      assert.deepStrictEqual(items.map((item) => (item as { id?: string }).id), ['update-then-receive', 'receive-without-import', 'cancel']);
-      assert.ok(items[0].label.startsWith('$(sync) Загрузить правки в базу, затем получить'), items[0].label);
+      assert.deepStrictEqual(items.map((item) => (item as { id?: string }).id), ['receive-then-load', 'receive-without-import', 'cancel']);
+      assert.ok(items[0].label.startsWith('$(sync) Получить, затем загрузить правки в базу'), items[0].label);
       assert.ok(items[1].label.startsWith('$(cloud-download) Получить, проект не обновлять'), items[1].label);
       assert.deepStrictEqual(events, []);
     });
@@ -395,37 +397,62 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       assert.deepStrictEqual(events, []);
     });
 
-    test('update-then-receive: порядок update → receive → import; всё под одним замком', async () => {
+    test('receive-then-load: порядок receive → update → import (Э24: загруженное ДО получения оно бы затёрло); всё под одним замком', async () => {
       dirty();
-      answerRequest([pickById('update-then-receive')]);
+      answerRequest([pickById('receive-then-load')]);
 
       await update();
 
-      assert.deepStrictEqual(events, ['update:cf', 'receive', 'import:cf']);
-      assert.deepStrictEqual(lockHeldAt, { 'update:cf': true, receive: true, 'import:cf': true });
-      // Чистым корень помечают и загрузка в базу, и импорт после получения.
+      assert.deepStrictEqual(events, ['receive', 'update:cf', 'import:cf']);
+      assert.deepStrictEqual(lockHeldAt, { receive: true, 'update:cf': true, 'import:cf': true });
+      // Чистым корень помечают и загрузка в базу, и импорт после неё.
       assert.deepStrictEqual(cleaned, [[cfRoot], [cfRoot]]);
+      assert.deepStrictEqual(warnings, []);
     });
 
-    test('update-then-receive, цель cfe: загрузка и импорт расширения', async () => {
+    test('receive-then-load, цель cfe: загрузка и импорт расширения', async () => {
       changed = [{ rootPath: cfeRoot, name: 'Расш', changedFilesCount: 1 }];
-      answerRequest([pickById('update-then-receive')]);
+      answerRequest([pickById('receive-then-load')]);
 
       await update(cfeCatalogNode);
 
-      assert.deepStrictEqual(events, ['update:cfe:Расш', 'receive', 'import:cfe:Расш']);
+      assert.deepStrictEqual(events, ['receive', 'update:cfe:Расш', 'import:cfe:Расш']);
     });
 
-    test('update-then-receive, сбой загрузки в базу: получения нет, импорта нет', async () => {
+    test('receive-then-load, лог без «получен»: правки загружаются, импорта нет', async () => {
       dirty();
-      updateResult = false;
-      answerRequest([pickById('update-then-receive')]);
+      setLog(LOG_NOTHING_RECEIVED);
+      answerRequest([pickById('receive-then-load')]);
 
       await update();
 
-      assert.deepStrictEqual(events, ['update:cf']);
-      assert.strictEqual(runs.length, 0);
-      assert.strictEqual(isConfigurationOperationRunning(), false);
+      assert.deepStrictEqual(events, ['receive', 'update:cf']);
+      assert.deepStrictEqual(warnings, []);
+    });
+
+    test('receive-then-load, сбой загрузки после получения: импорта нет (он перезаписал бы правки), предупреждение без await', async () => {
+      dirty();
+      updateResult = false;
+      warningNeverResolves = true;
+      answerRequest([pickById('receive-then-load')]);
+
+      await update();
+
+      assert.deepStrictEqual(events, ['receive', 'update:cf']);
+      assert.deepStrictEqual(warnings, [describeLoadFailureAfterReceive('Основная')]);
+      assert.deepStrictEqual(cleaned, []);
+      assert.strictEqual(isConfigurationOperationRunning(), false, 'запрет №18: замок не ждёт закрытия предупреждения');
+    });
+
+    test('receive-then-load, получение упало: загрузки и импорта нет', async () => {
+      dirty();
+      setLog('Нет доступа к хранилищу', 1);
+      answerRequest([pickById('receive-then-load')]);
+
+      await update();
+
+      assert.deepStrictEqual(events, ['receive']);
+      assert.strictEqual(errors.length, 1);
     });
 
     test('receive-without-import и «получен» в логе: импорта нет, предупреждение «проект не обновлён» без await', async () => {
@@ -456,6 +483,90 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       answerRequest();
 
       await update();
+
+      assert.strictEqual(pickItems.length, 2);
+      assert.deepStrictEqual(events, ['receive', 'import:cf']);
+    });
+  });
+
+  suite('захваченные объекты в выборке — подтверждение до замка (Э24: получение затирает их правки в базе)', () => {
+    const lockCatalog = (names: string[] = ['Справочник.Товары']): void => {
+      const target = service.resolveTargetByConfigRoot(cfRoot);
+      assert.ok(target);
+      service.setLocked(target, names, true);
+    };
+    const cfRootNode = (): RepositoryNodeRef =>
+      ({ nodeKind: 'configuration', label: 'Основная', xmlPath: path.join(cfRoot, 'Configuration.xml') });
+
+    test('захвачен получаемый объект: вопрос (receive, cancel) со списком захваченных; замок во время вопроса свободен; cancel — ничего не запущено', async () => {
+      lockCatalog();
+      answerRequest([(items) => {
+        assert.strictEqual(isConfigurationOperationRunning(), false, 'вопрос задаётся ДО замка');
+        return items.find((item) => (item as { id?: string }).id === 'cancel');
+      }]);
+
+      await update();
+
+      assert.strictEqual(pickItems.length, 3);
+      assert.deepStrictEqual(pickItems[2].map((item) => (item as { id?: string }).id), ['receive', 'cancel']);
+      assert.deepStrictEqual(events, []);
+    });
+
+    test('Esc в вопросе о захваченных: ничего не запущено', async () => {
+      lockCatalog();
+      answerRequest([PICK_ESC]);
+
+      await update();
+
+      assert.deepStrictEqual(events, []);
+    });
+
+    test('подтверждено, проект чист: получение и импорт', async () => {
+      lockCatalog();
+      answerRequest([pickById('receive')]);
+
+      await update();
+
+      assert.deepStrictEqual(events, ['receive', 'import:cf']);
+    });
+
+    test('подтверждено, правки есть: затем вопрос о правках; receive-then-load — receive → update → import', async () => {
+      lockCatalog();
+      changed = [{ rootPath: cfRoot, name: 'Основная', changedFilesCount: 2 }];
+      answerRequest([pickById('receive'), pickById('receive-then-load')]);
+
+      await update();
+
+      assert.strictEqual(pickItems.length, 4);
+      assert.deepStrictEqual(events, ['receive', 'update:cf', 'import:cf']);
+    });
+
+    test('захвачен другой объект: вопроса о захваченных нет', async () => {
+      lockCatalog(['Справочник.Склады']);
+      answerRequest();
+
+      await update();
+
+      assert.strictEqual(pickItems.length, 2);
+      assert.deepStrictEqual(events, ['receive', 'import:cf']);
+    });
+
+    test('получение корня рекурсивно при любом захвате цели: вопрос задаётся', async () => {
+      lockCatalog(['Справочник.Склады']);
+      answerRequest([pickById('cancel')]);
+
+      await update(cfRootNode());
+
+      assert.strictEqual(pickItems.length, 3);
+      assert.deepStrictEqual(events, []);
+    });
+
+    test('получение корня НЕ рекурсивно, корень не захвачен: вопроса нет', async () => {
+      lockCatalog(['Справочник.Склады']);
+      picks.push(pickLabel('Только выбранный объект'), NO_FORCE);
+      inputs.push('');
+
+      await update(cfRootNode());
 
       assert.strictEqual(pickItems.length, 2);
       assert.deepStrictEqual(events, ['receive', 'import:cf']);
