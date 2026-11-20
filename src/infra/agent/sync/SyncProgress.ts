@@ -1,4 +1,5 @@
 import type { AgentOperationHooks } from '../AgentOperationService';
+import { createTransferCounter, type TransferCounter, type TransferFormat } from './TransferProgress';
 
 /**
  * Единственный источник сообщений о ходе операции агента. Текст строится один раз и уходит в оба канала:
@@ -43,6 +44,8 @@ export interface SyncProgress {
   step(text: string): void;
   /** Счётчик этапа; при `total === 0` молчит целиком (нечего считать). */
   counter(format: ProgressFormat, total: number): ProgressCounter;
+  /** Счётчик передачи по весу (байты, скорость, оставшееся время); при 0 файлов и 0 байт молчит. */
+  transfer(format: TransferFormat, totals: { readonly files: number; readonly bytes: number }): TransferCounter;
 }
 
 const SILENT_COUNTER: ProgressCounter = { advance: () => undefined, finish: () => undefined };
@@ -60,6 +63,7 @@ export function createSyncProgress(
       ui({ text });
     },
     counter: (format, total) => (total === 0 ? SILENT_COUNTER : createCounter(format, total, now, policy, journal, ui)),
+    transfer: (format, totals) => createTransferCounter(format, totals, now, policy, { journal, ui }),
   };
 }
 

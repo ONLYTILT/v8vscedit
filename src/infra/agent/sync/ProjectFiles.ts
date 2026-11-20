@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { writeFileAtomic } from '../../fs/AtomicFileWriter';
+import { writeFileAtomic, writeFileAtomicWith } from '../../fs/AtomicFileWriter';
 import type { SyncProgress } from './SyncProgress';
 
 /**
@@ -10,16 +10,23 @@ import type { SyncProgress } from './SyncProgress';
  *    вызова (`Container.suppressConfigurationReloadForFiles`); запись может идти дольше окна, поэтому
  *    хук зовётся до первой записи, непосредственно перед Configuration.xml и после последней записи;
  *  - Configuration.xml пишется последним: его событие watcher перезагружает всё дерево;
- *  - файлы пишутся только через writeFileAtomic — обрыв не оставляет обрезанный XML.
+ *  - файлы пишутся только через writeFileAtomic/writeFileAtomicWith — обрыв не оставляет обрезанный XML.
  */
 
 export const CONFIGURATION_XML = 'Configuration.xml';
 export const CONFIG_DUMP_INFO_XML = 'ConfigDumpInfo.xml';
 
+/**
+ * Содержимое файла: байты либо писатель временного файла записи. Второй вариант — для файлов, которые нельзя
+ * держать в памяти целиком (конфигурация поставщика в гигабайт): содержимое копируется из staging или
+ * скачивается потоком прямо во временный файл, подмену цели делает `writeFileAtomicWith`.
+ */
+export type ProjectFileContent = Uint8Array | { readonly writeTo: (tempPath: string) => Promise<void> };
+
 /** Отдаёт содержимое перечисленных файлов (в любом порядке, каждый ровно один раз). */
 export type ProjectDataReader = (
   rels: readonly string[],
-  sink: (rel: string, data: Uint8Array) => void | Promise<void>
+  sink: (rel: string, data: ProjectFileContent) => void | Promise<void>
 ) => Promise<unknown>;
 
 export interface ProjectChanges {
@@ -47,24 +54,29 @@ export async function applyProjectChanges(changes: ProjectChanges): Promise<stri
 
   for (const rel of deletes) {
     const target = toProjectPath(projectDir, rel);
+    // Переименование только регистром на Windows: оба написания пути — один физический файл, и он уже удалён
+    // по первому из них.
+    if (!fs.existsSync(target)) {
+      continue;
+    }
     // unlink, а не fs.rmSync: на Windows rmSync системного Node 24 молча не удаляет файл с
     // кириллицей в имени (проверено 2026-11-17).
     fs.unlinkSync(target);
     pruneEmptyParents(projectDir, path.dirname(target));
   }
 
-  let configuration: Uint8Array | undefined;
-  await changes.read(writes, (rel, data) => {
+  let configuration: ProjectFileContent | undefined;
+  await changes.read(writes, async (rel, data) => {
     if (rel === CONFIGURATION_XML) {
       configuration = data;
       return;
     }
-    writeProjectFile(projectDir, rel, data);
+    await writeProjectFile(projectDir, rel, data);
     counter?.advance();
   });
   if (configuration !== undefined) {
     changes.onWillChange?.(changedProjectFiles);
-    writeProjectFile(projectDir, CONFIGURATION_XML, configuration);
+    await writeProjectFile(projectDir, CONFIGURATION_XML, configuration);
     counter?.advance();
   }
   counter?.finish();
@@ -125,10 +137,14 @@ export function toProjectPath(projectDir: string, rel: string): string {
   return path.join(projectDir, ...rel.split('/').filter((segment) => segment !== ''));
 }
 
-function writeProjectFile(projectDir: string, rel: string, data: Uint8Array): void {
+async function writeProjectFile(projectDir: string, rel: string, data: ProjectFileContent): Promise<void> {
   const target = toProjectPath(projectDir, rel);
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  writeFileAtomic(target, data);
+  if (data instanceof Uint8Array) {
+    writeFileAtomic(target, data);
+  } else {
+    await writeFileAtomicWith(target, data.writeTo);
+  }
 }
 
 /** Убирает каталоги, опустевшие после удаления файлов, — как прежнее зеркалирование каталогом целиком. */

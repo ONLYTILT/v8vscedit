@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { hashContent, isSupportedConfigFile, type HashCacheSnapshot } from './HashCache';
@@ -27,6 +28,8 @@ export interface HashScanFs {
   readdir(dir: string): Promise<readonly fs.Dirent[]>;
   stat(filePath: string): Promise<FileFingerprint>;
   readFile(filePath: string): Promise<Buffer>;
+  /** SHA-1 hex содержимого потоком (большие файлы); совпадает с `hashContent`. */
+  hashFile(filePath: string): Promise<string>;
 }
 
 export const nodeHashScanFs: HashScanFs = {
@@ -36,7 +39,20 @@ export const nodeHashScanFs: HashScanFs = {
     return { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size };
   },
   readFile: (filePath) => fs.promises.readFile(filePath),
+  hashFile: (filePath) => new Promise<string>((resolve, reject) => {
+    const hash = createHash('sha1');
+    fs.createReadStream(filePath)
+      .on('error', reject)
+      .on('data', (chunk) => { hash.update(chunk); })
+      .on('end', () => { resolve(hash.digest('hex')); });
+  }),
 };
+
+/**
+ * С этого размера хеш считается потоком: новый `.cf`/CDI в P прочитался бы одним буфером в гигабайт
+ * (plan-large-files.md §2.6). Ниже порога буфер дешевле потока на тысячах мелких файлов.
+ */
+export const HASH_STREAM_THRESHOLD_BYTES = 16 * 1024 * 1024;
 
 /**
  * Не больше: пул libuv по умолчанию — 4 потока, и операции ФС других расширений не должны надолго
@@ -59,6 +75,8 @@ export interface HashScanOptions {
   /** Часы прохода: от них отсчитывается racy-окно. Подменяются в тестах ради детерминизма. */
   readonly now?: () => number;
   readonly onReport?: (report: HashScanReport) => void;
+  /** Порог потокового хеша (по умолчанию {@link HASH_STREAM_THRESHOLD_BYTES}); тесты ставят малый. */
+  readonly streamThresholdBytes?: number;
 }
 
 export interface HashScanResult {
@@ -81,6 +99,7 @@ export async function scanCurrentHashes(
 ): Promise<HashScanResult> {
   const scanFs = options.fs ?? nodeHashScanFs;
   const now = options.now ?? Date.now;
+  const streamThreshold = options.streamThresholdBytes ?? HASH_STREAM_THRESHOLD_BYTES;
   // Момент старта берётся ДО любого stat/read — на этом держится racy-защита (см. isRacyFingerprint).
   const scanStartedAtMs = now();
 
@@ -108,14 +127,13 @@ export async function scanCurrentHashes(
     }
     // stat обязан предшествовать чтению: правка после stat сдвинет mtime/ctime вперёд, и следующий
     // проход увидит несовпадение отпечатка, а не доверится хешу старого содержимого.
-    let content: Buffer;
+    let hash: string;
     try {
-      content = await scanFs.readFile(fullPath);
+      hash = fp.size >= streamThreshold ? await scanFs.hashFile(fullPath) : hashContent(await scanFs.readFile(fullPath));
     } catch (error) {
       rethrowUnlessGone(error);
       return;
     }
-    const hash = hashContent(content);
     files[relativePath] = hash;
     hashed += 1;
     if (isRacyFingerprint(fp, scanStartedAtMs)) {

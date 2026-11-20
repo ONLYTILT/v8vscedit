@@ -1,23 +1,16 @@
 import { buildDumpConfigToFilesCommand } from '../../../domain/agent/AgentCommand';
 import type { DumpChangeSet } from '../../../domain/agent/DumpChangesParser';
-import { downloadFiles, statFiles } from '../files/AgentFileTransfer';
+import { statFiles } from '../files/AgentFileTransfer';
 import { importByArchive } from './ArchiveImport';
 import { fetchChangeSet } from './ChangeSet';
 import { confirmFullDumpOrThrow, type FullDumpConsentContext } from './FullDumpConsent';
 import { resolveFullDump } from './FullDumpAvoidance';
 import { collectOwnerFiles, resolveChangedOwners, type ChangedOwner, type OwnerFilesResult } from './ChangedObjectFiles';
-import { caseCollisions, importByDelta } from './DeltaImport';
+import { importByDelta } from './DeltaImport';
+import { importByCompare } from './LocalCompareImport';
 import { MIRROR_MTIME_SELECTION_ENABLED, takeMirrorMarker, type MirrorMarker } from './MirrorChangeWindow';
 import { isProjectDumpReplaced } from './ProjectDumpInfo';
-import {
-  CONFIG_DUMP_INFO_XML,
-  CONFIGURATION_XML,
-  applyProjectChanges,
-  assertConfigurationPresent,
-  hasSameProjectContent,
-  listProjectFiles,
-  projectFileExists,
-} from './ProjectFiles';
+import { CONFIG_DUMP_INFO_XML, listProjectFiles, projectFileExists } from './ProjectFiles';
 import { handleOrphans, seedFromProject, type OrphanFilesOutcome } from './ProjectSeed';
 import { restoreFromDatabase } from './SparseRestore';
 import {
@@ -27,6 +20,7 @@ import {
   withTransferCancellation,
   type SyncOperationContext,
 } from './SyncContext';
+import { evidenceFromChangeObjects, type RootPartEvidence } from './VendorConfigurationGate';
 import {
   buildSyncManifestFiles,
   diffSyncFiles,
@@ -87,59 +81,6 @@ export interface AgentImportOutcome {
 export async function runImport(context: SyncOperationContext): Promise<AgentImportOutcome> {
   const result = context.store.kind === 'local' ? await importByCompare(context) : await importRemote(context);
   return { result, mirrorCoverage: context.mirror.coverage };
-}
-
-// --- локальное хранилище: полное сравнение ---------------------------------------------------
-
-async function importByCompare(context: SyncOperationContext): Promise<AgentImportResult> {
-  const { store, workspace } = context;
-  const mirror = workspace.targetAgentDir;
-  const hasDumpInfo = (await store.stat(`${mirror}/${CONFIG_DUMP_INFO_XML}`)) !== undefined;
-  context.markMirrorMutated();
-  await context.exec.execute(buildDumpConfigToFilesCommand(mirror, {
-    extensionName: context.extensionName,
-    update: hasDumpInfo,
-    force: true,
-  }));
-  throwIfCancelled(context);
-
-  const prefix = `${mirror}/`;
-  const mirrorFiles = (await store.list(mirror, { recursive: true }))
-    .filter((entry) => entry.type === 'file')
-    .map((entry) => entry.path.slice(prefix.length));
-  assertConfigurationPresent(mirrorFiles.includes(CONFIGURATION_XML), `"${mirror}"`);
-
-  // Первый проход только сравнивает: список изменений нужен до первой записи, а держать в
-  // памяти всю выгрузку ради одного прохода нельзя (локально второе чтение дёшево).
-  const changed: string[] = [];
-  const projectDir = context.target.rootPath;
-  const counter = context.progress.counter(
-    (done, total) => `Сравнение зеркала с проектом: ${String(done)} из ${String(total)}`, mirrorFiles.length);
-  await downloadFiles(store, mirrorFiles.map((rel) => prefix + rel), (agentRel, data) => {
-    counter.advance();
-    const rel = agentRel.slice(prefix.length);
-    if (!hasSameProjectContent(projectDir, rel, data)) {
-      changed.push(rel);
-    }
-  }, transferOptionsOf(context));
-  counter.finish();
-  throwIfCancelled(context);
-
-  const inMirror = new Set(mirrorFiles);
-  const deletes = listProjectFiles(projectDir).filter((rel) => !inMirror.has(rel));
-  const sameFileAsDeleted = caseCollisions(deletes);
-  const changedSet = new Set(changed);
-  const changedProjectFiles = await applyProjectChanges({
-    projectDir,
-    writes: [...changed, ...mirrorFiles.filter((rel) => !changedSet.has(rel) && sameFileAsDeleted(rel))],
-    deletes,
-    // Второй проход без отмены: запись в проект, начавшись, доводится до конца.
-    read: (rels, sink) => downloadFiles(store, rels.map((rel) => prefix + rel), (agentRel, data) =>
-      sink(agentRel.slice(prefix.length), data), { concurrency: context.transferConcurrency }),
-    onWillChange: context.hooks?.onProjectFilesWillChange,
-    onProgress: context.progress,
-  });
-  return { changedProjectFiles, strategy: 'compare' };
 }
 
 // --- удалённое хранилище: список изменений, дельта, архив --------------------------------------
@@ -221,6 +162,8 @@ interface ChangesPhase2 {
   readonly fullDump?: AgentFullDumpHandling;
   /** Метка времени сервера до первой мутации M (`undefined` — отбор по времени не применяется). */
   readonly marker: MirrorMarker | undefined;
+  /** Изменённые части корня — для шлюза конфигурации поставщика. */
+  readonly rootPartEvidence: RootPartEvidence;
 }
 
 async function importChanges(
@@ -270,6 +213,7 @@ async function importChanges(
         replacedOwners: [...resolution.replacedOwners].sort(),
       },
       marker,
+      rootPartEvidence: resolution.rootPartEvidence,
     });
   }
   if (before.action === 'update') {
@@ -292,6 +236,7 @@ async function importChanges(
     updateKind: 'incremental',
     rewriteOwnersWithRemovedParts: [],
     marker,
+    rootPartEvidence: evidenceFromChangeObjects(before.objects),
   });
 }
 
@@ -379,6 +324,7 @@ async function importPhase2(
     base,
     expectRewrites: owners.length > 0,
     updateKind: input.updateKind,
+    rootPartEvidence: input.rootPartEvidence,
   };
   if (restore.length === 0) {
     return { result: withFullDump(await importByDelta(context, delta)), changedOwners };

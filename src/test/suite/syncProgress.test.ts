@@ -253,3 +253,49 @@ suite('SyncProgress', () => {
     });
   });
 });
+
+suite('SyncProgress.transfer (plan-large-files.md §3.1)', () => {
+  /** Те же правила троттлинга, что у `counter`: одинаковая последовательность часов даёт одинаковые журнал и UI. */
+  test('transfer по файлам и counter при одинаковых часах пишут в журнал и UI в одни и те же моменты', () => {
+    const clock = [0, 100, 600, 700, 15_700, 15_800];
+    const run = (kind: 'counter' | 'transfer'): { journal: string[]; ui: string[] } => {
+      const { rig, now } = rigWithClock();
+      const progress = createSyncProgress(rig.hooks, now);
+      const advance = kind === 'counter'
+        ? ((): (() => void) => { const c = progress.counter((done, total) => `${String(done)}/${String(total)}`, 100); return () => { c.advance(); }; })()
+        : ((): (() => void) => { const t = progress.transfer((s) => `${String(s.doneFiles)}/${String(s.totalFiles)}`, { files: 100, bytes: 0 }); return () => { t.fileDone(); }; })();
+      for (const at of clock) {
+        rig.at(at);
+        advance();
+      }
+      return { journal: rig.journal, ui: rig.ui.map((event) => event.text) };
+    };
+    const counter = run('counter');
+    const transfer = run('transfer');
+    assert.deepStrictEqual(transfer.journal, counter.journal);
+    assert.deepStrictEqual(transfer.ui, counter.ui);
+    assert.ok(transfer.ui.length > transfer.journal.length, 'UI чаще журнала: троттлинг каналов разный');
+  });
+
+  test('transfer пишет в оба канала одним текстом; step и transfer соседствуют в одной операции', () => {
+    const { rig, now } = rigWithClock();
+    const progress = createSyncProgress(rig.hooks, now);
+    progress.step('Этап');
+    const counter = progress.transfer((state) => `байт ${String(state.doneBytes)} из ${String(state.totalBytes)}`, { files: 1, bytes: 10 });
+    counter.addBytes(10);
+    counter.fileDone();
+    counter.finish();
+    assert.deepStrictEqual(rig.journal, ['Этап', 'байт 0 из 10', 'байт 10 из 10']);
+    assert.deepStrictEqual(rig.ui.map((event) => event.text), rig.journal);
+  });
+
+  test('transfer с total 0/0 молчит, как counter с total 0', () => {
+    const { rig, now } = rigWithClock();
+    const progress = createSyncProgress(rig.hooks, now);
+    const counter = progress.transfer(() => 'x', { files: 0, bytes: 0 });
+    counter.fileDone();
+    counter.finish();
+    assert.deepStrictEqual(rig.journal, []);
+    assert.deepStrictEqual(rig.ui, []);
+  });
+});

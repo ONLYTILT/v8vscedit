@@ -1,18 +1,20 @@
 import * as fs from 'fs';
+import { PARENT_CONFIGURATIONS_BIN_REL } from '../../support/SupportFiles';
 import type { AgentFileEntry } from '../files/AgentFileStore';
-import { downloadFiles, statFiles } from '../files/AgentFileTransfer';
+import { statFiles } from '../files/AgentFileTransfer';
 import type { AgentImportResult } from './AgentImportFlow';
+import { downloadDelta } from './DeltaDownload';
 import { selectMirrorDownloads, type MirrorMarker } from './MirrorChangeWindow';
 import {
   CONFIGURATION_XML,
   applyProjectChanges,
   assertConfigurationPresent,
-  hasSameProjectContent,
   projectFileExists,
   projectFileSize,
 } from './ProjectFiles';
 import { summarizeList } from './ProjectSeed';
 import { throwIfCancelled, transferOptionsOf, type SyncOperationContext } from './SyncContext';
+import { isVendorGated, type RootPartEvidence } from './VendorConfigurationGate';
 
 /** Файлы точечной выгрузки: каталог обмена, откуда они берутся вместо M. */
 export interface RestoreSource {
@@ -41,9 +43,9 @@ export interface DeltaInput {
   readonly expectRewrites: boolean;
   /** `rewrite` — сервер переписал M целиком (`--update --force` при FullDump): отбор бесполезен. */
   readonly updateKind: 'incremental' | 'rewrite';
+  /** Изменённые части корня по списку изменений или файлу версий (шлюз конфигурации поставщика); нет — неизвестно. */
+  readonly rootPartEvidence?: RootPartEvidence;
 }
-
-const MEBIBYTE = 1024 * 1024;
 
 /**
  * Предикат «путь совпадает с одним из удаляемых без учёта регистра». На Windows это один физический файл
@@ -56,10 +58,10 @@ export function caseCollisions(deletes: readonly string[]): (rel: string) => boo
 }
 
 /**
- * Дельта: STAT отсутствующих в M — пулом, отбор по времени изменения, скачивание — пулом, отличающиеся от P
- * файлы — во временные файлы локального каталога обмена; в памяти только «путь → staging»: при пороге в
- * тысячи файлов буфер в памяти занял бы гигабайты, а второе скачивание ради записи удвоило бы трафик (Н25).
- * Staging убирает движок вместе с каталогом обмена.
+ * Дельта: STAT отсутствующих в M — пулом, отбор по времени изменения, скачивание (`DeltaDownload`: две полосы и
+ * шлюз поставщика), отличающиеся от P файлы — во временные файлы локального каталога обмена; в памяти только
+ * «путь → staging»: при пороге в тысячи файлов буфер в памяти занял бы гигабайты, а второе скачивание ради
+ * записи удвоило бы трафик (Н25). Staging убирает движок вместе с каталогом обмена.
  */
 export async function importByDelta(context: SyncOperationContext, input: DeltaInput): Promise<AgentImportResult> {
   const { store, progress } = context;
@@ -97,43 +99,30 @@ export async function importByDelta(context: SyncOperationContext, input: DeltaI
     }
   }
   const fromMirror = present.filter((rel) => !fromRestore(rel));
+  // Шлюзуемый файл поставщика не отслеживается B никогда, поэтому «вне B» для него не причина качать: иначе
+  // шлюз не срабатывал бы вовсе (см. VendorDownloadInput.mustFetch).
+  const gateMustFetch = (rel: string): boolean => input.dirtyFiles.has(rel) || sameFileAsDeleted(rel);
   const mustFetch = new Set(fromMirror.filter((rel) =>
-    input.dirtyFiles.has(rel) || !Object.prototype.hasOwnProperty.call(input.base, rel) || sameFileAsDeleted(rel)));
+    gateMustFetch(rel) || (!Object.prototype.hasOwnProperty.call(input.base, rel) && !isVendorGated(rel))));
   const download = new Set(chooseDownloads(context, input, fromMirror, entries, mustFetch));
 
-  // Источник файла — каталог точечной выгрузки или M. Путь в проекте берётся из карты, а не разбором
+  // Источник файла — каталог точечной выгрузки или M. Путь в проекте хранится рядом, а не берётся разбором
   // префикса: префиксы двух каталогов могут вкладываться друг в друга.
-  const relBySource = new Map(present
+  const toDownload = present
     .filter((rel) => fromRestore(rel) || download.has(rel))
-    .map((rel) => [restore?.files.has(rel) === true ? `${restore.dir}/${rel}` : prefix + rel, rel]));
-  const staged = new Map<string, string>();
-  let stagingCount = 0;
-  const downloadCounter = progress.counter((done, total, bytes) =>
-    `Скачивание изменённых файлов: ${String(done)} из ${String(total)} (${String(Math.floor((done * 100) / total))}%), ` +
-    `${(bytes / MEBIBYTE).toFixed(1)} МБ`, relBySource.size);
-  await downloadFiles(store, [...relBySource.keys()], async (source, data) => {
-    const rel = relBySource.get(source);
-    /* c8 ignore start -- downloadFiles отдаёт в приёмник ровно запрошенные пути; ветка страхует от смены
-       контракта хранилища, из тестов (настоящее хранилище и эмулятор агента) недостижима. */
-    if (rel === undefined) {
-      throw new Error(`Неожиданный файл агента в дельте импорта: ${source}`);
-    }
-    /* c8 ignore stop */
-    downloadCounter.advance(1, data.length);
-    // Совпадение с удаляемым путём без учёта регистра (переименование регистром на Windows) — тот же
-    // физический файл: удаление идёт первым, поэтому запись обязательна даже при равном содержимом.
-    if (!sameFileAsDeleted(rel) && hasSameProjectContent(projectDir, rel, data)) {
-      return;
-    }
-    // Имя по номеру, а не по пути (длинные пути Windows); номер берётся до первого await. Это не файл
-    // выгрузки: его читает только эта операция после успешной записи, а обрыв убирает каталог обмена
-    // целиком — temp+rename здесь не нужен.
-    stagingCount += 1;
-    const stagingPath = await context.localExchange.file(`delta-${String(stagingCount)}`);
-    await fs.promises.writeFile(stagingPath, data);
-    staged.set(rel, stagingPath);
-  }, transferOptionsOf(context));
-  downloadCounter.finish();
+    .map((rel) => (restore?.files.has(rel) === true
+      // Размер файла точечной выгрузки неизвестен: малая полоса (грязные файлы обычно мелкие).
+      ? { source: `${restore.dir}/${rel}`, rel, size: undefined }
+      : { source: prefix + rel, rel, size: entries.get(rel)?.size }));
+  const { staged } = await downloadDelta(context, {
+    files: toDownload,
+    sameFileAsDeleted,
+    gate: {
+      evidence: input.rootPartEvidence,
+      mustFetch: gateMustFetch,
+      binDeleted: deletes.includes(PARENT_CONFIGURATIONS_BIN_REL),
+    },
+  });
   throwIfCancelled(context);
 
   // Configuration.xml попадает в удаляемые, только если владелец «конфигурация» исчез из M.
@@ -142,10 +131,11 @@ export async function importByDelta(context: SyncOperationContext, input: DeltaI
     projectDir,
     writes: [...staged.keys()],
     deletes,
-    // Запрашиваются ровно `writes` — ключи staging; читаются по одному: память — O(файл).
+    // Запрашиваются ровно `writes` — ключи staging. Содержимое копируется из staging прямо во временный файл
+    // записи: память O(1) и для файла в гигабайт.
     read: async (_rels, sink) => {
       for (const [rel, stagingPath] of staged) {
-        await sink(rel, await fs.promises.readFile(stagingPath));
+        await sink(rel, { writeTo: (tempPath) => fs.promises.copyFile(stagingPath, tempPath) });
       }
     },
     onWillChange: context.hooks?.onProjectFilesWillChange,

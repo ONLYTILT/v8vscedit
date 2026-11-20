@@ -109,6 +109,14 @@ export type EmulatorUpdateGranularity = 'owner' | 'changed-files';
  */
 export type EmulatorFullDumpUpdate = 'rewrite-all' | 'changed-and-removals';
 
+/**
+ * Какие строки пишет `dump --get-changes` при изменении владельца: `explicit` — только переданные `putFile(…, parts)`
+ * (прежнее поведение); `all-parts` — строка КАЖДОЙ файловой части владельца (сверхприближение после полной загрузки);
+ * `changed-parts` — только части с изменившейся версией (`New`, если записи части в файле версий каталога ещё нет),
+ * как после «получить из хранилища» (ФАКТ Э27: правка модуля корня даёт `New: …<Часть>` + `Modified: <корень>`).
+ */
+export type EmulatorChangeLines = 'explicit' | 'all-parts' | 'changed-parts';
+
 export interface EmulatedLoad {
   readonly mode: 'dir' | 'partial' | 'archive';
   /** Файлы, которые агент взял из каталога/списка/архива (относительные пути). */
@@ -132,6 +140,14 @@ export class AgentConfigEmulator {
   /** Искажает байты архива, который агент собирается отдать (однократно). */
   nextArchiveTamper: ((zip: Buffer) => Buffer) | undefined;
   updateGranularity: EmulatorUpdateGranularity = 'owner';
+  /** Состав строк списка изменений владельца (см. {@link EmulatorChangeLines}). */
+  changeLines: EmulatorChangeLines = 'explicit';
+  /**
+   * Факт стенда: `--update` при изменённом корне конфигурации переписывает (обновляет mtime) ВСЕ файлы корня, включая
+   * `Ext/ParentConfigurations/*.cf`, даже при `updateGranularity = 'changed-files'`. Выключен — переписываются только
+   * изменённые файлы (ФАКТ Э27).
+   */
+  rewriteWholeRootOnUpdate = false;
   /** Режим `--update` при пропавших записях известного CDI (см. {@link EmulatorFullDumpUpdate}). */
   fullDumpUpdate: EmulatorFullDumpUpdate = 'changed-and-removals';
   /** Сколько `dump --update` застали в известном CDI записи, которых уже нет в базе (в обоих режимах). */
@@ -440,7 +456,8 @@ export class AgentConfigEmulator {
       if (knownVersion === object.version) {
         continue;
       }
-      if (this.updateGranularity === 'changed-files') {
+      const rewriteRoot = this.rewriteWholeRootOnUpdate && name === CONFIGURATION_OWNER;
+      if (this.updateGranularity === 'changed-files' && !rewriteRoot) {
         const changed = [...object.files].filter(([rel]) => (object.fileVersions.get(rel) ?? 0) > (knownVersion ?? 0));
         this.writeFiles(dirAbs, Object.fromEntries(changed));
         continue;
@@ -543,12 +560,32 @@ export class AgentConfigEmulator {
         continue;
       }
       const change = version === undefined ? 'New' : 'Modified';
-      for (const part of object.parts) {
-        lines.push(`${change}: ${name}.${part}`);
-      }
+      lines.push(...this.partChangeLines(name, object, change, knownRecords));
       lines.push(`${change}: ${name}`);
     }
     return BOM + lines.map((line) => `${line}\r\n`).join('');
+  }
+
+  private partChangeLines(owner: string, object: EmulatedObject, change: 'New' | 'Modified', knownRecords: ReadonlyMap<string, number>): string[] {
+    if (this.changeLines === 'explicit') {
+      return object.parts.map((part) => `${change}: ${owner}.${part}`);
+    }
+    const lines: string[] = [];
+    for (const [suffix, rels] of fileSubobjects(owner, object)) {
+      if (suffix === '') {
+        continue;
+      }
+      const version = Math.max(...rels.map((rel) => object.fileVersions.get(rel) ?? object.version));
+      const known = knownRecords.get(`${owner}${suffix}`);
+      if (this.changeLines === 'all-parts') {
+        lines.push(`${known === undefined ? 'New' : 'Modified'}: ${owner}${suffix}`);
+      } else if (known === undefined) {
+        lines.push(`New: ${owner}${suffix}`);
+      } else if (known !== version) {
+        lines.push(`Modified: ${owner}${suffix}`);
+      }
+    }
+    return lines;
   }
 
   // ── load ──────────────────────────────────────────────────────────────
@@ -738,6 +775,10 @@ export function cdiSuffixOfFile(owner: string, rel: string): string | undefined 
   if (owner === CONFIGURATION_OWNER) {
     if (rel === 'Configuration.xml') {
       return '';
+    }
+    if (parts[0] === 'Ext' && parts[1] === 'ParentConfigurations' && parts.length > 2) {
+      // Одна файловая запись CDI покрывает `Ext/ParentConfigurations.bin` и все `.cf` поставщиков (корпус example/2.20).
+      return '.ParentConfigurations';
     }
     return parts.length === 2 && parts[0] === 'Ext' ? `.${stemOf(parts[1])}` : undefined;
   }

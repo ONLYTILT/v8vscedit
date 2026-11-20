@@ -68,6 +68,15 @@ export interface SyncOperationContext {
   readonly operationId: string;
   readonly archiveThresholdFiles: number;
   readonly transferConcurrency: number;
+  /**
+   * С этого размера файл M скачивается и сравнивается потоком (staging на диске), а не буфером в памяти
+   * (plan-large-files.md §2.3); по умолчанию `DEFAULT_LARGE_FILE_THRESHOLD_BYTES`.
+   */
+  readonly largeFileThresholdBytes: number;
+  /** С этого размера файл называется в журнале заранее, до начала скачивания. */
+  readonly largeFileWarnBytes: number;
+  /** Свободное место тома каталога, байт; `undefined` — неизвестно (проверка места пропускается). */
+  readonly freeDiskSpace: (dir: string) => Promise<number | undefined>;
   /** Локальный каталог обмена операции (архив выгрузки на этой машине); убирает движок. */
   readonly localExchange: LocalExchange;
   /** Полнота M; меняют стратегии (посев — `sparse`, полная выгрузка в M — `full`). */

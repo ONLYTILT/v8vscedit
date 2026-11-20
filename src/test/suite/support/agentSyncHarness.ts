@@ -47,6 +47,12 @@ export interface HarnessOptions {
   readonly targetKind?: HarnessTargetKind;
   /** Часы прогресса движка; по умолчанию постоянные (0): троттлинг по времени не вмешивается в точные последовательности. */
   readonly progressClock?: () => number;
+  /** Порог «большого» файла дельты/сравнения, байт (по умолчанию — продакшн-значение, 16 МиБ). */
+  readonly largeFileThresholdBytes?: number;
+  /** Порог предупреждения о большом файле заранее, байт. */
+  readonly largeFileWarnBytes?: number;
+  /** Подмена проверки свободного места каталога обмена (по умолчанию — `fs.statfs`). */
+  readonly freeDiskSpace?: (dir: string) => Promise<number | undefined>;
 }
 
 export interface SyncHarness {
@@ -170,6 +176,9 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     localExchangeRoot,
     now: clock.now,
     progressClock: options.progressClock ?? ((): number => 0),
+    largeFileThresholdBytes: options.largeFileThresholdBytes,
+    largeFileWarnBytes: options.largeFileWarnBytes,
+    freeDiskSpace: options.freeDiskSpace,
   });
   const emulator = new AgentConfigEmulator(userRoot);
   const mirrorDir = targetKind === 'cf' ? `workspace/${projectId}/cf` : `workspace/${projectId}/cfe/${HARNESS_EXTENSION_NAME}`;

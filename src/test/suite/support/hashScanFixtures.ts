@@ -10,18 +10,22 @@ import type { FileFingerprint } from '../../../infra/cache/HashStatMemo';
  * поведенческий критерий «неизменённые файлы не читаются» из ТЗ (а не замер времени).
  */
 export interface CountingFs extends HashScanFs {
-  readonly counts: { readdir: number; stat: number; readFile: number };
+  readonly counts: { readdir: number; stat: number; readFile: number; hashFile: number };
   readonly readPaths: string[];
+  /** Файлы, хеш которых посчитан потоком (`hashFile`), в порядке обращений. */
+  readonly hashPaths: string[];
   beforeReaddir?: (dir: string) => void | Promise<void>;
   beforeStat?: (filePath: string) => void | Promise<void>;
   beforeReadFile?: (filePath: string) => void | Promise<void>;
+  beforeHashFile?: (filePath: string) => void | Promise<void>;
   reset(): void;
 }
 
 export function countingFs(base: HashScanFs = nodeHashScanFs): CountingFs {
   const wrapper: CountingFs = {
-    counts: { readdir: 0, stat: 0, readFile: 0 },
+    counts: { readdir: 0, stat: 0, readFile: 0, hashFile: 0 },
     readPaths: [],
+    hashPaths: [],
     async readdir(dir: string): Promise<readonly fs.Dirent[]> {
       wrapper.counts.readdir += 1;
       await wrapper.beforeReaddir?.(dir);
@@ -38,11 +42,19 @@ export function countingFs(base: HashScanFs = nodeHashScanFs): CountingFs {
       await wrapper.beforeReadFile?.(filePath);
       return base.readFile(filePath);
     },
+    async hashFile(filePath: string): Promise<string> {
+      wrapper.counts.hashFile += 1;
+      wrapper.hashPaths.push(filePath);
+      await wrapper.beforeHashFile?.(filePath);
+      return base.hashFile(filePath);
+    },
     reset(): void {
       wrapper.counts.readdir = 0;
       wrapper.counts.stat = 0;
       wrapper.counts.readFile = 0;
+      wrapper.counts.hashFile = 0;
       wrapper.readPaths.length = 0;
+      wrapper.hashPaths.length = 0;
     },
   };
   return wrapper;

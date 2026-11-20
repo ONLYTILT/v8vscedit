@@ -5,6 +5,7 @@ import { sanitizePathPart, type AgentWorkspaceService } from '../AgentWorkspaceS
 import type { AgentFileStore } from '../files/AgentFileStore';
 import { DEFAULT_AGENT_TRANSFER_CONCURRENCY } from '../files/AgentFileTransfer';
 import { buildScopeKey, saveHashCache } from '../../cache/HashCache';
+import { freeDiskSpaceOf } from '../../fs/FreeDiskSpace';
 import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
 import { createLocalExchange, pruneStaleLocalExchanges } from './LocalExchange';
@@ -34,6 +35,16 @@ export type { AgentLoadMode, AgentLoadResult } from './AgentLoadFlow';
  */
 export const DEFAULT_ARCHIVE_THRESHOLD_FILES = 20_000;
 
+/**
+ * Порог «большого» файла дельты и сравнения, байт: с него файл идёт потоком через staging на диске, а не
+ * буфером в памяти. Пул из 16 малых файлов держит в худшем случае 16 × 16 МиБ = 256 МиБ; файл версий большой
+ * конфигурации (~33 МБ) уже уходит в большую полосу.
+ */
+export const DEFAULT_LARGE_FILE_THRESHOLD_BYTES = 16 * 1024 * 1024;
+
+/** С этого размера файл называется в журнале заранее: скачивание займёт заметное время. */
+export const DEFAULT_LARGE_FILE_WARN_BYTES = 100 * 1024 * 1024;
+
 export interface AgentSyncEngineOptions {
   readonly projectRoot: string;
   readonly store: AgentFileStore;
@@ -52,6 +63,12 @@ export interface AgentSyncEngineOptions {
    * тестовый стенд тикает его на каждый вызов, а прогресс тестам нужен с постоянными часами.
    */
   readonly progressClock?: () => number;
+  /** Порог большого файла (по умолчанию {@link DEFAULT_LARGE_FILE_THRESHOLD_BYTES}). */
+  readonly largeFileThresholdBytes?: number;
+  /** Порог предупреждения о большом файле (по умолчанию {@link DEFAULT_LARGE_FILE_WARN_BYTES}). */
+  readonly largeFileWarnBytes?: number;
+  /** Свободное место тома каталога (по умолчанию — `fs.statfs`); подменяется в тестах. */
+  readonly freeDiskSpace?: (dir: string) => Promise<number | undefined>;
 }
 
 type OperationKind = 'import' | 'load';
@@ -168,6 +185,9 @@ export class AgentSyncEngine {
       operationId,
       archiveThresholdFiles: this.archiveThresholdFiles,
       transferConcurrency: this.transferConcurrency,
+      largeFileThresholdBytes: this.options.largeFileThresholdBytes ?? DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
+      largeFileWarnBytes: this.options.largeFileWarnBytes ?? DEFAULT_LARGE_FILE_WARN_BYTES,
+      freeDiskSpace: this.options.freeDiskSpace ?? freeDiskSpaceOf,
       localExchange,
       // Локальный M всегда полный: импорт сравнивает его с P целиком, посева там нет.
       mirror: { coverage: store.kind === 'local' ? 'full' : mirrorCoverageOf(manifest) },

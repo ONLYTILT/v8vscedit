@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import type { Logger } from './Logger';
 import { SupportMode } from './SupportMode';
 import { parseParentConfigurations, type ParentConfigurationsData } from './ParentConfigurationsParser';
+import { PARENT_CONFIGURATIONS_BIN_REL } from './SupportFiles';
 import { resolveOwnerXmlForExtContent } from '../fs/MetaPathResolver';
 
 export { SupportMode } from './SupportMode';
@@ -49,7 +50,7 @@ export class SupportInfoService {
   loadConfig(configRoot: string): void {
     const name = path.basename(configRoot);
     const normalizedRoot = normPath(configRoot);
-    const binPath = path.join(configRoot, 'Ext', 'ParentConfigurations.bin');
+    const binPath = path.join(configRoot, ...PARENT_CONFIGURATIONS_BIN_REL.split('/'));
 
     let stat: fs.Stats;
     try {

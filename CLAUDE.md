@@ -158,6 +158,8 @@ src/
 │   ├── fs/
 │   │   ├── ConfigLocator.ts          # рекурсивный поиск Configuration.xml
 │   │   ├── MetaPathResolver.ts       # единый resolver: XML + все модули по ModuleSlot
+│   │   ├── FileContentCompare.ts     # filesHaveSameContent: побайтное сравнение файлов потоком (большие файлы)
+│   │   ├── FreeDiskSpace.ts          # freeDiskSpaceOf: свободное место каталога (проверка до скачивания больших файлов)
 │   │   ├── FileHandleWrite.ts        # writeFully: цикл дозаписи по bytesWritten (НЕ замена AtomicFileWriter)
 │   │   ├── AtomicFileWriter.ts       # writeFileAtomic/resolveAtomicTempPath: ЕДИНСТВЕННАЯ
 │   │   │                              # реализация temp+rename; через неё идёт любая запись файла
@@ -172,7 +174,8 @@ src/
 │   │                                  # invalidate/whenIdle/dispose (Container.changeDetection)
 │   ├── cfe/                          # расширения: CfeBorrowService, CfeDiffService, CfePatchMethodService
 │   ├── support/                      # ParentConfigurationsParser (чистый разбор bin), SupportMode,
-│   │                                  # SupportInfoService (кэш + режим по пути), Logger — см.
+│   │                                  # SupportInfoService (кэш + режим по пути), SupportFiles (имена файлов
+│   │                                  # поддержки: ParentConfigurations, .bin — единый источник), Logger — см.
 │   │                                  # docs/metadata-navigator.md#поддержка-поставщика-parentconfigurationsbin
 │   ├── cache/                        # MetadataCache; хеш-кэш выгрузки: HashCache (базовая линия
 │   │                                  # .v8vscedit/cache), HashStatMemo (stat-мемо .v8vscedit/hash-stat),
@@ -215,7 +218,12 @@ src/
 │   │                                  # DeltaImport (дельта импорта скачивает только файлы с mtime ≥ метки сервера; метка —
 │   │                                  # ПЕРВАЯ операция `importChanges`, мутации M в импорте — только после неё; грязные, вне B
 │   │                                  # и restore скачиваются всегда), SyncProgress (один источник прогресса для журнала и окна
-│   │                                  # `withProgress` с «Отмена» у импорта; docs/architecture.md, «Прогресс операций агента»)
+│   │                                  # `withProgress` с «Отмена» у импорта; docs/architecture.md, «Прогресс операций агента»),
+│   │                                  # VendorConfigurationGate (шлюз: Ext/ParentConfigurations/** качаются только при
+│   │                                  # доказанном изменении части или изменившемся .bin; `VENDOR_CONFIGURATION_GATE_ENABLED`),
+│   │                                  # DeltaDownload/DeltaLanes (малая/большая полосы по порогу 16 МиБ), LocalCompareImport
+│   │                                  # (локальный агент), TransferProgress(Text) (прогресс по весу: скорость, ETA);
+│   │                                  # docs/architecture.md, «Конфигурация поставщика и большие файлы»
 │   ├── process/                      # поиск платформы, spawn, декодер OEM/Win1251,
 │   │   │                              # SensitiveArgs (маскирование -Password в логах),
 │   │   │                              # WindowsCommandLine (квотирование libuv — один вектор локально и удалённо)
@@ -526,6 +534,11 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   импорт, сам помечая чисто); после успеха `refreshRepositoryUi` → регистрация в
   `ui/mcp/registration/McpRepositoryTools.ts` + запись в `EXTENSION_MCP_TOOLS`
   (`infra/ai/AiMcpToolCatalog.ts`).
+- **Новый писатель или читатель файла выгрузки размером с ГБ** (скачивание, сравнение, запись в P, хеш): только
+  потоком — `downloadToFile`, `ProjectFileContent.writeTo`, `filesHaveSameContent`, потоковый хеш `HashScanner`;
+  `readFile` целиком допустим лишь для файлов ниже `DEFAULT_LARGE_FILE_THRESHOLD_BYTES` (16 МиБ). Файлы
+  `Ext/ParentConfigurations/**` скачиваются только через шлюз `VendorConfigurationGate`, а не напрямую (см.
+  [architecture.md](./docs/architecture.md#модель-синхронизации-m--p--b)).
 - **Любой писатель файла выгрузки (и служебного кэша):** только через `infra/fs/AtomicFileWriter`
   (`writeFileAtomic`) либо `writeTextFilePreservingBomAndEol`, который делегирует туда. Собственный
   `fs.writeFileSync`/`rename` для файла выгрузки заводить нельзя — третьей копии temp+rename быть не

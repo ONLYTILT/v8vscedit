@@ -8,6 +8,7 @@ import { fetchChangeSet } from './ChangeSet';
 import { resolveOwnerNames, type ChangedOwner } from './ChangedObjectFiles';
 import { fetchFreshDumpInfo } from './FreshDumpInfo';
 import { confirmFullDumpOrThrow, type FullDumpConsentContext } from './FullDumpConsent';
+import { evidenceFromChangeObjects, evidenceFromDumpInfoNames, type RootPartEvidence } from './VendorConfigurationGate';
 import { CONFIG_DUMP_INFO_XML, assertConfigurationPresent } from './ProjectFiles';
 import { summarizeList } from './ProjectSeed';
 import {
@@ -49,6 +50,11 @@ export interface FullDumpResolved {
   readonly replacedOwners: readonly string[];
   readonly updateKind: 'incremental' | 'rewrite';
   readonly rewriteOwnersWithRemovedParts: readonly string[];
+  /**
+   * Изменённые части корня для шлюза конфигурации поставщика: после очистки — по ПОВТОРНОМУ списку изменений,
+   * после перезаписи M — по сравнению файла версий до и после.
+   */
+  readonly rootPartEvidence: RootPartEvidence;
 }
 
 export type FullDumpResolution =
@@ -188,6 +194,7 @@ async function afterPrune(
     replaced: changes.ownersWithRemovedParts,
     updateKind: 'incremental',
     rewriteOwnersWithRemovedParts: [],
+    rootPartEvidence: evidenceFromChangeObjects(plan.objects),
   });
 }
 
@@ -213,7 +220,8 @@ async function rewriteMirror(
   }));
   throwIfCancelled(context);
   const afterIndex = parseConfigDumpInfoIndex(await downloadMirrorDumpInfo(context, CDI_AFTER));
-  const changes = groupDumpInfoDiffByOwner(diffConfigDumpInfo(beforeIndex, afterIndex), beforeIndex, afterIndex);
+  const diff = diffConfigDumpInfo(beforeIndex, afterIndex);
+  const changes = groupDumpInfoDiffByOwner(diff, beforeIndex, afterIndex);
   assertConfigurationPresent(!changes.configurationMissing, `файле версий зеркала "${mirror}"`);
   const alive = afterIndex.rootNames;
   const prunedAll = [...pruned.removed, ...pruned.withParts];
@@ -228,6 +236,7 @@ async function rewriteMirror(
     replaced: [...pruned.withParts.filter((owner) => alive.has(owner)), ...changes.ownersWithRemovedParts],
     updateKind: 'rewrite',
     rewriteOwnersWithRemovedParts: changes.ownersWithRemovedParts,
+    rootPartEvidence: evidenceFromDumpInfoNames(diff),
   });
 }
 
@@ -241,6 +250,7 @@ interface ResolvedNames {
   readonly replaced: readonly string[];
   readonly updateKind: FullDumpResolved['updateKind'];
   readonly rewriteOwnersWithRemovedParts: readonly string[];
+  readonly rootPartEvidence: RootPartEvidence;
 }
 
 /** Имена → файлы: одна таблица «вид → папка» (META_TYPES) через `resolveOwnerNames`. */
@@ -262,6 +272,7 @@ function resolved(context: SyncOperationContext, names: ResolvedNames): FullDump
     replacedOwners: unique(names.replaced),
     updateKind: names.updateKind,
     rewriteOwnersWithRemovedParts: names.rewriteOwnersWithRemovedParts,
+    rootPartEvidence: names.rootPartEvidence,
   };
 }
 
