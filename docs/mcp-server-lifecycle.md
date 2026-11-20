@@ -102,6 +102,89 @@ unit-тестом без extension host; в `Container` остаётся тол�
 (`Promise.allSettled([...])`), а сам `V8McpServer` зарегистрирован в `context.subscriptions` —
 освобождение порта гарантировано и при штатной деактивации, и при закрытии IDE/перезагрузке окна.
 
+## Долгие вызовы: пульс, возобновляемость SSE, видимость операции
+
+План и обоснования — [plans/mcp-long-running-plan.md](./plans/mcp-long-running-plan.md).
+
+### Почему
+
+Полное получение БП КОРП с импортом (`v8vscedit_repository_update`, > 5 мин) приводило в клиенте Claude
+Code к «SSE stream disconnected: TimeoutError», затем «response presumed lost», хотя операция в расширении
+шла дальше под общим замком. Журнал клиента показал: согласован протокол `2025-11-25`; клиент
+периодически (ровно раз в 6 мин, даже без вызова) рвёт молчащий GET-поток сессии, а POST вызова гибнет
+вместе с ним. Сервер без `eventStore` не отправляет priming-событие, поэтому клиент SDK не мог
+переподключиться по `Last-Event-ID` и через ~109 с объявлял ответ потерянным. Какой именно таймер
+истекает (простой или абсолютный), подтверждается только пилотом на собранном VSIX.
+
+### Пульс (`infra/mcp/McpRequestPulse.ts`)
+
+Чистый модуль без SDK/`vscode`. Пока идёт долгий вызов, раз в 20 с (`MCP_PULSE_INTERVAL_MS`) клиенту
+уходит уведомление:
+
+- первый тик — через интервал (короткие вызовы молчат); следующий таймер взводится только после
+  завершения отправки предыдущего (без наложения); после `stop()`/abort таймеров и отправок нет;
+- при `progressToken` в `_meta` запроса — `notifications/progress` (`progress` растёт монотонно, токен `0`
+  допустим), иначе `notifications/message` (`level: info`, `logger: v8vscedit`); для второго у сервера
+  объявлена capability `logging` (без неё SDK бросает);
+- в вызов уведомление идёт через `extra.sendNotification` (SDK ставит `relatedRequestId`, поэтому оно
+  попадает в POST-поток вызова);
+- **сессионный пульс** — то же сообщение через `server.sendLoggingMessage` в GET-поток сессии, но только на
+  время долгого вызова (в простое сессия молчит). Если GET-потока нет, SDK при наличии `eventStore`
+  сохраняет событие в `_GET_stream` и тихо возвращается: события копятся до лимита 1000 на поток (порядка
+  250 КБ на сессию). Это цена решения, не утечка — store ограничен и очищается в `onclose`;
+- уровень `logging/setLevel` клиента не учитывается (`isMessageIgnored` в SDK приватный) — пульс всегда
+  `info`;
+- ошибка отправки не останавливает пульс и логируется в канал «1С Редактор» один раз за вызов
+  (`[mcp][pulse] <tool>: …`).
+
+Текст — `<tool>: выполняется 5 мин 20 с — <этап>`; этап берётся из `OperationStageFeed`
+(`infra/progress/`): лента строк, которые статус-бары операций (`begin/update/endConfigurationOperationStatus`,
+`begin/update/endRepositoryOperationStatus`) и так показывают человеку; этап старше начала вызова
+отбрасывается.
+
+### Возобновление (`infra/mcp/McpSessionEventStore.ts`)
+
+На каждую MCP-сессию создаётся свой `McpSessionEventStore` (`V8McpServer.createSession`), транспорт получает
+`eventStore` и `retryInterval = 1000` мс (`MCP_SSE_RETRY_INTERVAL_MS`). Следствия:
+
+- сервер шлёт priming-событие (только клиентам с протоколом ≥ `2025-11-25`; старые получают лишь пульс);
+- после обрыва клиент переподключается GET-запросом с `Last-Event-ID`; `replayEventsAfter` отдаёт события
+  после указанного, **пропуская не-JSON-RPC** (priming хранится как `{}`), и ответ, готовый уже после
+  переподключения, уходит в новый поток;
+- лимиты на сессию: 1000 событий на поток, 64 потока, 16 МиБ, TTL 15 мин для завершённых потоков (поток
+  завершён, когда сохранён JSON-RPC-ответ). Очистка ленивая (на `storeEvent`/`replay`, без таймеров);
+  ответ вытесняется последним; `clear()` — первой строкой `transport.onclose`;
+- **не реализовывать необязательный `getStreamIdForEventId`.** Устаревшая запись от оборванного
+  replay-потока даёт `409 Conflict` при втором переподключении (страж-тест проверяет отсутствие метода);
+- `enableJsonResponse` не включается.
+
+**Окно потери ≈ `retryInterval`.** Если ответ готов раньше, чем клиент успел переподключиться, SDK не
+находит поток и событие не сохраняет: ответ теряется. Это известное ограничение SDK; страхует его
+`lastOperation`.
+
+### Видимость операции
+
+`v8vscedit_repository_status` возвращает `operationRunning`, `currentOperation` (`startedAt`,
+`elapsedSeconds`, `title`/`stage`/`stageUpdatedAt` — только свежий этап) и `lastOperation`
+(`{tool, startedAt, finishedAt, isError, summary}`, `McpOperationOutcome`: один экземпляр на сервер, живёт
+дольше сессии). После обрыва агент читает исход оттуда. `lastOperation` записывает `wrapLongRunning` в
+`finally` (успех, ошибка, abort).
+
+### Какие инструменты долгие
+
+Через `gate.wrapLongRunning(toolName, extra, fn)` (`ui/mcp/registration/McpMutationGate.ts`) идут 10
+инструментов: `repository_lock`, `repository_update`, `repository_commit`, `repository_unlock`,
+`update_database_configuration`, `dump_cf`, `load_cf`, `dump_all_cfe`, `load_all_cfe`, `execute_command`.
+Без `extra` (старые тесты с фейковым сервером) обёртка эквивалентна `wrapAsync`. Новый долгий инструмент —
+только так, не через `wrapAsync`.
+
+### Как читать журнал клиента
+
+Claude Code пишет журналы MCP-подключений в
+`%LOCALAPPDATA%\claude-cli-nodejs\Cache\<проект>\mcp-logs-<сервер>\*.jsonl`: там `negotiatedProtocolVersion`,
+строки «SSE stream disconnected», моменты обрывов (период 6 мин) и «response presumed lost». Для проверки
+возобновления ищите после обрыва GET с `Last-Event-ID` и ответ вызова.
+
 ## Известные ограничения
 
 - **`conflict-unknown` не различает «порт занят чем-то живым» от «порт временно в TIME_WAIT».**

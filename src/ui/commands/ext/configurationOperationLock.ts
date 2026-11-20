@@ -17,6 +17,8 @@ import * as vscode from 'vscode';
 const BUSY_CONTEXT_KEY = 'v8vscedit.isUpdatingConfigurations';
 
 let operationRunning = false;
+// Момент взятия замка (мс epoch): длительность и свежесть этапа в `v8vscedit_repository_status`.
+let operationStartedAt: number | undefined;
 const idleActions: (() => void)[] = [];
 
 /** Идёт ли сейчас эксклюзивная операция над конфигурацией. */
@@ -33,6 +35,7 @@ export async function tryBeginConfigurationOperation(): Promise<boolean> {
     return false;
   }
   operationRunning = true;
+  operationStartedAt = Date.now();
   await vscode.commands.executeCommand('setContext', BUSY_CONTEXT_KEY, true);
   return true;
 }
@@ -40,6 +43,7 @@ export async function tryBeginConfigurationOperation(): Promise<boolean> {
 /** Освобождает замок. Вызывается только тем, кто его занял (обычно в `finally`). */
 export async function endConfigurationOperation(): Promise<void> {
   operationRunning = false;
+  operationStartedAt = undefined;
   // Синхронно, до первого await: следующая операция не успеет занять замок раньше отложенных действий.
   for (const action of idleActions.splice(0)) {
     try {
@@ -65,7 +69,19 @@ export function runWhenConfigurationOperationIdle(action: () => void): void {
   action();
 }
 
+/** Момент старта идущей операции или `undefined`, если замок свободен. */
+export function getConfigurationOperationStartedAt(): number | undefined {
+  return operationStartedAt;
+}
+
 export const CONFIGURATION_OPERATION_BUSY_MESSAGE = 'Операция с конфигурацией уже выполняется. Дождитесь её завершения.';
+
+/**
+ * Текст «занято» для агента: у него нет статус-бара, поэтому указывается, где смотреть состояние
+ * идущей операции. UI-тексты (тосты) остаются на базовом сообщении.
+ */
+export const MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE =
+  `${CONFIGURATION_OPERATION_BUSY_MESSAGE} Состояние идущей операции — v8vscedit_repository_status (operationRunning, currentOperation, lastOperation); повторите вызов после её завершения.`;
 
 /**
  * Выполняет `operation` под общим замком. При занятом замке — уведомление без `await`
@@ -86,12 +102,12 @@ export async function runWithConfigurationOperationLock<T>(operation: () => Prom
 
 /**
  * Вариант для MCP: у агента нет тостов, поэтому занятый замок — исключение с
- * `CONFIGURATION_OPERATION_BUSY_MESSAGE` (его превращает в `isError` обёртка инструмента). Чужой
+ * `MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE` (его превращает в `isError` обёртка инструмента). Чужой
  * замок не снимается; исключение операции пробрасывается как есть, замок освобождается.
  */
 export async function runWithConfigurationOperationLockOrThrow<T>(operation: () => Promise<T>): Promise<T> {
   if (!await tryBeginConfigurationOperation()) {
-    throw new Error(CONFIGURATION_OPERATION_BUSY_MESSAGE);
+    throw new Error(MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE);
   }
   try {
     return await operation();

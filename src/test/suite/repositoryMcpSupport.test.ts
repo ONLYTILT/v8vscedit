@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
-  CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
   endConfigurationOperation,
   isConfigurationOperationRunning,
   runWithConfigurationOperationLockOrThrow,
@@ -36,12 +36,12 @@ suite('configurationOperationLock: runWithConfigurationOperationLockOrThrow', ()
     assert.strictEqual(isConfigurationOperationRunning(), false);
   });
 
-  test('замок занят: бросает CONFIGURATION_OPERATION_BUSY_MESSAGE, операция не запускается, чужой замок НЕ снят', async () => {
+  test('замок занят: бросает MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, операция не запускается, чужой замок НЕ снят', async () => {
     assert.strictEqual(await tryBeginConfigurationOperation(), true);
     let ran = false;
     await assert.rejects(
       () => runWithConfigurationOperationLockOrThrow(() => { ran = true; return Promise.resolve(1); }),
-      (error: Error) => error.message === CONFIGURATION_OPERATION_BUSY_MESSAGE
+      (error: Error) => error.message === MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE // смена контракта (план mcp-long-running, 1.8): MCP-текст вместо базового
     );
     assert.strictEqual(ran, false);
     assert.strictEqual(isConfigurationOperationRunning(), true, 'чужой замок остался');

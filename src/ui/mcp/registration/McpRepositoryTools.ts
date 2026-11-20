@@ -21,7 +21,13 @@ import {
   type RepositoryNodeRef,
   type RepositoryTarget,
 } from '../../../infra/repository/RepositoryService';
-import { runWithConfigurationOperationLockOrThrow } from '../../commands/ext/configurationOperationLock';
+import { describeRunningOperation } from '../../../infra/progress/OperationStageFeed';
+import {
+  getConfigurationOperationStartedAt,
+  isConfigurationOperationRunning,
+  runWithConfigurationOperationLockOrThrow,
+} from '../../commands/ext/configurationOperationLock';
+import { operationStageFeed } from '../../commands/ext/configurationOperationStatus';
 import { RepositoryCliError, RepositoryCliInterruptedError } from '../../commands/repository/RepositoryCommandRunner';
 import { readRevisedOnLockSetting } from '../../commands/repository/RepositoryLockCommand';
 import {
@@ -44,6 +50,7 @@ import {
   resolveMcpUpdatePlan,
   toRepositoryNodeRef,
 } from './McpRepositoryDecisions';
+import type { McpMutationGate } from './McpMutationGate';
 import type { McpCommandServices, McpRegistrationDeps } from './McpRegistrationDeps';
 
 const INTERRUPTED_MESSAGE = 'Операция прервана пользователем';
@@ -98,7 +105,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     'v8vscedit_repository_status',
     {
       title: 'Состояние хранилища конфигурации',
-      description: 'Показывает подключение узла к хранилищу конфигурации: привязку (без пароля), подключено ли оно, захваченные вами объекты по локальному учёту и число незагруженных изменённых файлов проекта. Платформу не вызывает. Принимает канонический путь объекта или корня конфигурации/расширения (Справочники.Товары, Конфигурация, Расширение).',
+      description: 'Показывает подключение узла к хранилищу конфигурации: привязку (без пароля), подключено ли оно, захваченные вами объекты по локальному учёту и число незагруженных изменённых файлов проекта. Также показывает состояние общей операции с конфигурацией: operationRunning — идёт ли сейчас операция; currentOperation — время её начала, длительность и текущий этап (null, если операции нет); lastOperation — исход последней завершённой долгой операции MCP (null, если их не было): по нему можно узнать результат, если соединение оборвалось. Платформу не вызывает. Принимает канонический путь объекта или корня конфигурации/расширения (Справочники.Товары, Конфигурация, Расширение).',
       inputSchema: z.object({
         path: z.string(),
         configuration: z.string().optional(),
@@ -107,7 +114,10 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     },
     ({ path, configuration }) => gate.wrapAsync(async () => {
       const { ref, target } = resolveNodeTarget(path, configuration);
-      return buildStatus(services, path, ref, target, await dirtyFilesCount(target));
+      return {
+        ...await buildStatus(services, path, ref, target, await dirtyFilesCount(target)),
+        ...describeOperationState(gate),
+      };
     })
   );
 
@@ -125,7 +135,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       }),
       annotations: { destructiveHint: false },
     },
-    ({ path, configuration, recursive, localChanges, confirm }) => gate.wrapAsync(() => withRepositoryErrors(async () => {
+    ({ path, configuration, recursive, localChanges, confirm }, extra) => gate.wrapLongRunning('v8vscedit_repository_lock', extra, () => withRepositoryErrors(async () => {
       const { ref, target } = resolveConnected(path, configuration);
       const isRecursive = recursive ?? false;
       assertRootRecursiveLockConfirmed({ nodeKind: ref.nodeKind, recursive: isRecursive, confirm });
@@ -156,7 +166,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       annotations: { destructiveHint: true },
     },
     // `-force` и версия не открыты: по Э24 различий у `-force` нет, а откат к версии — решение человека.
-    ({ path, configuration, recursive, localChanges, overwriteLocked }) => gate.wrapAsync(() => withRepositoryErrors(async () => {
+    ({ path, configuration, recursive, localChanges, overwriteLocked }, extra) => gate.wrapLongRunning('v8vscedit_repository_update', extra, () => withRepositoryErrors(async () => {
       const { ref, target } = resolveConnected(path, configuration);
       const isRecursive = recursive ?? false;
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
@@ -193,7 +203,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       }),
       annotations: { destructiveHint: true },
     },
-    (args) => gate.wrapAsync(() => withRepositoryErrors(async () => {
+    (args, extra) => gate.wrapLongRunning('v8vscedit_repository_commit', extra, () => withRepositoryErrors(async () => {
       assertCommitArgs(args);
       const { ref, target } = resolveConnected(args.path, args.configuration);
       const request = {
@@ -223,7 +233,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       annotations: { destructiveHint: false },
     },
     // `force` не открыт: по Э24 он отменяет захват ценой правок объекта в базе.
-    ({ path, configuration, recursive }) => gate.wrapAsync(() => withRepositoryErrors(async () => {
+    ({ path, configuration, recursive }, extra) => gate.wrapLongRunning('v8vscedit_repository_unlock', extra, () => withRepositoryErrors(async () => {
       const { ref, target } = resolveConnected(path, configuration);
       const request = { recursive: recursive ?? false, force: false };
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
@@ -265,6 +275,31 @@ async function buildStatus(
       locked: fullName ? repository.isLocked(target, fullName) : repository.isRootLocked(target),
       editRestricted: repository.isMetadataEditRestricted(target, ownerXml),
     },
+  };
+}
+
+/**
+ * Идущая общая операция (замок + свежий этап ленты) и исход последней долгой операции MCP: по ним
+ * агент узнаёт, чего ждать при «занято», и результат вызова, ответ на который потерян при обрыве.
+ */
+function describeOperationState(gate: McpMutationGate): Record<string, unknown> {
+  const last = gate.lastOperation();
+  return {
+    ...describeRunningOperation({
+      running: isConfigurationOperationRunning(),
+      startedAt: getConfigurationOperationStartedAt(),
+      stage: operationStageFeed.current(),
+      now: Date.now(),
+    }),
+    lastOperation: last
+      ? {
+          tool: last.tool,
+          startedAt: new Date(last.startedAt).toISOString(),
+          finishedAt: new Date(last.finishedAt).toISOString(),
+          isError: last.isError,
+          summary: last.summary,
+        }
+      : null,
   };
 }
 

@@ -1,6 +1,10 @@
 import * as assert from 'assert';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { CONFIGURATION_OPERATION_BUSY_MESSAGE, isConfigurationOperationRunning, tryBeginConfigurationOperation } from '../../ui/commands/ext/configurationOperationLock';
+import {
+  MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  isConfigurationOperationRunning,
+  tryBeginConfigurationOperation,
+} from '../../ui/commands/ext/configurationOperationLock';
 import { resolveConfigurationXmlByCanonical } from '../../ui/mcp/McpPathResolvers';
 import { registerConfigLifecycleTools } from '../../ui/mcp/registration/McpConfigLifecycleTools';
 import { McpMutationGate } from '../../ui/mcp/registration/McpMutationGate';
@@ -138,11 +142,12 @@ suite('v8vscedit_update_database_configuration', function () {
     assert.deepStrictEqual(p.events, []);
   });
 
-  test('замок занят: CONFIGURATION_OPERATION_BUSY_MESSAGE, apply не вызывался, чужой замок не снят', async () => {
+  test('замок занят: MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, apply не вызывался, чужой замок не снят', async () => {
     assert.strictEqual(await tryBeginConfigurationOperation(), true);
     const result = await run({ path: 'Конфигурация' });
     assert.strictEqual(result.isError, true);
-    assert.strictEqual(text(result), CONFIGURATION_OPERATION_BUSY_MESSAGE);
+    // Смена контракта (план mcp-long-running, 1.8): MCP-текст вместо базового.
+    assert.strictEqual(text(result), MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE);
     assert.deepStrictEqual(p.events, []);
     assert.strictEqual(isConfigurationOperationRunning(), true);
   });

@@ -1,5 +1,13 @@
 // Перенесено из ExtensionCommandRunner.ts (Э2) без изменения поведения; публичный API реэкспортируется оттуда.
 import * as vscode from 'vscode';
+import { OperationStageFeed } from '../../../infra/progress/OperationStageFeed';
+
+/**
+ * Единственная лента этапов операций с конфигурацией и хранилищем. Публикуют в неё оба статус-бара
+ * (через них уже идёт весь прогресс раннеров), читают пульс долгих MCP-вызовов и
+ * `v8vscedit_repository_status` — агент видит тот же этап, что человек в статус-баре.
+ */
+export const operationStageFeed = new OperationStageFeed();
 
 let statusBarItem: vscode.StatusBarItem | undefined;
 let clearStatusTimer: NodeJS.Timeout | undefined;
@@ -28,6 +36,7 @@ export function beginConfigurationOperationStatus(title: string, message: string
   cancelConfigurationHideTimer();
   activeOperationCount++;
   showSpinnerStatus(title, message);
+  operationStageFeed.publish('begin', title, message);
 }
 
 /** Обновление текста прогресса без изменения счётчика активных операций. */
@@ -35,6 +44,7 @@ export function updateConfigurationOperationStatus(title: string, message: strin
   ensureConfigurationStatusItem();
   cancelConfigurationHideTimer();
   showSpinnerStatus(title, message);
+  operationStageFeed.publish('update', title, message);
 }
 
 /**
@@ -53,6 +63,10 @@ export function endConfigurationOperationStatus(title?: string, message?: string
     statusBarItem.text = `$(check) ${trimStatusMessage(text)}`;
     statusBarItem.tooltip = text;
     statusBarItem.show();
+  }
+  // Без title/message этап уже выставлен предыдущим шагом — публиковать нечего.
+  if (title !== undefined && message !== undefined) {
+    operationStageFeed.publish('end', title, message);
   }
 
   // Скрываем статус только когда завершилась последняя активная операция —

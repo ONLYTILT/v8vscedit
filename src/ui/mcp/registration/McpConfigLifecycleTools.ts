@@ -3,6 +3,9 @@
  *
  * Домен «configLifecycle»: create_configuration, create_extension, cfe_borrow,
  * cfe_patch_method, cfe_diff, execute_command, update_database_configuration.
+ *
+ * Долгие инструменты (обмен с базой через Конфигуратор, команды импорта/обновления) обёрнуты в
+ * `gate.wrapLongRunning`: пульс держит поток вызова живым, исход попадает в `lastOperation`.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as vscode from 'vscode';
@@ -12,13 +15,27 @@ import { runDumpAllExtensionsToCfe, runLoadAllExtensionsFromCfe } from '../../co
 import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport } from '../../../infra/cfFile';
 import { buildCfApplyTarget, resolveApplyTargetFromNode } from '../../commands/ext/CfFileTarget';
 import { runApplyDatabaseConfiguration } from '../../commands/ext/ExtensionCommandRunner';
-import { runWithConfigurationOperationLockOrThrow } from '../../commands/ext/configurationOperationLock';
+import {
+  MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  isConfigurationOperationRunning,
+  runWithConfigurationOperationLockOrThrow,
+} from '../../commands/ext/configurationOperationLock';
 import { findChangedConfiguration } from '../../commands/repository/repositoryPostSync';
 import { canonicalToLegacyModulePath, resolveConfigurationXmlByCanonical } from '../McpPathResolvers';
 import type { McpRegistrationDeps } from './McpRegistrationDeps';
 
 const ALLOWED_COMMANDS = new Set([
   'v8vscedit.refresh',
+  'v8vscedit.importConfigurations',
+  'v8vscedit.updateChangedConfigurations',
+]);
+
+/**
+ * Команды, берущие общий замок сами. При занятом замке UI-команда показала бы тост «занято» и вернула
+ * бы `undefined` — агент получил бы ложный «успех», а ожидание тоста держало бы MCP-вызов. Проверка
+ * до запуска не атомарна с захватом замка командой (TOCTOU): гонка лишь вернёт прежнее поведение.
+ */
+const LOCKING_COMMANDS = new Set([
   'v8vscedit.importConfigurations',
   'v8vscedit.updateChangedConfigurations',
 ]);
@@ -101,7 +118,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: false,
       },
     },
-    async ({ outputFile, extensionName, overwrite }) => gate.wrapAsync(async () => {
+    async ({ outputFile, extensionName, overwrite }, extra) => gate.wrapLongRunning('v8vscedit_dump_cf', extra, async () => {
       const dumped = await runWithConfigurationOperationLockOrThrow(() => runDumpConfigurationToCf({
         workspaceFolder: services.workspaceFolder,
         outputChannel: services.outputChannel,
@@ -138,7 +155,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: true,
       },
     },
-    async ({ inputFile, extensionName, confirm, applyToDatabase }) => {
+    async ({ inputFile, extensionName, confirm, applyToDatabase }, extra) => {
       // Проверяем значение, а не только наличие поля: агент может прислать
       // confirm=false — неявного согласия по умолчанию у необратимой
       // операции быть не должно.
@@ -149,7 +166,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           + 'Передайте confirm: true, чтобы подтвердить операцию.'
         ));
       }
-      return gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
+      return gate.wrapLongRunning('v8vscedit_load_cf', extra, async () => runWithConfigurationOperationLockOrThrow(async () => {
         const loaded = await runLoadConfigurationFromCf({
           workspaceFolder: services.workspaceFolder,
           outputChannel: services.outputChannel,
@@ -204,7 +221,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: false,
       },
     },
-    async ({ outputDir, overwrite }) => gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
+    async ({ outputDir, overwrite }, extra) => gate.wrapLongRunning('v8vscedit_dump_all_cfe', extra, async () => runWithConfigurationOperationLockOrThrow(async () => {
       const result = await runDumpAllExtensionsToCfe({
         workspaceFolder: services.workspaceFolder,
         outputChannel: services.outputChannel,
@@ -249,7 +266,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: true,
       },
     },
-    async ({ inputDir, confirm, createMissing, applyToDatabase }) => {
+    async ({ inputDir, confirm, createMissing, applyToDatabase }, extra) => {
       // Проверяем значение, а не наличие поля: неявного согласия у необратимой
       // операции быть не должно.
       if (!confirm) {
@@ -259,7 +276,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           + 'Передайте confirm: true, чтобы подтвердить операцию.'
         ));
       }
-      return gate.wrapAsync(async () => runWithConfigurationOperationLockOrThrow(async () => {
+      return gate.wrapLongRunning('v8vscedit_load_all_cfe', extra, async () => runWithConfigurationOperationLockOrThrow(async () => {
         const result = await runLoadAllExtensionsFromCfe({
           workspaceFolder: services.workspaceFolder,
           outputChannel: services.outputChannel,
@@ -403,7 +420,10 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         destructiveHint: true,
       },
     },
-    async ({ command }) => gate.wrapAsync(async () => {
+    async ({ command }, extra) => gate.wrapLongRunning('v8vscedit_execute_command', extra, async () => {
+      if (LOCKING_COMMANDS.has(command) && isConfigurationOperationRunning()) {
+        throw new Error(MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE);
+      }
       const result = await vscode.commands.executeCommand(command);
       return { command, result: result ?? null };
     })
@@ -424,7 +444,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     },
     // Без confirm — паритет с «Обновить БД» в UI. gate.afterMutation не вызывается: файлы проекта не
     // менялись, а пометка «изменено» заставила бы «Обновить БД» залить их поверх базы (как у load_cf).
-    ({ path, configuration }) => gate.wrapAsync(async () => {
+    ({ path, configuration }, extra) => gate.wrapLongRunning('v8vscedit_update_database_configuration', extra, async () => {
       // Текст отказа для не-корня — тот же, что у остальных инструментов корня конфигурации.
       resolveConfigurationXmlByCanonical(deps.paths, path, configuration);
       const target = resolveApplyTargetFromNode(deps.paths.resolveNode(path, configuration));

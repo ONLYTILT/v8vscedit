@@ -234,7 +234,11 @@ src/
 │   ├── mcp/                          # McpServerIdentity/McpStartDecision/McpPortProbe/
 │   │                                  # McpConflictPrompt/McpHost — чистая логика жизненного цикла
 │   │                                  # встроенного MCP-сервера (bind/reuse/conflict, закрытие порта),
-│   │                                  # без vscode; см. docs/mcp-server-lifecycle.md
+│   │                                  # без vscode; McpRequestPulse (пульс долгих вызовов),
+│   │                                  # McpSessionEventStore (eventStore SSE на сессию),
+│   │                                  # McpOperationOutcome (lastOperation); см. docs/mcp-server-lifecycle.md
+│   ├── progress/                     # OperationStageFeed — лента этапов операций из статус-баров
+│   │                                  # (источник текста пульса и currentOperation)
 │   ├── ai/                           # AiMcpToolCatalog.ts — ДАННЫЕ каталога MCP-инструментов (EXTENSION_MCP_TOOLS,
 │   │                                  # BSL_ANALYZER_MCP_TOOLS); AiMcpConfiguration.ts реэкспортирует
 │   └── skills/                       # AiSkillsInstaller — установка ИИ-навыков
@@ -643,7 +647,9 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   в `infra/mcp/` (`McpServerIdentity`, `McpStartDecision`, `McpPortProbe`, `McpConflictPrompt`, `McpHost`,
   без `vscode`) → тонкий адаптер конкретного эндпоинта/диалога — `ui/mcp/V8McpServer.ts` (HTTP-роутинг,
   служебные `/identity`+`/shutdown` — не MCP-инструменты) и `Container` (чтение настроек `v8vscedit.mcp.*`,
-  показ диалога конфликта порта). См. [mcp-server-lifecycle.md](./docs/mcp-server-lifecycle.md).
+  показ диалога конфликта порта). Новый ДОЛГИЙ MCP-инструмент — через `gate.wrapLongRunning(toolName, extra,
+  fn)` (пульс + `lastOperation`), не `wrapAsync`. `eventStore` сессии не менять без учёта ловушки 409
+  (не реализовывать `getStreamIdForEventId`). См. [mcp-server-lifecycle.md](./docs/mcp-server-lifecycle.md).
 - **Новая часть объекта в панели «Изменения метаданных»** (`MetadataPartKind`, см.
   [git-metadata-changes.md](./docs/git-metadata-changes.md)): случай в
   `infra/git/MetadataChangeResolver.ts` (`resolveSubPath`/дизамбигуация слота через

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { operationStageFeed } from '../ext/configurationOperationStatus';
 
 /**
  * Статус-бар операций хранилища: общий для всех операций, скрывается по таймеру после последней.
@@ -39,6 +40,7 @@ export function beginRepositoryOperationStatus(title: string, message: string): 
   cancelRepositoryHideTimer();
   activeOperationCount++;
   showRepositorySpinnerStatus(title, message);
+  operationStageFeed.publish('begin', title, message);
 }
 
 /** Обновление текста прогресса без изменения счётчика активных операций. */
@@ -46,6 +48,7 @@ export function updateRepositoryOperationStatus(title: string, message: string):
   ensureRepositoryStatusItem();
   cancelRepositoryHideTimer();
   showRepositorySpinnerStatus(title, message);
+  operationStageFeed.publish('update', title, message);
 }
 
 /** Терминал операции хранилища: декремент счётчика; при нуле — таймер скрытия. */
@@ -60,6 +63,7 @@ export function endRepositoryOperationStatus(title: string, message: string): vo
     statusBarItem.tooltip = text;
     statusBarItem.show();
   }
+  operationStageFeed.publish('end', title, message);
 
   // Скрываем статус только когда завершилась последняя активная операция хранилища.
   if (activeOperationCount === 0) {

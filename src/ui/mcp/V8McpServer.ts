@@ -8,7 +8,7 @@ import type { ConfigurationXmlEditor } from '../../infra/xml';
 import { MetadataMutationService } from '../commands/metadata/MetadataMutationService';
 import type { CommandServices } from '../commands/_shared';
 import { registerAllAddTools } from './McpAddToolsRegistration';
-import { McpMutationGate } from './registration/McpMutationGate';
+import { McpMutationGate, type McpPulseDeps } from './registration/McpMutationGate';
 import type { McpRegistrationDeps } from './registration/McpRegistrationDeps';
 import { registerNavigationTools } from './registration/McpNavigationTools';
 import { registerConfigInfoTools } from './registration/McpConfigInfoTools';
@@ -25,6 +25,10 @@ import { McpPropertyService } from './McpPropertyService';
 import { probeIdentity, reclaimPort } from '../../infra/mcp/McpPortProbe';
 import { formatHostForUrl } from '../../infra/mcp/McpHost';
 import { decideMcpStart } from '../../infra/mcp/McpStartDecision';
+import { McpOperationOutcomeRegistry } from '../../infra/mcp/McpOperationOutcome';
+import { MCP_PULSE_INTERVAL_MS, realPulseScheduler } from '../../infra/mcp/McpRequestPulse';
+import { MCP_SSE_RETRY_INTERVAL_MS, McpSessionEventStore } from '../../infra/mcp/McpSessionEventStore';
+import { operationStageFeed } from '../commands/ext/configurationOperationStatus';
 import {
   PRODUCT_ID,
   IDENTITY_PROTOCOL,
@@ -76,6 +80,9 @@ export class V8McpServer implements vscode.Disposable {
   // endpoint на занятом порту и НЕ владеет http.Server: его stop() не должен
   // гасить владельца.
   private adopted = false;
+  // Исходы долгих операций — на сервер, а не на сессию: обрыв соединения может закрыть сессию, а
+  // `lastOperation` нужен клиенту, переподключившемуся новой сессией.
+  private readonly outcomes = new McpOperationOutcomeRegistry();
 
   constructor(
     private readonly services: McpCommandServices,
@@ -166,7 +173,14 @@ export class V8McpServer implements vscode.Disposable {
     const paths = new McpMetadataPathService(this.services.treeProvider);
     const properties = new McpPropertyService(this.xmlEditor, this.services.subsystemXmlService);
     const mutations = new MetadataMutationService(this.services);
-    const gate = new McpMutationGate(this.services);
+    const pulse: McpPulseDeps = {
+      scheduler: realPulseScheduler,
+      intervalMs: MCP_PULSE_INTERVAL_MS,
+      readStage: () => operationStageFeed.current(),
+      // Пульс в GET-поток СВОЕЙ сессии: sendLoggingMessage без relatedRequestId уходит именно туда.
+      sendSessionPulse: (data) => server.sendLoggingMessage({ level: 'info', logger: 'v8vscedit', data }),
+    };
+    const gate = new McpMutationGate(this.services, pulse, this.outcomes);
     const deps: McpRegistrationDeps = {
       services: this.services,
       xmlEditor: this.xmlEditor,
@@ -276,12 +290,18 @@ export class V8McpServer implements vscode.Disposable {
 
   private async createSession(): Promise<McpSession> {
     let initializedSessionId: string | undefined;
+    // capability logging обязательна: без неё notifications/message пульса бросает в SDK.
     const server = new McpServer({
       name: 'v8vscedit',
       version: this.version,
-    });
+    }, { capabilities: { logging: {} } });
+    // Хранилище событий включает priming и переподключение клиента по Last-Event-ID после обрыва
+    // потока. enableJsonResponse не включается: JSON-ответ без SSE возобновить нельзя.
+    const eventStore = new McpSessionEventStore();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      eventStore,
+      retryInterval: MCP_SSE_RETRY_INTERVAL_MS,
       onsessioninitialized: (sessionId) => {
         initializedSessionId = sessionId;
         this.sessions.set(sessionId, { server, transport });
@@ -289,6 +309,7 @@ export class V8McpServer implements vscode.Disposable {
       },
     });
     transport.onclose = () => {
+      eventStore.clear();
       const sessionId = transport.sessionId ?? initializedSessionId;
       if (sessionId) {
         this.sessions.delete(sessionId);

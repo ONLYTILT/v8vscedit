@@ -16,6 +16,18 @@
  * лениво грузится через `tryRequireProductionModule`.
  */
 import * as assert from 'assert';
+import * as vscode from 'vscode';
+import {
+  CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  endConfigurationOperation,
+  getConfigurationOperationStartedAt,
+  isConfigurationOperationRunning,
+  runWithConfigurationOperationLock,
+  runWithConfigurationOperationLockOrThrow,
+  tryBeginConfigurationOperation,
+} from '../../ui/commands/ext/configurationOperationLock';
+import { waitForNextMillisecond } from './support/mcpFakeExtra';
 import { tryRequireProductionModule } from './support/tryRequireProductionModule';
 
 interface ConfigurationOperationLockModule {
@@ -73,5 +85,90 @@ suite('configurationOperationLock — общий взаимный замок о�
 
     const reacquired = await m().tryBeginConfigurationOperation();
     assert.strictEqual(reacquired, true, 'после освобождения замок обязан снова браться');
+  });
+});
+
+/**
+ * Видимость идущей операции для MCP (контракт плана 1.8): момент старта замка и MCP-текст «занято».
+ */
+suite('configurationOperationLock — момент старта и текст «занято» для MCP', () => {
+  const BASE = 'Операция с конфигурацией уже выполняется. Дождитесь её завершения.';
+  const MCP_TEXT =
+    `${BASE} Состояние идущей операции — v8vscedit_repository_status (operationRunning, currentOperation, lastOperation); повторите вызов после её завершения.`;
+
+  teardown(async () => {
+    if (isConfigurationOperationRunning()) {
+      await endConfigurationOperation();
+    }
+  });
+
+  test('замок свободен: момента старта нет', () => {
+    assert.strictEqual(getConfigurationOperationStartedAt(), undefined);
+  });
+
+  test('tryBegin запоминает момент старта (Date.now в пределах вызова); end сбрасывает', async () => {
+    const before = Date.now();
+    assert.strictEqual(await tryBeginConfigurationOperation(), true);
+    const after = Date.now();
+    const startedAt = getConfigurationOperationStartedAt();
+    assert.ok(startedAt !== undefined && startedAt >= before && startedAt <= after, `startedAt=${String(startedAt)}`);
+
+    await endConfigurationOperation();
+    assert.strictEqual(getConfigurationOperationStartedAt(), undefined);
+  });
+
+  test('неудачный повторный tryBegin момент старта чужой операции не меняет', async () => {
+    assert.strictEqual(await tryBeginConfigurationOperation(), true);
+    const startedAt = getConfigurationOperationStartedAt();
+    waitForNextMillisecond();
+    assert.strictEqual(await tryBeginConfigurationOperation(), false);
+    assert.strictEqual(getConfigurationOperationStartedAt(), startedAt);
+  });
+
+  test('runWithConfigurationOperationLockOrThrow: внутри операции момент старта задан, после — сброшен (и при исключении)', async () => {
+    let inside: number | undefined;
+    await runWithConfigurationOperationLockOrThrow(() => {
+      inside = getConfigurationOperationStartedAt();
+      return Promise.resolve();
+    });
+    assert.strictEqual(typeof inside, 'number');
+    assert.strictEqual(getConfigurationOperationStartedAt(), undefined);
+
+    await assert.rejects(() => runWithConfigurationOperationLockOrThrow(() => Promise.reject(new Error('сбой'))));
+    assert.strictEqual(getConfigurationOperationStartedAt(), undefined);
+  });
+
+  test('тексты: базовое сообщение UI не изменилось; MCP-текст = базовое + указание на статус', () => {
+    assert.strictEqual(CONFIGURATION_OPERATION_BUSY_MESSAGE, BASE);
+    assert.strictEqual(MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, MCP_TEXT);
+    assert.strictEqual(MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, MCP_TEXT);
+  });
+
+  test('OrThrow при занятом замке бросает MCP-текст (смена контракта: прежде — базовый), чужой замок не снят', async () => {
+    assert.strictEqual(await tryBeginConfigurationOperation(), true);
+    let ran = false;
+    await assert.rejects(
+      () => runWithConfigurationOperationLockOrThrow(() => { ran = true; return Promise.resolve(); }),
+      (error: Error) => error.message === MCP_TEXT
+    );
+    assert.strictEqual(ran, false);
+    assert.strictEqual(isConfigurationOperationRunning(), true);
+  });
+
+  test('UI-вариант runWithConfigurationOperationLock при занятом замке показывает ПРЕЖНИЙ текст (без указания на MCP) и возвращает undefined', async () => {
+    const infos: string[] = [];
+    const w = vscode.window as unknown as { showInformationMessage: unknown };
+    const original = w.showInformationMessage;
+    w.showInformationMessage = (message: string) => { infos.push(message); return Promise.resolve(undefined); };
+    try {
+      assert.strictEqual(await tryBeginConfigurationOperation(), true);
+      let ran = false;
+      const result = await runWithConfigurationOperationLock(() => { ran = true; return Promise.resolve(1); });
+      assert.strictEqual(result, undefined);
+      assert.strictEqual(ran, false);
+    } finally {
+      w.showInformationMessage = original;
+    }
+    assert.deepStrictEqual(infos, [BASE]);
   });
 });

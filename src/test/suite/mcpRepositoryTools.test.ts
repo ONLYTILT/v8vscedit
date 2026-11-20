@@ -2,12 +2,21 @@ import * as assert from 'assert';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as vscode from 'vscode';
 import { formatRepositoryLockName } from '../../infra/repository/RepositoryService';
-import { CONFIGURATION_OPERATION_BUSY_MESSAGE, isConfigurationOperationRunning, tryBeginConfigurationOperation } from '../../ui/commands/ext/configurationOperationLock';
+import {
+  MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
+  getConfigurationOperationStartedAt,
+  isConfigurationOperationRunning,
+  tryBeginConfigurationOperation,
+} from '../../ui/commands/ext/configurationOperationLock';
 import { describeLockedOverwrite } from '../../ui/commands/repository/repositoryUpdateFlow';
 import { McpMetadataPathService } from '../../ui/mcp/McpMetadataPathService';
 import { McpMutationGate } from '../../ui/mcp/registration/McpMutationGate';
 import { registerRepositoryTools } from '../../ui/mcp/registration/McpRepositoryTools';
 import type { MetadataNode } from '../../ui/tree/TreeNode';
+import { ManualScheduler } from './support/manualScheduler';
+import { McpOperationOutcomeRegistry } from '../../infra/mcp/McpOperationOutcome';
+import { operationStageFeed } from '../../ui/commands/ext/configurationOperationStatus';
+import { fakeExtra, waitForNextMillisecond } from './support/mcpFakeExtra';
 import {
   COMMIT_DONE, LOCK_DONE, ROOT_LOCK_CF, UNLOCK_DONE, UPDATE_DONE, createRepoProject, opLog, operationTail, type RepoProject,
 } from './support/repositoryMcpFixtures';
@@ -56,6 +65,8 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
   let p: RepoProject;
   let tools: Map<string, RegisteredTool>;
   let resolved: { path: string; configuration?: string }[];
+  // Шлюз общий для инструментов и проверок lastOperation: исходы пишет wrapLongRunning, статус их читает.
+  let gate: McpMutationGate;
 
   /** Регистрирует инструменты хранилища с заданным резолвером путей (пересборка реестра `tools`). */
   function mount(paths: unknown): void {
@@ -65,8 +76,13 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
         tools.set(name, { ...config, name, handler });
       },
     };
+    gate = new McpMutationGate(
+      p.services,
+      { scheduler: new ManualScheduler(), intervalMs: 20_000, readStage: () => operationStageFeed.current() },
+      new McpOperationOutcomeRegistry()
+    );
     registerRepositoryTools(server as never, {
-      services: p.services, xmlEditor: {}, paths, properties: {}, mutations: {}, gate: new McpMutationGate(p.services),
+      services: p.services, xmlEditor: {}, paths, properties: {}, mutations: {}, gate,
     } as never);
   }
 
@@ -199,6 +215,78 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
     });
   });
 
+  suite('v8vscedit_repository_status: состояние идущей операции и lastOperation (контракт плана 1.6/1.8)', () => {
+    const statusOf = async (): Promise<Record<string, unknown>> => data(await call('status', { path: 'Справочники.Товары' }));
+    const iso = (ms: number): string => new Date(ms).toISOString();
+    const run = (fn: () => Promise<unknown>, tool = 'v8vscedit_repository_lock'): Promise<unknown> =>
+      gate.wrapLongRunning(tool, fakeExtra(), fn);
+
+    test('операции нет: operationRunning=false, currentOperation=null, lastOperation=null', async () => {
+      const result = await statusOf();
+      assert.strictEqual(result.operationRunning, false);
+      assert.strictEqual(result.currentOperation, null);
+      assert.strictEqual(result.lastOperation, null);
+    });
+
+    test('идёт операция со свежим этапом: startedAt (ISO момента старта замка), elapsedSeconds, title, stage, stageUpdatedAt', async () => {
+      assert.strictEqual(await tryBeginConfigurationOperation(), true);
+      const startedAt = getConfigurationOperationStartedAt();
+      assert.strictEqual(typeof startedAt, 'number');
+      const feed = operationStageFeed;
+      feed.publish('update', 'Получение из хранилища', 'Объект Товары');
+      const stageAt = feed.current()?.at ?? -1;
+
+      const result = await statusOf();
+      assert.strictEqual(result.operationRunning, true);
+      const current = result.currentOperation as Record<string, unknown>;
+      assert.deepStrictEqual(Object.keys(current).sort(), ['elapsedSeconds', 'stage', 'stageUpdatedAt', 'startedAt', 'title']);
+      assert.strictEqual(current.startedAt, iso(startedAt ?? 0));
+      assert.strictEqual(current.title, 'Получение из хранилища');
+      assert.strictEqual(current.stage, 'Объект Товары');
+      assert.strictEqual(current.stageUpdatedAt, iso(stageAt));
+      assert.ok(typeof current.elapsedSeconds === 'number' && current.elapsedSeconds >= 0);
+      assert.strictEqual(isConfigurationOperationRunning(), true, 'статус замок не освобождает и не берёт');
+      assert.deepStrictEqual(p.runs, [], 'платформа не вызывается');
+    });
+
+    test('идёт операция, этап устаревший (опубликован до старта замка): только startedAt и elapsedSeconds', async () => {
+      operationStageFeed.publish('update', 'Чужая операция', 'остаток прошлого этапа');
+      waitForNextMillisecond();
+      assert.strictEqual(await tryBeginConfigurationOperation(), true);
+
+      const result = await statusOf();
+      assert.strictEqual(result.operationRunning, true);
+      const current = result.currentOperation as Record<string, unknown>;
+      assert.deepStrictEqual(Object.keys(current).sort(), ['elapsedSeconds', 'startedAt']);
+    });
+
+    test('lastOperation после успешной долгой операции: tool, ISO-время начала/конца, isError=false, summary', async () => {
+      await run(() => Promise.resolve({ path: 'Справочники.Товары', done: true }));
+      const last = (await statusOf()).lastOperation as Record<string, unknown>;
+      assert.deepStrictEqual(Object.keys(last).sort(), ['finishedAt', 'isError', 'startedAt', 'summary', 'tool']);
+      assert.strictEqual(last.tool, 'v8vscedit_repository_lock');
+      assert.strictEqual(last.isError, false);
+      assert.strictEqual(typeof last.summary, 'string');
+      for (const key of ['startedAt', 'finishedAt'] as const) {
+        const value = last[key];
+        assert.ok(typeof value === 'string' && iso(Date.parse(value)) === value, `${key} — ISO-строка: ${String(value)}`);
+      }
+      assert.ok(Date.parse(last.finishedAt as string) >= Date.parse(last.startedAt as string));
+    });
+
+    test('lastOperation после ошибки: isError=true, summary — первая строка текста ошибки; следующая операция заменяет запись', async () => {
+      await run(() => Promise.reject(new Error('Отказ платформы\nПодробности во второй строке')));
+      const failed = (await statusOf()).lastOperation as Record<string, unknown>;
+      assert.strictEqual(failed.isError, true);
+      assert.strictEqual(failed.summary, 'Отказ платформы');
+
+      await run(() => Promise.resolve({ done: true }), 'v8vscedit_repository_commit');
+      const next = (await statusOf()).lastOperation as Record<string, unknown>;
+      assert.strictEqual(next.tool, 'v8vscedit_repository_commit');
+      assert.strictEqual(next.isError, false);
+    });
+  });
+
   suite('защиты без побочных эффектов (исполнитель не запускается, замок свободен)', () => {
     const GUARDS: readonly {
       title: string;
@@ -326,12 +414,13 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
         assertNoSideEffects();
       });
 
-      test(`${name}: замок занят другой операцией — CONFIGURATION_OPERATION_BUSY_MESSAGE, запуска нет, чужой замок не снят`, async () => {
+      test(`${name}: замок занят другой операцией — MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, запуска нет, чужой замок не снят`, async () => {
         assert.strictEqual(await tryBeginConfigurationOperation(), true);
         const args = { ...VALID[name], path: 'Справочники.Товары' };
         const result = await call(name, args);
         assert.strictEqual(result.isError, true);
-        assert.strictEqual(text(result), CONFIGURATION_OPERATION_BUSY_MESSAGE);
+        // Смена контракта (план mcp-long-running, 1.8): MCP-текст вместо базового.
+        assert.strictEqual(text(result), MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE);
         assert.strictEqual(p.runs.length, 0);
         assert.strictEqual(isConfigurationOperationRunning(), true);
         assert.deepStrictEqual(p.toasts, []);

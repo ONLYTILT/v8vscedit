@@ -1135,7 +1135,12 @@ SFTP открывается отдельной фабрикой (`connectSftpAge
   молчаливая правка объекта в базе и хранилище (захват не обходит), поэтому он описан в description.
 - **Исполнитель тот же, что у UI** (`DesignerBatchExecutor`: local/remote по `v8vscedit.agent.location`),
   замок `configurationOperationLock` — бросающий (`runWithConfigurationOperationLockOrThrow`): занятый замок
-  — ошибка `CONFIGURATION_OPERATION_BUSY_MESSAGE`.
+  — ошибка. В MCP текст — `MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE` (базовое сообщение + подсказка смотреть
+  `v8vscedit_repository_status`: `operationRunning`/`currentOperation`/`lastOperation`); текст UI
+  (`CONFIGURATION_OPERATION_BUSY_MESSAGE`) прежний.
+- **`v8vscedit_execute_command`** для `importConfigurations`/`updateChangedConfigurations` при занятом замке
+  сразу отбивается этой же ошибкой (раньше вызов висел на тосте UI-команды и возвращал ложный успех).
+  Проверка и взятие замка не атомарны (TOCTOU) — остаточный риск; `refresh` не блокируется.
 
 **Общие цепочки.** Порядок шагов операции живёт в `ui/commands/repository/repositoryChains.ts`
 (`runLockChain`/`runUpdateChain`/`runCommitChain`/`runUnlockChain`): решённый план → структурный результат с
@@ -1170,9 +1175,11 @@ SFTP открывается отдельной фабрикой (`connectSftpAge
 
 **Согласие человека внутри вызова.** Импорт после захвата/получения в агентном режиме может открыть окна
 согласия (`promptFullDump`, `promptMirrorSeed`, `promptOrphanRemoval`) — их показывают человеку, MCP-вызов
-ждёт ответа. Долгие операции (захват, получение, помещение крупной конфигурации) могут превысить тайм-аут
-MCP-клиента: операция при этом не прерывается и дойдёт до конца, состояние потом смотрите
-`v8vscedit_repository_status`.
+ждёт ответа. Долгие операции (захват, получение, помещение крупной конфигурации) идут под пульсом и с
+возобновляемым SSE-потоком (`gate.wrapLongRunning`, см.
+[mcp-server-lifecycle.md](./mcp-server-lifecycle.md#долгие-вызовы-пульс-возобновляемость-sse-видимость-операции));
+операция не прерывается при обрыве клиента, а исход и текущий этап доступны в
+`v8vscedit_repository_status` (`operationRunning`, `currentOperation`, `lastOperation`).
 
 `v8vscedit_update_database_configuration` (`/UpdateDBCfg`): `path` — только корень; цель —
 `resolveApplyTargetFromNode`, корень берётся из реального `Configuration.xml`, а не из раскладки `src/cf`.
