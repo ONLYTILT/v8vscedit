@@ -260,7 +260,7 @@ hash-кэша — файлы XML-выгрузки проекта при загр
 обратно в базу поверх только что загруженного CF, обнулив результат операции.
 Вместо этого пользователю после загрузки явно показывается предупреждение,
 что XML-выгрузка проекта больше не соответствует базе, и предлагается импорт
-конфигураций (`v8vscedit.importConfigurations`); MCP возвращает то же самое
+конфигураций (`v8vscedit.importConfigurations`; для агента - MCP-инструмент `v8vscedit_import_configurations`); MCP возвращает то же самое
 через поле `projectSourcesOutdated: true`. **Это правило намеренно нарушает
 общий пункт «Единый post-mutation путь» из раздела про MCP-сервер ниже** — при
 похожих задачах не «чинить» это обратно без повторного замера платформы.
@@ -1316,6 +1316,14 @@ MCP (`repository_status`, lock/update/commit) - поле `databaseConfigurationB
 - **`v8vscedit_execute_command`** для `importConfigurations`/`updateChangedConfigurations` при занятом замке
   сразу отбивается этой же ошибкой (раньше вызов висел на тосте UI-команды и возвращал ложный успех).
   Проверка и взятие замка не атомарны (TOCTOU) — остаточный риск; `refresh` не блокируется.
+  `importConfigurations` через мост больше НЕ зовёт UI-команду: это `runMcpImportConfigurations(deps, 'all')` -
+  тот же путь, что у `v8vscedit_import_configurations`, в режиме unattended (замок берёт сам бросающий путь).
+  Мост остаётся ради совместимости; результат - `{ command, result: <ответ импорта> }`.
+- **Цепочки хранилища и unattended.** `runLockChain`/`runUpdateChain`/`runCommitChain` принимают ОБЯЗАТЕЛЬНЫЙ
+  последний параметр `interaction: OperationInteraction` (в план `planRepository*` он не входит: план - решения
+  диалога, а не режим канала). UI-команды передают `'interactive'`, `McpRepositoryTools` - `'unattended'`:
+  загрузка до захвата и импорт после получения/помещения идут без окон, а причина отказа шага добавляется к
+  тексту (`describeChainStepFailure`: «... Причина: ...»; в interactive текст прежний, причину уже показал раннер).
 
 **Общие цепочки.** Порядок шагов операции живёт в `ui/commands/repository/repositoryChains.ts`
 (`runLockChain`/`runUpdateChain`/`runCommitChain`/`runUnlockChain`): решённый план → структурный результат с
@@ -1365,6 +1373,94 @@ MCP (`repository_status`, lock/update/commit) - поле `databaseConfigurationB
 Известное ограничение: `RepositoryLockLog.resolveUnlockedFullNames` при распознанном логе считает снятыми
 служебные (не «Тип.Имя») имена из запроса — в частности корень — даже если корень захвачен другим
 пользователем.
+
+### Неинтерактивные операции (MCP): `OperationInteraction`
+
+`OperationInteraction = 'interactive' | 'unattended'` (`ui/commands/ext/configurationOperationTypes.ts`) -
+явный параметр на каждой границе UI/MCP, глобального состояния нет. `interactive` - отвечает человек (модальные
+вопросы, тосты). `unattended` (MCP) - **ни одного модального окна и ни одного тоста**: вопрос, на который нужен
+человек, становится отказом с текстом-инструкцией («выполните операцию из интерфейса VS Code»). Раньше такие
+вызовы из MCP висели на модалке до прихода человека.
+
+**Единая точка подмены хуков - `runInProgress`** (`ui/commands/ext/agent/agentConfigurationOperation.ts`, по
+`RunAgentOptions.interaction`, по умолчанию `interactive`). Вызывающие могут по-прежнему передавать
+`promptMirrorSeed/promptFullDump/promptOrphanRemoval` - в unattended они отбрасываются, поэтому забытый
+вызывающий не протащит модалку в MCP. Хуки unattended - `ui/commands/ext/agent/unattendedAgentHooks.ts`
+(чистый модуль без `vscode`); журнал «Вызов без участия человека: ...» пишут они сами (обёртка журнала вопросов
+не используется - её «Ответ пользователя» была бы ложью).
+
+| Хук `AgentOperationHooks` | Без хука в infra | В unattended |
+|---|---|---|
+| `confirmFullDump` | `FullDumpConsent.confirmFullDumpOrThrow`: **отсутствие хука = СОГЛАСИЕ**, полная выгрузка идёт молча | **Обязателен хук-отказ** (всегда `'cancel'`): `AgentFullDumpDeclinedError` до мутаций M и P. Передавать `undefined` «ради отсутствия диалога» нельзя |
+| `confirmMirrorSeed` | посев пропускается (`skipped`); пустое M идёт в `confirmFullDump('mirror-empty')` | не передаётся: посева из проекта без человека нет |
+| `confirmOrphanRemoval` | сироты не удаляются, сообщение в `onMessage` | не передаётся: сироты бывают только после посева, ветка недостижима |
+| `onQuestion` | ответ `undefined` - в канал ничего не пишется, агент ждёт вечно (до срока команды) | ответ `'cancel'` (как кнопка «Отмена»), а НЕ `undefined` и НЕ исключение: исключение оставило бы агента ждать ответа в stdin |
+
+Исход: отказ - `cancelled: true` (до изменения проекта/базы, поэтому признак `DatabaseConfigLag` не ставится) и
+`requiresUserAction: true`, если причина - полная выгрузка или вопрос агента. Текст полной выгрузки -
+`describeUnattendedFullDumpRefusal` (три варианта: импорт со скачиванием, перезапись зеркала, выгрузка для
+загрузки; везде «Проект не изменён» либо «База и проект не изменены»); вопроса агента -
+`describeUnattendedQuestion`; при успешной операции, в ходе которой агент задавал вопросы, текст уходит в
+`warnings` (`interactionWarnings`). Прочие ошибки - без тоста, `showErrorMessage` принудительно `false`.
+Уведомление `withProgress` (не модальное, с «Отмена») остаётся: человек видит идущую операцию и может её
+прервать.
+
+**Где применяется:**
+
+| Путь | Что делает unattended |
+|---|---|
+| `v8vscedit_import_configurations`, мост `execute_command importConfigurations` | импорт целей (агент и пакетный Конфигуратор) без окон |
+| `v8vscedit_load_configuration_changes` | в пакетном режиме `confirmFallback` (быстрая загрузка отказала) вместо модалки «полная загрузка?» даёт отказ `describeUnattendedFullLoadRefusal`; причина отказа (`onFailure`) идёт в ошибку инструмента вместо «подробности в журнале» |
+| `repository_lock/update/commit` | загрузка до операции и импорт после - в unattended (`interaction` цепочек обязателен) |
+| Пароль удалённого сервера | `repositoryNodeTargets.toCliServices(services, interaction)`: в unattended вместо окна пароля PSSession - отказ `UNATTENDED_REMOTE_PASSWORD_MISSING` (сохранённый пароль работает как обычно) |
+| `runWithStandaloneServerStopped` | предупреждения о перезапуске автономного сервера не показываются тостом, тексты уходят в `warnings` результата |
+
+Пакетные операции: `runInternalCliCommand` в unattended вызывается с `showSuccessMessage/showErrorMessage: false`
+и сообщает причину отказа через `onFailureReason`. **Поведенческое изменение и для UI-вызовов:** ветка
+прерывания `runInternalCliCommand` теперь тоже сообщает причину (`onFailureReason`), а информационный тост о
+прерывании показывается только при `showErrorMessage !== false` - вызовы UI с `showErrorMessage: false`
+тоста о прерывании больше не получают.
+
+**Правило для нового MCP-пути.** Любой MCP-инструмент, запускающий операцию агента или пакетного Конфигуратора,
+в которой возможны вопросы/модалки, обязан передавать `interaction: 'unattended'` явным параметром (у цепочек
+хранилища и `repositoryPostSync` параметр обязателен - забытый вызов станет ошибкой сборки). Тихость
+(`silent`) не равна unattended: она убирает тосты, но не подменяет хуки согласия.
+
+#### Импорт конфигураций: аргумент команды и MCP-инструмент
+
+Тело `v8vscedit.importConfigurations` вынесено в общий раннер `runImportTargets(services, targets, interaction)`
+(`ui/commands/ext/importConfigurationsRunner.ts`); его зовут UI-команда (`ImportConfigurationsCommands.ts`,
+регистрация - `CommandRegistry.registerAll`), MCP-инструмент и мост. Чистая логика целей - `importTargets.ts`
+(`collectImportTargets`, `orderImportTargets` с дедупликацией по пути, `parseImportConfigurationsArgs`,
+`selectImportTargets`, `selectImportTargetsByRoots`, `summarizeImportRun`).
+
+- **Аргумент команды** - `{ targets: 'all' | string[] }` (имена конфигураций, те же, что в окне выбора; без
+  учёта регистра и крайних пробелов). Объект без СОБСТВЕННОГО свойства `targets` (узел дерева от webview,
+  `Uri`, `undefined`) считается посторонним: показывается прежнее окно выбора. Неверная форма `targets`
+  (пустой массив, `'ALL'`, нестроковые/пустые имена) - исключение `IMPORT_ARGS_INVALID`; неизвестное или
+  неоднозначное (одно имя у cf и cfe) имя - исключение со списком, молчаливого пропуска нет. Выбор делается ДО
+  взятия замка операций.
+- **MCP `v8vscedit_import_configurations`** (долгий; `destructiveHint`). `targets` обязателен, без умолчания:
+  `'all'` или непустой массив `{ path: 'Конфигурация' | 'Расширение', configuration? }` (канон корня, как у
+  `load_configuration_changes`). Порядок: основная конфигурация, затем расширения по алфавиту.
+  Ограничение: первичный импорт пустого `src/cf` (нет `Configuration.xml`) - только через `'all'`.
+- **Остановка на первой неудаче.** Цели после неудачной получают `skipped` («Не выполнялся: импорт остановлен
+  на «X»») - иначе агент принял бы невыполненную цель за выполненную.
+- **Форма ответа:** `requested` (`'all'` или эхо массива), `completed` (нет `failed` и `skipped`), счётчики
+  `imported`/`failed`/`skipped`, `targets[]` с полями `path`, `configuration`, `kind`, `name`,
+  `status: imported | failed | skipped`, `reason`, `requiresUserAction`, `warnings`,
+  `databaseConfigurationBehind` (импорт базу не меняет, но обычно идёт после получения из хранилища, которое
+  ставит признак; нужен ли `update_database_configuration` - агенту видно сразу), общие `warnings` (перезапуск
+  автономного сервера). Пустые поля опускаются (`McpResponseFields.ts`). Ответ структурный и при частичном
+  отказе; `isError` - только при отказе до запуска (неверные аргументы/корень, занятый замок, нет целей,
+  `NO_IMPORT_TARGETS`, непредвиденная ошибка раннера).
+- **`gate.afterMutation` НЕ вызывается** - сознательное отклонение от единого post-mutation пути (как у
+  `repository_*` и `load_cf`): импорт делает файлы проекта РАВНЫМИ базе, пометка «изменено» заставила бы
+  «Обновить БД» залить их обратно. Раннер сам делает `suppressConfigurationReloadForFiles` (через хуки),
+  `markConfigurationsClean(импортированные)`, `reloadEntries`, `refreshActionsView`.
+- **Перезагрузка дерева** - если импортирована хотя бы одна цель (раньше только при полном успехе: при
+  частичном отказе дерево показывало устаревшую выгрузку); тост «Импортировано конфигураций: N» - только
+  interactive, при полном успехе и N > 1.
 
 ### Известные ограничения
 

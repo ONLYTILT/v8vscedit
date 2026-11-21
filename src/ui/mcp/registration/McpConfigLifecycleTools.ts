@@ -2,7 +2,8 @@
  * MCP-инструменты жизненного цикла конфигурации/расширения и мостов CFE.
  *
  * Домен «configLifecycle»: create_configuration, create_extension, cfe_borrow,
- * cfe_patch_method, cfe_diff, execute_command, update_database_configuration, load_configuration_changes.
+ * cfe_patch_method, cfe_diff, execute_command, update_database_configuration, load_configuration_changes
+ * (импорт конфигураций — в McpImportTools: мост execute_command importConfigurations зовёт его общую точку).
  *
  * Долгие инструменты (обмен с базой через Конфигуратор, команды импорта/обновления) обёрнуты в
  * `gate.wrapLongRunning`: пульс держит поток вызова живым, исход попадает в `lastOperation`.
@@ -26,9 +27,16 @@ import {
 } from '../../commands/ext/configurationOperationLock';
 import { findChangedConfiguration, refreshRepositoryUi } from '../../commands/repository/repositoryPostSync';
 import type { DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
-import { settleCfFileLoadLag, settleCfeBatchLoadLag, type DatabaseLoadOutcome } from '../../commands/ext/databaseLoadPlan';
+import {
+  settleCfFileLoadLag,
+  settleCfeBatchLoadLag,
+  type DatabaseLoadOptions,
+  type DatabaseLoadOutcome,
+} from '../../commands/ext/databaseLoadPlan';
 import { canonicalToLegacyModulePath, resolveConfigurationXmlByCanonical } from '../McpPathResolvers';
 import type { McpRegistrationDeps } from './McpRegistrationDeps';
+import { runMcpImportConfigurations } from './McpImportTools';
+import { definedFields, mergeWarnings } from './McpResponseFields';
 
 const ALLOWED_COMMANDS = new Set([
   'v8vscedit.refresh',
@@ -37,12 +45,12 @@ const ALLOWED_COMMANDS = new Set([
 ]);
 
 /**
- * Команды, берущие общий замок сами. При занятом замке UI-команда показала бы тост «занято» и вернула
+ * Команды UI, берущие общий замок сами (importConfigurations сюда не входит: мост зовёт MCP-путь импорта,
+ * который берёт замок атомарно и бросает при занятом). При занятом замке UI-команда показала бы тост «занято» и вернула
  * бы `undefined` — агент получил бы ложный «успех», а ожидание тоста держало бы MCP-вызов. Проверка
  * до запуска не атомарна с захватом замка командой (TOCTOU): гонка лишь вернёт прежнее поведение.
  */
 const LOCKING_COMMANDS = new Set([
-  'v8vscedit.importConfigurations',
   'v8vscedit.updateChangedConfigurations',
 ]);
 
@@ -463,7 +471,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     'v8vscedit_execute_command',
     {
       title: 'Выполнить команду расширения',
-      description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
+      description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. importConfigurations импортирует ВСЕ подключённые конфигурации без окна выбора и без участия человека (как v8vscedit_import_configurations с targets: "all"; для выбора целей и подробного результата используйте его). updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
       inputSchema: z.object({
         command: z.enum([...ALLOWED_COMMANDS] as [string, ...string[]]),
       }),
@@ -472,6 +480,10 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
       },
     },
     async ({ command }, extra) => gate.wrapLongRunning('v8vscedit_execute_command', extra, async () => {
+      // UI-команда импорта ждала бы человека в окне выбора: мост импортирует всё без участия человека.
+      if (command === 'v8vscedit.importConfigurations') {
+        return { command, result: await runMcpImportConfigurations(deps, 'all') };
+      }
       if (LOCKING_COMMANDS.has(command) && isConfigurationOperationRunning()) {
         throw new Error(MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE);
       }
@@ -556,11 +568,16 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
       }
       return runWithConfigurationOperationLockOrThrow(async () => {
         let outcome: DatabaseLoadOutcome = { databaseUpdated: false, warnings: [] };
-        const options = {
+        let failureReason: string | undefined;
+        const options: DatabaseLoadOptions = {
           updateDatabase,
           lag: services.databaseConfigLag,
           silent: true,
-          onOutcome: (reported: DatabaseLoadOutcome) => { outcome = reported; },
+          // Без участия человека: вопрос агента и запасная полная загрузка — отказ с причиной, а не окно.
+          interaction: 'unattended',
+          onOutcome: (reported) => { outcome = reported; },
+          // Пустая причина не публикуется: агенту нужен текст, а не пустой isError.
+          onFailure: (reason) => { failureReason = reason === '' ? undefined : reason; },
         };
         const loaded = target.kind === 'cfe'
           // У корня расширения имя цели и есть имя расширения (resolveApplyTargetFromNode).
@@ -571,7 +588,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
               target.name, target.rootPath, services.workspaceFolder, services.outputChannel, false, undefined, options
             );
         if (!loaded) {
-          throw new Error('Загрузка изменений в базу не выполнена. Подробности — в журнале «1С Редактор».');
+          throw new Error(failureReason ?? 'Загрузка изменений в базу не выполнена. Подробности — в журнале «1С Редактор».');
         }
         services.markConfigurationsClean([target.rootPath]);
         refreshRepositoryUi(services);
@@ -619,17 +636,6 @@ function assertBatchReport(report: CfeBatchReport | undefined, failureMessage: s
   return report;
 }
 
-/** Непустые списки предупреждений; `undefined` — предупреждений нет (ответ не получает ключа `warnings`). */
-function mergeWarnings(...lists: (readonly string[] | undefined)[]): string[] | undefined {
-  let merged: string[] | undefined;
-  for (const list of lists) {
-    if (list !== undefined && list.length > 0) {
-      merged = [...(merged ?? []), ...list];
-    }
-  }
-  return merged;
-}
-
 /**
  * Что уже изменено в базе до сбоя пакетной загрузки (агентская ветка): новые расширения применены сразу, плюс
  * предупреждения сверки. Пусто — в базе применено ничего не было (batch или сбой на первом новом).
@@ -642,15 +648,4 @@ function appliedBeforeFailureNotes(report: CfeBatchReport): string[] {
     ...(applied.length > 0 ? [`Уже созданы в базе и применены (update-db-cfg выполнен): ${applied.join(', ')}.`] : []),
     ...(report.verificationWarnings ?? []),
   ];
-}
-
-/** Только заданные поля: batch-ответ не получает ключей агентской ветки со значением `undefined`. */
-function definedFields(fields: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(fields)) {
-    if (value !== undefined) {
-      result[key] = value;
-    }
-  }
-  return result;
 }

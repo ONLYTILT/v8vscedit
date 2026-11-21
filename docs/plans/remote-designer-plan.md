@@ -769,3 +769,12 @@
 2. **Полный `npm test` на Windows не завершается** на корпусе БП КОРП (104 тыс. файлов): Extension Host перестаёт отвечать на сканах корпуса; плюс платформенные падения (git EPERM, `DesignerAgentProcess` EACCES/код выхода). Корпус на машине пользователя — только `example/2.20/src/cf` (другая конфигурация, чем та, по которой пиннились числа корпусных тестов): нет `2.21`, нет `cfe`, нет `example/2.20/env.json`. Нужен таймаут/фильтр корпусных сьютов или отдельный режим + классификация известных Windows-падений в «Известных технических долгах».
 4. **Флейк `CfeBatchCommands: регистрируют РОВНО две команды`** (замечен на QA Э2): в список зарегистрированных команд попала посторонняя `workbench.action.output.show.TypeScriptTeam.jsts-chat-features…` из окружения тестового VS Code. Тест должен фильтровать команды по префиксу расширения (`v8vscedit.`), а не считать все.
 3. **POSIX-семантика сигналов в тестах `cliProcess`:** Windows-вариант проверки гонки `forceKill` или конвенция пометки платформы.
+
+### Бэклог по итогам задачи «импорт без окна и unattended» (2026-11-21)
+
+- Мост `execute_command updateChangedConfigurations` зовёт UI-команду и всё ещё может показать модалки (batch fallback, полная выгрузка): перевести на путь вроде `load_configuration_changes` (`interaction: 'unattended'`).
+- `update_database_configuration`, `load_cf`, `dump_cf`, `dump_all_cfe`, `load_all_cfe` через агента используют `onQuestion = showAgentQuestion` (модалка из MCP): передать `interaction: 'unattended'` в их `runAgentOperation`.
+- `repositoryNodeTargets.toCliServices(services, interaction)` - сейчас `interaction` необязателен (по умолчанию `interactive`): сделать обязательным, как у цепочек.
+- Дубль `toLagTarget` (`McpImportTools.ts`) и `toDatabaseLagTarget` (`repositoryPostSync.ts`): свести к одному.
+- Реакция агента на ответ `'cancel'` на вопрос пароля/логина не замерена на стенде: ожидается ошибка аутентификации и завершение команды с `error` (одна попытка), но не проверено.
+- Информационный тост прерывания в пакетном режиме больше не показывается при `showErrorMessage: false` (см. architecture.md, «Неинтерактивные операции»).

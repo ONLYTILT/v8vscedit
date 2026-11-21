@@ -5,6 +5,7 @@ import type { ConfigurationProgressHooks } from '../configurationOperationTypes'
 import {
   decideLagAfterLoad,
   describeLoadWithoutUpdateSuccess,
+  isSilentLoad,
   lagSourceFor,
   settleDatabaseLag,
   type DatabaseLoadOptions,
@@ -96,13 +97,15 @@ async function runAgentDatabaseLoad(
       ...texts,
       // Успех показывается ниже: его текст зависит от того, была ли загрузка (а не только от режима).
       showSuccessMessage: false,
-      showErrorMessage: options.silent !== true,
+      showErrorMessage: !isSilentLoad(options),
       onProgressMessage: request.hooks?.onProgressMessage,
       workspaceFolder: request.workspaceFolder,
       outputChannel: request.outputChannel,
       rootPath: target.rootPath,
-      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя.
+      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя
+      // (в unattended хук отбрасывает сама агентская операция: отказ вместо диалога).
       confirmFullDump: promptFullDump,
+      interaction: options.interaction,
     },
     (service, uiHooks: AgentOperationUiHooks) => load(service, {
       ...uiHooks,
@@ -122,11 +125,14 @@ async function runAgentDatabaseLoad(
     ambiguousFailure: !outcome.ok && outcome.cancelled !== true && progress.loadStarted && !progress.loaded,
   }), source);
   if (!outcome.ok) {
+    if (outcome.reason) {
+      options.onFailure?.(outcome.reason);
+    }
     return false;
   }
-  const warnings = notifyAgentWarnings(outcome.value, options.silent === true);
+  const warnings = [...notifyAgentWarnings(outcome.value, isSilentLoad(options)), ...(outcome.interactionWarnings ?? [])];
   options.onOutcome?.({ databaseUpdated, warnings });
-  if (request.showSuccessMessage) {
+  if (request.showSuccessMessage && options.interaction !== 'unattended') {
     // Без обновления и без изменений «загружены в основную конфигурацию» было бы неправдой.
     void vscode.window.showInformationMessage(
       options.updateDatabase || progress.loaded ? texts.successMessage : `Изменений "${target.name}" для загрузки в базу нет.`

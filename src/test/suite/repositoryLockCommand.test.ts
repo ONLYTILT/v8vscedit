@@ -619,8 +619,8 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
         databaseConfigLag: new FakeLagRecorder(),
       } as unknown as CommandServices;
 
-      assert.strictEqual(await loadTargetChangesIntoDatabase(bare, services, { updateDatabase: true }), false);
-      assert.strictEqual(await importTargetFromDatabase(bare, services), false);
+      assert.strictEqual(await loadTargetChangesIntoDatabase(bare, services, { updateDatabase: true, interaction: 'interactive' }), false);
+      assert.strictEqual(await importTargetFromDatabase(bare, services, { interaction: 'interactive' }), false);
 
       assert.deepStrictEqual(events, ['update:cfe:ПоИмени', 'import:cfe:ПоИмени']);
     });

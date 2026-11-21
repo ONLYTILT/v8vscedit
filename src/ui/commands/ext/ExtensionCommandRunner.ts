@@ -13,7 +13,11 @@ import {
   resolveProjectSettingsPath,
   resolveSettingsPath,
 } from './connectionSettings';
-import type { ConfigurationImportHooks, ConfigurationProgressHooks } from './configurationOperationTypes';
+import type {
+  ConfigurationImportHooks,
+  ConfigurationImportOptions,
+  ConfigurationProgressHooks,
+} from './configurationOperationTypes';
 import {
   beginConfigurationOperationStatus,
   endConfigurationOperationStatus,
@@ -22,7 +26,7 @@ import {
 } from './configurationOperationStatus';
 // Режим, а не булев флаг: remote без агентского режима — отказ, а не тихий откат на пакетный.
 import { getAgentExecutionMode } from './agent/agentSettings';
-import { notifyAgentWarnings, runAgentConfigurationOperation, runAgentOperation } from './agent/agentConfigurationOperation';
+import { notifyAgentWarnings, runAgentOperation } from './agent/agentConfigurationOperation';
 import { promptFullDump } from './agent/fullDumpPrompt';
 import { promptMirrorSeed } from './agent/mirrorSeedPrompt';
 import { promptOrphanRemoval } from './agent/orphanFilesPrompt';
@@ -35,6 +39,8 @@ import {
   buildBatchLoadSteps,
   decideLagAfterLoad,
   describeLoadWithoutUpdateSuccess,
+  describeUnattendedFullLoadRefusal,
+  isSilentLoad,
   settleDatabaseLag,
   type DatabaseLoadOptions,
 } from './databaseLoadPlan';
@@ -113,35 +119,13 @@ export async function runDecompileExtension(
   extensionRoot: string,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  hooks?: ConfigurationImportHooks
+  hooks?: ConfigurationImportHooks,
+  options: ConfigurationImportOptions = { interaction: 'interactive' }
 ): Promise<boolean> {
-  if (getAgentExecutionMode() === 'batch') {
-    return runBatchDecompileExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, hooks);
-  }
-
-  return runAgentConfigurationOperation(
-    {
-      progressTitle: `Выгрузка расширения ${extensionName} во внутренний XML`,
-      progressStartMessage: 'Импорт расширения через агент...',
-      successMessage: `Импорт расширения "${extensionName}" успешно завершен.`,
-      errorTitle: `Ошибка импорта расширения "${extensionName}".`,
-      showSuccessMessage: false,
-      workspaceFolder,
-      outputChannel,
-      hooks,
-      rootPath: extensionRoot,
-      confirmMirrorSeed: promptMirrorSeed,
-      confirmFullDump: promptFullDump,
-      confirmOrphanRemoval: promptOrphanRemoval,
-      cancellable: true,
-    },
-    async (service, operationHooks) => {
-      await service.importFromDatabase(
-        { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName },
-        operationHooks
-      );
-    }
-  );
+  const target: ApplyDatabaseTarget = { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName };
+  return getAgentExecutionMode() === 'batch'
+    ? runBatchImport(target, workspaceFolder, outputChannel, hooks, options)
+    : runAgentImport(target, workspaceFolder, outputChannel, hooks, options);
 }
 
 export async function runDecompileMainConfiguration(
@@ -149,35 +133,58 @@ export async function runDecompileMainConfiguration(
   configRoot: string,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  hooks?: ConfigurationImportHooks
+  hooks?: ConfigurationImportHooks,
+  options: ConfigurationImportOptions = { interaction: 'interactive' }
 ): Promise<boolean> {
-  if (getAgentExecutionMode() === 'batch') {
-    return runBatchDecompileMainConfiguration(configName, configRoot, workspaceFolder, outputChannel, hooks);
-  }
+  const target: ApplyDatabaseTarget = { kind: 'cf', name: configName, rootPath: configRoot };
+  return getAgentExecutionMode() === 'batch'
+    ? runBatchImport(target, workspaceFolder, outputChannel, hooks, options)
+    : runAgentImport(target, workspaceFolder, outputChannel, hooks, options);
+}
 
-  return runAgentConfigurationOperation(
+/** Импорт через агента; prompt-хуки в unattended отбрасывает сама агентская операция. */
+async function runAgentImport(
+  target: ApplyDatabaseTarget,
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  hooks: ConfigurationImportHooks | undefined,
+  options: ConfigurationImportOptions
+): Promise<boolean> {
+  const cf = target.kind === 'cf';
+  const what = cf ? 'основной конфигурации' : 'расширения';
+  const outcome = await runAgentOperation(
     {
-      progressTitle: `Выгрузка основной конфигурации ${configName} во внутренний XML`,
-      progressStartMessage: 'Импорт основной конфигурации через агент...',
-      successMessage: `Импорт основной конфигурации "${configName}" успешно завершён.`,
-      errorTitle: `Ошибка импорта основной конфигурации "${configName}".`,
+      progressTitle: `Выгрузка ${what} ${target.name} во внутренний XML`,
+      progressStartMessage: `Импорт ${what} через агент...`,
+      successMessage: cf
+        ? `Импорт основной конфигурации "${target.name}" успешно завершён.`
+        : `Импорт расширения "${target.name}" успешно завершен.`,
+      errorTitle: `Ошибка импорта ${what} "${target.name}".`,
       showSuccessMessage: false,
       workspaceFolder,
       outputChannel,
       hooks,
-      rootPath: configRoot,
+      rootPath: target.rootPath,
       confirmMirrorSeed: promptMirrorSeed,
       confirmFullDump: promptFullDump,
       confirmOrphanRemoval: promptOrphanRemoval,
       cancellable: true,
+      interaction: options.interaction,
     },
     async (service, operationHooks) => {
-      await service.importFromDatabase(
-        { kind: 'cf', name: configName, rootPath: configRoot },
-        operationHooks
-      );
+      await service.importFromDatabase(target, operationHooks);
     }
   );
+  options.onOutcome?.(outcome.ok
+    ? { success: true, warnings: outcome.interactionWarnings ?? [] }
+    : {
+        success: false,
+        reason: outcome.reason,
+        ...(outcome.cancelled ? { cancelled: true } : {}),
+        ...(outcome.requiresUserAction ? { requiresUserAction: true } : {}),
+        warnings: [],
+      });
+  return outcome.ok;
 }
 
 export interface ApplyDatabaseTarget {
@@ -342,112 +349,66 @@ function runChangedLoad(
   });
 }
 
-async function runBatchDecompileExtension(
-  extensionName: string,
-  extensionRoot: string,
+/** Пакетный импорт: выгрузка во временный каталог проекта и замена выгрузки цели снимком. */
+async function runBatchImport(
+  target: ApplyDatabaseTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  hooks?: ConfigurationImportHooks
+  hooks: ConfigurationImportHooks | undefined,
+  options: ConfigurationImportOptions
 ): Promise<boolean> {
-  const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath, extensionRoot);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const tempRoot = createWorkspaceTempDir(workspaceFolder.uri.fsPath, 'import-ext-');
-  const tempConfigDir = path.join(tempRoot, 'cfe', extensionName);
+  const cf = target.kind === 'cf';
+  const what = cf ? 'основной конфигурации' : 'расширения';
+  const connection = await resolveConnectionFromSettings(resolveSettingsPath(workspaceFolder.uri.fsPath, target.rootPath));
+  const tempRoot = createWorkspaceTempDir(workspaceFolder.uri.fsPath, cf ? 'import-cf-' : 'import-ext-');
+  const tempConfigDir = cf ? path.join(tempRoot, 'cf') : path.join(tempRoot, 'cfe', target.name);
   fs.mkdirSync(tempConfigDir, { recursive: true });
   const cliArgs = [
-    'export-configuration',
-    '-ProjectRoot',
-    workspaceFolder.uri.fsPath,
-    '-Target',
-    'cfe',
-    '-ConfigDir',
-    tempConfigDir,
-    '-Mode',
-    'Full',
-    '-Extension',
-    extensionName,
+    'export-configuration', '-ProjectRoot', workspaceFolder.uri.fsPath, '-Target', target.kind,
+    '-ConfigDir', tempConfigDir, '-Mode', 'Full',
+    ...(cf ? [] : ['-Extension', target.name]),
     ...buildConnectionCliArgs(connection),
   ];
+  const silent = options.interaction === 'unattended';
+  let failureReason = '';
   try {
-    return await runInternalCliCommand(
+    const ok = await runInternalCliCommand(
       {
         cliArgs,
-        progressTitle: `Выгрузка расширения ${extensionName} во внутренний XML`,
-        progressStartMessage: 'Импорт расширения: выгрузка во временный каталог...',
-        successMessage: `Импорт расширения "${extensionName}" успешно завершен.`,
-        errorTitle: `Ошибка импорта расширения "${extensionName}".`,
-        failureOperation: 'импорте расширения',
+        progressTitle: `Выгрузка ${what} ${target.name} во внутренний XML`,
+        progressStartMessage: `Импорт ${what}: выгрузка во временный каталог...`,
+        successMessage: cf
+          ? `Импорт основной конфигурации "${target.name}" успешно завершён.`
+          : `Импорт расширения "${target.name}" успешно завершен.`,
+        errorTitle: `Ошибка импорта ${what} "${target.name}".`,
+        failureOperation: `импорте ${what}`,
         logPrefix: 'export-configuration',
+        // Тосты — только у человека; причина отказа уходит в исход всегда (MCP получает её в ответе).
+        showSuccessMessage: !silent,
+        showErrorMessage: !silent,
+        onFailureReason: (reason) => { failureReason = reason; },
         onProgressMessage: hooks?.onProgressMessage,
         afterSuccess: async () => {
-          const changedProjectFiles = collectSnapshotProjectFiles(tempConfigDir, extensionRoot);
+          const changedProjectFiles = collectSnapshotProjectFiles(tempConfigDir, target.rootPath);
           hooks?.onProgressMessage?.(`замена файлов выгрузки: ${String(changedProjectFiles.length)}`);
           hooks?.beforeProjectFilesChanged?.(changedProjectFiles);
           await yieldToUi();
-          syncDirectorySnapshot(tempConfigDir, extensionRoot);
+          syncDirectorySnapshot(tempConfigDir, target.rootPath);
           hooks?.beforeProjectFilesChanged?.(changedProjectFiles);
           hooks?.onProgressMessage?.('обновление кэша метаданных');
-          await refreshConfigurationHashCache('cfe', extensionName, extensionRoot, workspaceFolder, outputChannel, hooks?.onProgressMessage);
+          await refreshConfigurationHashCache(
+            target.kind, cf ? '' : target.name, target.rootPath, workspaceFolder, outputChannel, hooks?.onProgressMessage
+          );
         },
       },
       workspaceFolder,
       outputChannel
     );
-  } finally {
-    removeTempDir(tempRoot, outputChannel);
-  }
-}
-
-
-async function runBatchDecompileMainConfiguration(
-  configName: string,
-  configRoot: string,
-  workspaceFolder: vscode.WorkspaceFolder,
-  outputChannel: vscode.OutputChannel,
-  hooks?: ConfigurationImportHooks
-): Promise<boolean> {
-  const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath, configRoot);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const tempRoot = createWorkspaceTempDir(workspaceFolder.uri.fsPath, 'import-cf-');
-  const tempConfigDir = path.join(tempRoot, 'cf');
-  fs.mkdirSync(tempConfigDir, { recursive: true });
-  const cliArgs = [
-    'export-configuration',
-    '-ProjectRoot',
-    workspaceFolder.uri.fsPath,
-    '-Target',
-    'cf',
-    '-ConfigDir',
-    tempConfigDir,
-    '-Mode',
-    'Full',
-    ...buildConnectionCliArgs(connection),
-  ];
-  try {
-    return await runInternalCliCommand(
-      {
-        cliArgs,
-        progressTitle: `Выгрузка основной конфигурации ${configName} во внутренний XML`,
-        progressStartMessage: 'Импорт основной конфигурации: выгрузка во временный каталог...',
-        successMessage: `Импорт основной конфигурации "${configName}" успешно завершён.`,
-        errorTitle: `Ошибка импорта основной конфигурации "${configName}".`,
-        failureOperation: 'импорте основной конфигурации',
-        logPrefix: 'export-configuration',
-        onProgressMessage: hooks?.onProgressMessage,
-        afterSuccess: async () => {
-          const changedProjectFiles = collectSnapshotProjectFiles(tempConfigDir, configRoot);
-          hooks?.onProgressMessage?.(`замена файлов выгрузки: ${String(changedProjectFiles.length)}`);
-          hooks?.beforeProjectFilesChanged?.(changedProjectFiles);
-          await yieldToUi();
-          syncDirectorySnapshot(tempConfigDir, configRoot);
-          hooks?.beforeProjectFilesChanged?.(changedProjectFiles);
-          hooks?.onProgressMessage?.('обновление кэша метаданных');
-          await refreshConfigurationHashCache('cf', '', configRoot, workspaceFolder, outputChannel, hooks?.onProgressMessage);
-        },
-      },
-      workspaceFolder,
-      outputChannel
-    );
+    options.onOutcome?.(ok
+      ? { success: true, warnings: [] }
+      /* c8 ignore next -- защитная ветка: runInternalCliCommand перед любым false сообщает непустую причину (отказ remote, прерывание, код выхода); пустая причина не публикуется, чтобы MCP не получил отказ без текста */
+      : { success: false, ...(failureReason ? { reason: failureReason } : {}), warnings: [] });
+    return ok;
   } finally {
     removeTempDir(tempRoot, outputChannel);
   }
@@ -600,6 +561,7 @@ async function runBatchChangedLoad(
   const what = target.kind === 'cfe' ? 'расширения' : 'конфигурации';
   const label = `${what} "${target.name}"`;
   const onProgressMessage = hooks?.onProgressMessage;
+  const silent = isSilentLoad(options);
   const stepOptions = (kind: BatchLoadStepKind): Omit<RunCliOptions, 'cliArgs'> => {
     switch (kind) {
       case 'partial':
@@ -626,7 +588,7 @@ async function runBatchChangedLoad(
           failureOperation: `обновлении ${what}`,
           logPrefix: 'update-configuration',
           showSuccessMessage,
-          showErrorMessage: options.silent !== true,
+          showErrorMessage: !silent,
           onProgressMessage,
         };
       case 'fallback':
@@ -642,7 +604,7 @@ async function runBatchChangedLoad(
           failureOperation: `полной загрузке ${what}`,
           logPrefix: options.updateDatabase ? 'sync-configuration-full' : 'import-configuration',
           showSuccessMessage,
-          showErrorMessage: options.silent !== true,
+          showErrorMessage: !silent,
           onProgressMessage,
         };
     }
@@ -656,15 +618,25 @@ async function runBatchChangedLoad(
         workspaceFolder,
         outputChannel
       );
+      if (!ok && kind !== 'partial' && failureReason) {
+        options.onFailure?.(failureReason);
+      }
       return { ok, failureReason };
     },
-    confirmFallback: (failureReason) => confirmFullSyncFallback(label, failureReason, options.updateDatabase, outputChannel),
+    // Без человека полная загрузка не запускается: модальное окно из MCP висело бы до прихода человека.
+    confirmFallback: (failureReason) => {
+      if (options.interaction !== 'unattended') {
+        return confirmFullSyncFallback(label, failureReason, options.updateDatabase, outputChannel);
+      }
+      options.onFailure?.(describeUnattendedFullLoadRefusal(label, failureReason));
+      return Promise.resolve(false);
+    },
     log: (line) => { outputChannel.appendLine(line); },
   });
   if (outcome.ok) {
     options.onOutcome?.({ databaseUpdated: outcome.databaseUpdated, warnings: [] });
   }
-  if (outcome.unchanged && !steps.update && showSuccessMessage && options.silent !== true) {
+  if (outcome.unchanged && !steps.update && showSuccessMessage && !silent) {
     void vscode.window.showInformationMessage(`Изменений "${target.name}" для загрузки в базу нет.`);
   }
   return outcome.ok;
@@ -757,7 +729,11 @@ export async function runInternalCliCommand(
       outputChannel.appendLine(`[actions] ${interruption}`);
       endConfigurationOperationStatus(options.progressTitle, 'прервано');
       options.onProgressMessage?.(interruption);
-      void vscode.window.showInformationMessage(`${options.progressTitle}: ${interruption}`);
+      // Без причины вызывающий без UI (MCP) получил бы пустой отказ; тост — только у человека.
+      options.onFailureReason?.(`${options.progressTitle}: ${interruption}`);
+      if (options.showErrorMessage !== false) {
+        void vscode.window.showInformationMessage(`${options.progressTitle}: ${interruption}`);
+      }
       return false;
     }
 

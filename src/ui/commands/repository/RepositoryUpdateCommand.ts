@@ -184,7 +184,7 @@ async function runUpdateChainWithUi(
   plan: RepositoryUpdatePlan
 ): Promise<boolean> {
   try {
-    const result = await runUpdateChain(services, target, node, request, plan);
+    const result = await runUpdateChain(services, target, node, request, plan, 'interactive');
     void vscode.window.showInformationMessage(describeRepositoryActionSuccess('update', node.label ?? target.displayName));
     showRepositoryChainWarnings(result.warnings);
     return true;

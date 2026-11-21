@@ -8,7 +8,7 @@ import {
   isConfigurationOperationRunning,
   tryBeginConfigurationOperation,
 } from '../../ui/commands/ext/configurationOperationLock';
-import { describeLockedOverwrite } from '../../ui/commands/repository/repositoryUpdateFlow';
+import { describeImportFailureAfterReceive, describeLockedOverwrite } from '../../ui/commands/repository/repositoryUpdateFlow';
 import { McpMetadataPathService } from '../../ui/mcp/McpMetadataPathService';
 import { McpMutationGate } from '../../ui/mcp/registration/McpMutationGate';
 import { registerRepositoryTools } from '../../ui/mcp/registration/McpRepositoryTools';
@@ -547,6 +547,22 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
       assert.strictEqual(isConfigurationOperationRunning(), false);
     });
 
+    test('unattended: отказ загрузки перед захватом несёт причину раннера («Причина: …»); интерактивных окон нет; цепочка получила interaction', async () => {
+      dirty();
+      p.updateResult = false;
+      p.loadFailureReason = 'Загрузка отменена; база и проект не изменены. Выполните загрузку из интерфейса VS Code.';
+      const result = await call('lock', { path: 'Справочники.Товары', localChanges: 'loadFirst' });
+      assert.strictEqual(result.isError, true);
+      assert.strictEqual(
+        text(result),
+        'Загрузка правок проекта в базу не выполнена; захват не выполнялся. Подробности — в журнале «1С Редактор». ' +
+          'Причина: Загрузка отменена; база и проект не изменены. Выполните загрузку из интерфейса VS Code.'
+      );
+      assert.strictEqual(p.updateOptions().interaction, 'unattended');
+      assert.strictEqual(p.runs.length, 0);
+      assert.deepStrictEqual(p.toasts, []);
+    });
+
     test('exit≠0: isError «Ошибка при захвате объектов хранилища: <причина>», учёт не тронут, тостов нет, замок свободен', async () => {
       p.setResult('Нет доступа к хранилищу', 1);
       const result = await call('lock', { path: 'Справочники.Товары' });
@@ -617,6 +633,30 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
       assert.strictEqual(result.projectBehind, true);
       assert.strictEqual((result.warnings as string[]).length, 1);
       assert.ok((result.warnings as string[])[0].includes('правки проекта в базу не загружены'));
+    });
+
+    test('unattended: импорт после получения отказал (полная выгрузка) — предупреждение с причиной и projectBehind=true; импорт шёл в unattended', async () => {
+      p.importResult = false;
+      p.importFailureReason = 'Импорт «Основная» требует полной выгрузки конфигурации на сервере. Проект не изменён.';
+      p.setResult(GOT);
+      const result = data(await call('update', { path: 'Справочники.Товары' }));
+      assert.strictEqual(result.projectBehind, true);
+      assert.strictEqual(result.projectImported, false);
+      assert.deepStrictEqual(result.warnings, [
+        `${describeImportFailureAfterReceive(p.cfTarget.displayName)} Причина: ${p.importFailureReason}`,
+      ]);
+      assert.strictEqual(p.importOptions()?.interaction, 'unattended');
+      assert.deepStrictEqual(p.toasts, []);
+    });
+
+    test('unattended: сбой загрузки после получения — предупреждение дополнено причиной раннера', async () => {
+      dirty();
+      p.updateResult = false;
+      p.loadFailureReason = 'Платформа отказала';
+      p.setResult(GOT);
+      const result = data(await call('update', { path: 'Справочники.Товары', localChanges: 'loadAfter' }));
+      assert.strictEqual(result.projectBehind, true);
+      assert.ok((result.warnings as string[])[0].endsWith('Причина: Платформа отказала'), (result.warnings as string[])[0]);
     });
 
     test('exit≠0 и прерывание', async () => {

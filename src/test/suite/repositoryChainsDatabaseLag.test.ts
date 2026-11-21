@@ -50,7 +50,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
       test(`захват с загрузкой до него, ${tag}: раннер получает { updateDatabase: updateDatabaseOnLoad, lag: services.databaseConfigLag }`, async () => {
         p.lock([T], getTarget());
         p.setResult(T_RECEIVED);
-        await runLockChain(p.services, getTarget(), getRef(), false, lockPlan({ updateDatabaseFirst: true, updateDatabaseOnLoad }));
+        await runLockChain(p.services, getTarget(), getRef(), false, lockPlan({ updateDatabaseFirst: true, updateDatabaseOnLoad }), 'interactive');
 
         assert.strictEqual(p.updateCalls.length, 1);
         assert.strictEqual(p.updateOptions().updateDatabase, updateDatabaseOnLoad);
@@ -60,7 +60,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
       test(`получение с загрузкой после него, ${tag}: раннер получает updateDatabase = updateDatabaseOnLoad`, async () => {
         p.setResult(T_GOT);
         const result = await runUpdateChain(
-          p.services, getTarget(), getRef(), updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad })
+          p.services, getTarget(), getRef(), updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad }), 'interactive'
         );
 
         assert.strictEqual(p.updateOptions().updateDatabase, updateDatabaseOnLoad);
@@ -74,7 +74,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
         p.lock([T], getTarget());
         p.setResult(COMMITTED);
         const result = await runCommitChain(
-          p.services, getTarget(), getRef(), commitRequest, { updateDatabaseFirst: true, updateDatabaseOnLoad }
+          p.services, getTarget(), getRef(), commitRequest, { updateDatabaseFirst: true, updateDatabaseOnLoad }, 'interactive'
         );
 
         assert.strictEqual(p.updateOptions().updateDatabase, updateDatabaseOnLoad);
@@ -87,14 +87,14 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
 
   test('захват БЕЗ шага загрузки: раннер не вызывался, databaseConfigurationUpdated=false', async () => {
     p.setResult(T_RECEIVED);
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan(), 'interactive');
     assert.deepStrictEqual(p.updateCalls, []);
     assert.strictEqual(result.databaseConfigurationUpdated, false);
   });
 
   test('помещение БЕЗ шага загрузки: раннер не вызывался, оба поля false', async () => {
     p.setResult(COMMITTED);
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, commitRequest, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, commitRequest, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(p.updateCalls, []);
     assert.deepStrictEqual([result.databaseConfigurationUpdated, result.databaseConfigurationBehind], [false, false]);
   });
@@ -102,7 +102,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
   suite('markBehind(repository-receive): получение версий меняет основную конфигурацию без UpdateDBCfg', () => {
     test('захват получил версии (даже при загрузке С обновлением ДО захвата — она была раньше получения): repository-receive', async () => {
       p.setResult(T_RECEIVED);
-      const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }));
+      const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }), 'interactive');
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
       assert.strictEqual(result.databaseConfigurationBehind, true);
       assert.strictEqual(result.databaseConfigurationUpdated, true, 'UpdateDBCfg до захвата выполнен');
@@ -110,7 +110,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
 
     test('захват без получения версий: отметки нет', async () => {
       p.setResult(opLog(LOCK_DONE, `Объект захвачен для редактирования: ${T}`));
-      const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan());
+      const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan(), 'interactive');
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
       assert.strictEqual(result.databaseConfigurationBehind, false);
     });
@@ -118,26 +118,26 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
     test('захват получил версии, сбой импорта в проект: отметка всё равно стоит (основная конфигурация изменена)', async () => {
       p.setResult(T_RECEIVED);
       p.importResult = false;
-      await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan());
+      await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan(), 'interactive');
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
     });
 
     test('захват получил версии, проект «оставить отстающим» (importAfterLock=false): отметка стоит', async () => {
       p.setResult(T_RECEIVED);
-      await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan({ revised: false, importAfterLock: false }));
+      await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan({ revised: false, importAfterLock: false }), 'interactive');
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
     });
 
     test('получение ничего не получило: отметки нет', async () => {
       p.setResult(T_NOTHING);
-      const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan());
+      const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan(), 'interactive');
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
       assert.strictEqual(result.databaseConfigurationBehind, false);
     });
 
     test('получение получило версии без загрузки правок: repository-receive', async () => {
       p.setResult(T_GOT);
-      await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan());
+      await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan(), 'interactive');
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
     });
 
@@ -145,7 +145,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
       p.lag.markBehind(cfLag(), 'update-failed');
       p.setResult(T_GOT);
       const result = await runUpdateChain(
-        p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true })
+        p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive'
       );
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
       assert.strictEqual(result.databaseConfigurationBehind, false);
@@ -155,7 +155,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
       p.setResult(T_GOT);
       p.updateResult = false;
       await runUpdateChain(
-        p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true })
+        p.services, p.cfTarget, p.refs.catalog, updateRequest, updatePlan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive'
       );
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
     });
@@ -163,7 +163,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
     test('помещение с очисткой ссылок (referencesCleaned): repository-receive; обычное помещение отметку не ставит', async () => {
       p.setResult(CLEANED);
       const cleaned = await runCommitChain(
-        p.services, p.cfTarget, p.refs.catalog, { ...commitRequest, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+        p.services, p.cfTarget, p.refs.catalog, { ...commitRequest, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'
       );
       assert.strictEqual(p.lag.sourceOf(cfLag()), 'repository-receive');
       assert.strictEqual(cleaned.databaseConfigurationBehind, true);
@@ -172,7 +172,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
       p.lock([T]);
       p.setResult(COMMITTED);
       const plain = await runCommitChain(
-        p.services, p.cfTarget, p.refs.catalog, commitRequest, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+        p.services, p.cfTarget, p.refs.catalog, commitRequest, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'
       );
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
       assert.strictEqual(plain.databaseConfigurationBehind, false);
@@ -181,14 +181,14 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
     test('отметка по цели cfe — отдельный ключ: cf остаётся актуальным', async () => {
       p.lock([T], p.cfeTarget);
       p.setResult(T_RECEIVED);
-      await runLockChain(p.services, p.cfeTarget, p.refs.cfeCatalog, false, lockPlan());
+      await runLockChain(p.services, p.cfeTarget, p.refs.cfeCatalog, false, lockPlan(), 'interactive');
       assert.strictEqual(p.lag.isBehind(cfeLag()), true);
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
     });
 
     test('отказ операции хранилища (exit≠0): отметка не ставится', async () => {
       p.setResult('нет доступа', 1);
-      await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan()), RepositoryCliError);
+      await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan(), 'interactive'), RepositoryCliError);
       assert.strictEqual(p.lag.isBehind(cfLag()), false);
     });
   });
@@ -196,7 +196,7 @@ suite('repositoryChains: updateDatabaseOnLoad и признак отставан
   test('цель уже отстаёт ДО цепочки: databaseConfigurationBehind отражает признак даже без получения версий', async () => {
     p.lag.markBehind(cfLag(), 'load-without-update');
     p.setResult(opLog(LOCK_DONE, `Объект захвачен для редактирования: ${T}`));
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, lockPlan(), 'interactive');
     assert.strictEqual(result.databaseConfigurationBehind, true);
   });
 });
@@ -211,7 +211,7 @@ suite('repositoryPostSync: loadTargetChangesIntoDatabase и runPostRepositorySyn
       test(`loadTargetChangesIntoDatabase(${target}, updateDatabase=${String(updateDatabase)}): раннер получает режим и признак; успех помечает проект чистым и обновляет UI`, async () => {
         const repoTarget = target === 'cf' ? p.cfTarget : p.cfeTarget;
 
-        const ok = await loadTargetChangesIntoDatabase(repoTarget, p.services, { updateDatabase });
+        const ok = await loadTargetChangesIntoDatabase(repoTarget, p.services, { updateDatabase, interaction: 'interactive' });
 
         assert.strictEqual(ok, true);
         assert.deepStrictEqual(p.events, [target === 'cf' ? 'update:cf' : 'update:cfe:Расш']);
@@ -225,7 +225,7 @@ suite('repositoryPostSync: loadTargetChangesIntoDatabase и runPostRepositorySyn
 
   test('loadTargetChangesIntoDatabase: сбой раннера → false, проект не помечен чистым', async () => {
     p.updateResult = false;
-    assert.strictEqual(await loadTargetChangesIntoDatabase(p.cfTarget, p.services, { updateDatabase: false }), false);
+    assert.strictEqual(await loadTargetChangesIntoDatabase(p.cfTarget, p.services, { updateDatabase: false, interaction: 'interactive' }), false);
     assert.deepStrictEqual(p.cleaned, []);
   });
 

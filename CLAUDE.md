@@ -215,7 +215,10 @@ src/
 │   │                                  # «Удалённый сервер 1С»; пользовательская часть — docs/remote-designer.md
 │   │   ├── extensions/               # CF/CFE и расширения через агента: AgentExtensionList (список, сверка, срок 30 с),
 │   │   │                              # AgentCfFileExchange (одиночный обмен), AgentCfeBatch (пакеты), AgentExtensionMessages (тексты E3-E12);
-│   │   │                              # рядом: cfFile/CfeDirectoryListing, fs/TreeRemoval, ui/commands/ext/ExtensionListRunner
+│   │   │                              # рядом: cfFile/CfeDirectoryListing, fs/TreeRemoval, ui/commands/ext/ExtensionListRunner;
+│   │   │                              # ui/commands/ext/: importTargets (чистый выбор целей импорта), importConfigurationsRunner (общий
+│   │   │                              # раннер UI/MCP/моста), ImportConfigurationsCommands, agent/unattendedAgentHooks (хуки unattended);
+│   │   │                              # ui/mcp/registration/: McpImportTools, McpResponseFields
 │   │   ├── files/                    # AgentFileStore: Local (каталог агента) и Sftp (отдельное SSH-соединение),
 │   │   │                              # AgentFileTransfer (конкурентная передача с отменой),
 │   │   │                              # SftpChunkedIo (потоковый обмен, IO_CHUNK 31 КиБ)
@@ -590,6 +593,12 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   различающихся только регистром, и пути вне каталога цели (причина — в журнал, строка «Базовая линия
   синхронизации: …»). Запуск детектора после операции с базой — только через `ChangeDetectionScheduler`
   (settle ~16 с, `flush` для «Обновить конфигурации»), собственные таймеры в `Container` не заводить.
+- **Неинтерактивные MCP-операции** (любой MCP-путь, запускающий операцию агента или пакетного Конфигуратора, в которой
+  возможны вопросы/модалки): `interaction: OperationInteraction` (`'unattended'`) явным параметром; хуки согласия
+  подменяет ТОЛЬКО `runInProgress`; `confirmFullDump: undefined` «ради отсутствия диалога» передавать нельзя (нет
+  хука = согласие = молчаливая полная выгрузка), `onQuestion` в unattended отвечает `'cancel'`, а не `undefined`;
+  отказ = `requiresUserAction` + текст-инструкция, без тостов. Подробности и таблица хуков -
+  [architecture.md](./docs/architecture.md#неинтерактивные-операции-mcp-operationinteraction).
 - **Новая команда:** класс в `ui/commands/...` с `readonly id` → регистрация в `CommandRegistry.registerAll` → `package.json → contributes.commands` → при меню узла `contributes.menus` c `when: viewItem =~ /…/` → при хоткее `contributes.keybindings`.
 - **Новый потребитель пути формы** (MCP-инструмент или команда навигатора, которым нужно тело
   `Ext/Form.xml`, дескриптор формы или XML владельца по узлу дерева): только через

@@ -548,7 +548,7 @@ export const EXTENSION_MCP_TOOLS: readonly AiMcpToolInfo[] = [
   {
     profile: 'extension',
     name: 'v8vscedit_execute_command',
-    description: 'Безопасный мост к разрешённым командам refresh, importConfigurations, updateChangedConfigurations; updateChangedConfigurations следует настройке updateDatabaseAfterLoad, явный выбор обновления БД — v8vscedit_load_configuration_changes.',
+    description: 'Безопасный мост к разрешённым командам refresh, importConfigurations, updateChangedConfigurations; importConfigurations импортирует все подключённые конфигурации без окна выбора и без участия человека (выбор целей — v8vscedit_import_configurations); updateChangedConfigurations следует настройке updateDatabaseAfterLoad, явный выбор обновления БД — v8vscedit_load_configuration_changes.',
     requirement: 'Команда должна быть в allowlist расширения',
   },
   {
@@ -592,6 +592,12 @@ export const EXTENSION_MCP_TOOLS: readonly AiMcpToolInfo[] = [
     name: 'v8vscedit_load_configuration_changes',
     description: 'Загрузка изменённых файлов проекта корня в основную конфигурацию базы; updateDatabase (обязателен) — обновлять ли конфигурацию БД (возможна реструктуризация данных), иначе БД отмечается как не обновлённая.',
     requirement: 'Настроенное подключение к базе (env.json), канонический путь корня, явный updateDatabase',
+  },
+  {
+    profile: 'extension',
+    name: 'v8vscedit_import_configurations',
+    description: 'Импорт конфигураций из базы в файлы проекта без окна выбора: targets — "all" или список корней (Конфигурация / Расширение + configuration). Без участия человека: полная выгрузка на сервере и вопросы агента — отказ с инструкцией выполнить импорт из интерфейса VS Code.',
+    requirement: 'Настроенное подключение к базе (env.json), явный targets',
   },
 ];
 

@@ -3,6 +3,8 @@ import type { DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLa
 import type { ChangedConfiguration } from '../../../infra/fs/ConfigurationChangeDetector';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices } from '../_shared';
+import type { ConfigurationImportOptions, OperationInteraction } from '../ext/configurationOperationTypes';
+import type { DatabaseLoadOptions } from '../ext/databaseLoadPlan';
 import {
   runApplyDatabaseConfiguration,
   runDecompileExtension,
@@ -64,16 +66,30 @@ export async function findChangedConfiguration(
 }
 
 /**
- * Загрузка правок проекта в базу (`false` — сбой или отмена; ошибку уже показал раннер). Обновление
- * конфигурации БД — по `options.updateDatabase` (настройка `updateDatabaseAfterLoad` или параметр MCP);
- * признак отставания ставит и снимает сам раннер.
+ * Режим вызова цепочки — обязательный: компилятор показывает каждый вызов, и забытый MCP-путь становится
+ * ошибкой сборки, а не модальным окном. `onFailure` получает причину отказа раннера.
+ */
+interface ChainStepOptions {
+  readonly interaction: OperationInteraction;
+  readonly onFailure?: (reason: string) => void;
+}
+
+/**
+ * Загрузка правок проекта в базу (`false` — сбой или отмена; в interactive ошибку уже показал раннер).
+ * Обновление конфигурации БД — по `options.updateDatabase` (настройка `updateDatabaseAfterLoad` или
+ * параметр MCP); признак отставания ставит и снимает сам раннер.
  */
 export async function loadTargetChangesIntoDatabase(
   target: RepositoryTarget,
   services: RepositoryChainServices,
-  options: { readonly updateDatabase: boolean }
+  options: ChainStepOptions & { readonly updateDatabase: boolean }
 ): Promise<boolean> {
-  const loadOptions = { updateDatabase: options.updateDatabase, lag: services.databaseConfigLag };
+  const loadOptions: DatabaseLoadOptions = {
+    updateDatabase: options.updateDatabase,
+    lag: services.databaseConfigLag,
+    interaction: options.interaction,
+    onFailure: options.onFailure,
+  };
   const updated = target.configKind === 'cfe'
     ? await runUpdateExtension(
         extensionNameOf(target),
@@ -106,19 +122,35 @@ export async function loadTargetChangesIntoDatabase(
  * Импорт основной конфигурации базы в файлы проекта. Проект помечается чистым только при успехе:
  * иначе «Обновить БД» из устаревших файлов перезаписала бы полученные из хранилища версии.
  */
-export async function importTargetFromDatabase(target: RepositoryTarget, services: RepositoryChainServices): Promise<boolean> {
+export async function importTargetFromDatabase(
+  target: RepositoryTarget,
+  services: RepositoryChainServices,
+  options: ChainStepOptions
+): Promise<boolean> {
+  const importOptions: ConfigurationImportOptions = {
+    interaction: options.interaction,
+    onOutcome: (outcome) => {
+      if (!outcome.success && outcome.reason) {
+        options.onFailure?.(outcome.reason);
+      }
+    },
+  };
   const imported = target.configKind === 'cfe'
     ? await runDecompileExtension(
         target.extensionName ?? target.displayName,
         target.configRoot,
         services.workspaceFolder,
-        services.outputChannel
+        services.outputChannel,
+        undefined,
+        importOptions
       )
     : await runDecompileMainConfiguration(
         target.displayName,
         target.configRoot,
         services.workspaceFolder,
-        services.outputChannel
+        services.outputChannel,
+        undefined,
+        importOptions
       );
   if (!imported) {
     return false;
@@ -142,7 +174,7 @@ export async function runPostRepositorySync(target: RepositoryTarget, services: 
     if (!updated) {
       return;
     }
-    await importTargetFromDatabase(target, services);
+    await importTargetFromDatabase(target, services, { interaction: 'interactive' });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     services.outputChannel.appendLine(`[repository][post-sync][error] ${message}`);

@@ -8,7 +8,11 @@ import {
   type AgentOperationService,
 } from '../../../../infra/agent';
 import { AgentFullDumpDeclinedError, AgentSyncCancelledError } from '../../../../infra/agent/sync/SyncContext';
-import type { ConfigurationImportHooks, ConfigurationProgressHooks } from '../configurationOperationTypes';
+import type {
+  ConfigurationImportHooks,
+  ConfigurationProgressHooks,
+  OperationInteraction,
+} from '../configurationOperationTypes';
 import {
   beginConfigurationOperationStatus,
   endConfigurationOperationStatus,
@@ -18,6 +22,7 @@ import {
 import { getAgentOperationService, logAgentDiagnostics, recoverAgentAfterHang } from './AgentServiceRegistry';
 import { agentQuestionText, isSecretQuestion, withQuestionJournal } from './agentQuestionJournal';
 import { readAgentLocation } from './agentSettings';
+import { createUnattendedAgentHooks, resolveUnattendedFailure, unattendedWarnings } from './unattendedAgentHooks';
 
 export interface RunAgentOptions {
   readonly progressTitle: string;
@@ -44,12 +49,17 @@ export interface RunAgentOptions {
   readonly cancellable?: boolean;
   /** `false` — без всплывающего окна ошибки (MCP `silent`): причину получает вызывающий из исхода. */
   readonly showErrorMessage?: boolean;
+  /**
+   * По умолчанию interactive. unattended (MCP): переданные `confirm*` отбрасываются, вопросы получают отказ,
+   * тостов нет — подмена в одной точке, чтобы забытый вызывающий не протащил модальное окно в MCP.
+   */
+  readonly interaction?: OperationInteraction;
 }
 
 /** Исход агентской операции: значение или причина отказа (у отмены пользователем — `cancelled`). */
 export type AgentOperationOutcome<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly reason: string; readonly cancelled?: boolean };
+  | { readonly ok: true; readonly value: T; readonly interactionWarnings?: readonly string[] }
+  | { readonly ok: false; readonly reason: string; readonly cancelled?: boolean; readonly requiresUserAction?: boolean };
 
 /** Хуки, которые операция получает от обёртки: журнал, вопросы, прогресс и (у отменяемых) токен отмены. */
 export interface AgentOperationUiHooks {
@@ -119,7 +129,8 @@ async function runInProgress<T>(
       progress.report({ message: statusMessage });
     }
   };
-  const buildOperationHooks = (): AgentOperationUiHooks => withQuestionJournal({
+  const unattended = options.interaction === 'unattended' ? createUnattendedAgentHooks(onMessage) : undefined;
+  const baseHooks: Omit<AgentOperationUiHooks, 'onQuestion'> = {
     onMessage,
     // Журнал пишет только onMessage: здесь — живой UI для промежуточных значений счётчиков.
     onProgress: (event) => {
@@ -133,12 +144,25 @@ async function runInProgress<T>(
     onProjectFilesWillChange: importHooks
       ? (filePaths: string[]) => importHooks.beforeProjectFilesChanged?.(filePaths)
       : undefined,
-    onQuestion: showAgentQuestion,
     cancellation,
-    confirmMirrorSeed: options.confirmMirrorSeed,
-    confirmFullDump: options.confirmFullDump,
-    confirmOrphanRemoval: options.confirmOrphanRemoval,
-  }, onMessage);
+  };
+  // Без человека журнал «Ответ пользователя: …» был бы ложью: строки пишут сами unattended-хуки. Посева и
+  // удаления сирот без согласия нет (у infra отсутствие этих хуков — безопасный отказ).
+  const buildOperationHooks = (): AgentOperationUiHooks => (unattended
+    ? {
+        ...baseHooks,
+        onQuestion: unattended.onQuestion,
+        confirmMirrorSeed: undefined,
+        confirmFullDump: unattended.confirmFullDump,
+        confirmOrphanRemoval: undefined,
+      }
+    : withQuestionJournal({
+        ...baseHooks,
+        onQuestion: showAgentQuestion,
+        confirmMirrorSeed: options.confirmMirrorSeed,
+        confirmFullDump: options.confirmFullDump,
+        confirmOrphanRemoval: options.confirmOrphanRemoval,
+      }, onMessage));
   const cancelSubscription = cancellation?.onCancellationRequested(() => { onMessage(CANCEL_REQUESTED_MESSAGE); });
   // Место агента — на момент старта операции: настройку могли сменить, пока операция ждала ответа.
   const location = readAgentLocation();
@@ -149,6 +173,9 @@ async function runInProgress<T>(
 
     endConfigurationOperationStatus(options.progressTitle, 'завершено');
     options.outputChannel.appendLine(`[agent] Завершено: ${options.progressTitle}`);
+    if (unattended) {
+      return { ok: true, value, interactionWarnings: unattendedWarnings(unattended.log) };
+    }
     if (options.showSuccessMessage !== false) {
       void vscode.window.showInformationMessage(options.successMessage);
     }
@@ -159,6 +186,9 @@ async function runInProgress<T>(
       // отказа (импорт, импорт после посева, загрузка), её и показываем (до общей ветки отмены: это её подкласс).
       options.outputChannel.appendLine(`[agent] ${error.message}`);
       endConfigurationOperationStatus(options.progressTitle, 'отменено');
+      if (unattended) {
+        return { ok: false, cancelled: true, ...resolveUnattendedFailure(unattended.log, error.message) };
+      }
       void vscode.window.showInformationMessage(error.message);
       return { ok: false, reason: error.message, cancelled: true };
     }
@@ -167,7 +197,9 @@ async function runInProgress<T>(
       // «Ошибка импорта…» и без диагностики агента, только запись в журнал и сообщение.
       options.outputChannel.appendLine(`[agent] Отменено: ${options.progressTitle}`);
       endConfigurationOperationStatus(options.progressTitle, 'отменено');
-      void vscode.window.showInformationMessage(`${options.progressTitle}: операция отменена.`);
+      if (!unattended) {
+        void vscode.window.showInformationMessage(`${options.progressTitle}: операция отменена.`);
+      }
       return { ok: false, reason: error.message, cancelled: true };
     }
     // Зависание агента (ФАКТ Э29): свой локальный процесс останавливается для перезапуска, иначе — просьба.
@@ -179,6 +211,9 @@ async function runInProgress<T>(
     }
     logAgentDiagnostics(options.workspaceFolder, options.outputChannel);
     endConfigurationOperationStatus(options.progressTitle, 'ошибка');
+    if (unattended) {
+      return { ok: false, ...resolveUnattendedFailure(unattended.log, message) };
+    }
     if (options.showErrorMessage !== false) {
       void vscode.window.showErrorMessage(
         `${options.errorTitle}\n${message}`,

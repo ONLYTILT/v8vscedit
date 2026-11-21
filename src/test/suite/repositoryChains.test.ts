@@ -38,7 +38,7 @@ suite('repositoryChains: runLockChain', () => {
 
   test('захват получил версии: захват → импорт cf; учёт, чистота проекта, перезагрузка дерева; результат и вектор', async () => {
     p.setResult(RECEIVED);
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan(), 'interactive');
 
     assert.deepStrictEqual(p.events, ['repo:lock', 'import:cf']);
     assert.deepStrictEqual(result, {
@@ -58,13 +58,13 @@ suite('repositoryChains: runLockChain', () => {
 
   test('revised=false: ключа -revised в векторе нет', async () => {
     p.setResult(NOT_RECEIVED);
-    await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ revised: false }));
+    await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ revised: false }), 'interactive');
     assert.ok(!operationTail(p.args()).includes('-revised'));
   });
 
   test('захват без новых версий: импорта нет, проект не отстаёт, предупреждений нет', async () => {
     p.setResult(NOT_RECEIVED);
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:lock']);
     assert.strictEqual(result.receivedFromRepository, false);
     assert.strictEqual(result.projectImported, false);
@@ -75,7 +75,7 @@ suite('repositoryChains: runLockChain', () => {
 
   test('цель cfe: импорт расширения с его именем, вектор оканчивается -Extension <имя>', async () => {
     p.setResult(RECEIVED);
-    await runLockChain(p.services, p.cfeTarget, p.refs.cfeCatalog, false, plan());
+    await runLockChain(p.services, p.cfeTarget, p.refs.cfeCatalog, false, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:lock', 'import:cfe:Расш']);
     assert.deepStrictEqual(p.cleaned, [[p.cfeRoot]]);
     assert.deepStrictEqual(p.args().slice(-2), ['-Extension', 'Расш']);
@@ -83,7 +83,7 @@ suite('repositoryChains: runLockChain', () => {
 
   test('updateDatabaseFirst: загрузка правок → захват → импорт, databaseLoadedBefore=true', async () => {
     p.setResult(RECEIVED);
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }));
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }), 'interactive');
     assert.deepStrictEqual(p.events, ['update:cf', 'repo:lock', 'import:cf']);
     assert.strictEqual(result.databaseLoadedBefore, true);
     assert.deepStrictEqual(p.cleaned, [[p.cfRoot], [p.cfRoot]]);
@@ -92,7 +92,7 @@ suite('repositoryChains: runLockChain', () => {
   test('сбой загрузки перед захватом: ошибка с точным текстом, захват не запускался, учёт не тронут', async () => {
     p.updateResult = false;
     await assert.rejects(
-      () => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true })),
+      () => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }), 'interactive'),
       (error: Error) => error.message === 'Загрузка правок проекта в базу не выполнена; захват не выполнялся. Подробности — в журнале «1С Редактор».'
     );
     assert.deepStrictEqual(p.events, ['update:cf']);
@@ -103,7 +103,7 @@ suite('repositoryChains: runLockChain', () => {
   test('importAfterLock=false (keepProjectBehind) и версии получены: импорта нет, projectBehind=true, предупреждение describeProjectBehindAfterLock', async () => {
     p.setResult(RECEIVED);
     const result = await runLockChain(
-      p.services, p.cfTarget, p.refs.catalog, false, plan({ revised: false, importAfterLock: false })
+      p.services, p.cfTarget, p.refs.catalog, false, plan({ revised: false, importAfterLock: false }), 'interactive'
     );
     assert.deepStrictEqual(p.events, ['repo:lock']);
     assert.strictEqual(result.projectBehind, true);
@@ -114,7 +114,7 @@ suite('repositoryChains: runLockChain', () => {
   test('сбой импорта: не исключение — предупреждение describeImportFailureAfterLock, projectImported=false, projectBehind=true, проект не помечен чистым', async () => {
     p.setResult(RECEIVED);
     p.importResult = false;
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:lock', 'import:cf']);
     assert.strictEqual(result.projectImported, false);
     assert.strictEqual(result.projectBehind, true);
@@ -125,20 +125,20 @@ suite('repositoryChains: runLockChain', () => {
 
   test('exit≠0: RepositoryCliError, импорта нет, учёт не тронут', async () => {
     p.setResult('нет доступа', 1);
-    await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan()), RepositoryCliError);
+    await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan(), 'interactive'), RepositoryCliError);
     assert.deepStrictEqual(p.events, ['repo:lock']);
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), false);
   });
 
   test('прерывание: RepositoryCliInterruptedError пробрасывается, импорта нет', async () => {
     p.setResult('', 0, { interrupted: 'Отменено пользователем' });
-    await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan()), RepositoryCliInterruptedError);
+    await assert.rejects(() => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan(), 'interactive'), RepositoryCliInterruptedError);
     assert.deepStrictEqual(p.events, ['repo:lock']);
   });
 
   test('рекурсивный захват корня: выборка с includeChildObjects="true", requestedObjects — служебное имя корня', async () => {
     p.setResult(opLog(LOCK_DONE));
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.cfRoot, true, plan());
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.cfRoot, true, plan(), 'interactive');
     assert.deepStrictEqual(result.requestedObjects, [ROOT_LOCK_CF]);
     assert.deepStrictEqual(result.lockedObjects, [ROOT_LOCK_CF], 'служебное имя корня не отфильтровывается логом');
     const objects = operationTail(p.args())[2] as { content: string };
@@ -159,7 +159,7 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('получено: получение → импорт cf; результат; тостов нет; вектор без -force и -v', async () => {
     p.setResult(GOT);
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan());
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'import:cf']);
     assert.deepStrictEqual(result, {
       receivedFromRepository: true, changesLoadedAfter: false, projectImported: true, projectBehind: false, warnings: [],
@@ -174,14 +174,14 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('версия и force попадают в вектор в порядке -Objects, -v, -force', async () => {
     p.setResult(GOT);
-    await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, { recursive: false, force: true, version: '5' }, plan());
+    await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, { recursive: false, force: true, version: '5' }, plan(), 'interactive');
     const tail = operationTail(p.args());
     assert.deepStrictEqual([tail[0], tail[1], tail[3], tail[4], tail[5]], ['/ConfigurationRepositoryUpdateCfg', '-Objects', '-v', '5', '-force']);
   });
 
   test('receive-then-load: получение → загрузка правок → импорт (Э24), changesLoadedAfter=true, всё без тостов', async () => {
     p.setResult(GOT);
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cf', 'import:cf']);
     assert.strictEqual(result.changesLoadedAfter, true);
     assert.deepStrictEqual(result.warnings, []);
@@ -190,14 +190,14 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('receive-then-load, цель cfe', async () => {
     p.setResult(GOT);
-    await runUpdateChain(p.services, p.cfeTarget, p.refs.cfeCatalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
+    await runUpdateChain(p.services, p.cfeTarget, p.refs.cfeCatalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cfe:Расш', 'import:cfe:Расш']);
   });
 
   test('сбой загрузки правок ПОСЛЕ получения — успех с предупреждением, импорта нет (перезаписал бы правки), projectBehind=true', async () => {
     p.setResult(GOT);
     p.updateResult = false;
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cf']);
     assert.deepStrictEqual(result, {
       receivedFromRepository: true, changesLoadedAfter: false, projectImported: false, projectBehind: true,
@@ -210,7 +210,7 @@ suite('repositoryChains: runUpdateChain', () => {
   test('receive-without-import и версии получены: проект отстаёт, предупреждение describeProjectBehindAfterReceive', async () => {
     p.setResult(GOT);
     const result = await runUpdateChain(
-      p.services, p.cfTarget, p.refs.catalog, request, plan({ importAfterReceive: false })
+      p.services, p.cfTarget, p.refs.catalog, request, plan({ importAfterReceive: false }), 'interactive'
     );
     assert.deepStrictEqual(p.events, ['repo:update']);
     assert.strictEqual(result.projectBehind, true);
@@ -220,7 +220,7 @@ suite('repositoryChains: runUpdateChain', () => {
   test('receive-without-import, ничего не получено: ни импорта, ни предупреждений, projectBehind=false', async () => {
     p.setResult(NOTHING);
     const result = await runUpdateChain(
-      p.services, p.cfTarget, p.refs.catalog, request, plan({ importAfterReceive: false })
+      p.services, p.cfTarget, p.refs.catalog, request, plan({ importAfterReceive: false }), 'interactive'
     );
     assert.deepStrictEqual(p.events, ['repo:update']);
     assert.deepStrictEqual([result.projectBehind, result.warnings], [false, []]);
@@ -228,7 +228,7 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('импорт разрешён, но ничего не получено: импорта нет, receivedFromRepository=false', async () => {
     p.setResult(NOTHING);
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan());
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update']);
     assert.deepStrictEqual(
       [result.receivedFromRepository, result.projectImported, result.projectBehind],
@@ -239,7 +239,7 @@ suite('repositoryChains: runUpdateChain', () => {
   test('сбой импорта: предупреждение describeImportFailureAfterReceive, projectImported=false, projectBehind=true', async () => {
     p.setResult(GOT);
     p.importResult = false;
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan());
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan(), 'interactive');
     assert.deepStrictEqual(result.warnings, [describeImportFailureAfterReceive('Основная')]);
     assert.strictEqual(result.projectImported, false);
     assert.strictEqual(result.projectBehind, true);
@@ -248,7 +248,7 @@ suite('repositoryChains: runUpdateChain', () => {
   test('exit≠0: RepositoryCliError, загрузки и импорта нет', async () => {
     p.setResult('нет доступа', 1);
     await assert.rejects(
-      () => runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true })),
+      () => runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive'),
       RepositoryCliError
     );
     assert.deepStrictEqual(p.events, ['repo:update']);
@@ -266,7 +266,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('чистый проект: помещение, учёт снят, результат; импорта нет; вектор -Objects … -comment', async () => {
     p.setResult(COMMITTED);
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(p.events, ['repo:commit']);
     assert.deepStrictEqual(result, {
       committedObjects: [T], keptLocked: false, referencesCleaned: false,
@@ -282,7 +282,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('updateDatabaseFirst: загрузка → помещение (под одним вызовом), databaseLoadedBefore=true', async () => {
     p.setResult(COMMITTED);
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true }, 'interactive');
     assert.deepStrictEqual(p.events, ['update:cf', 'repo:commit']);
     assert.strictEqual(result.databaseLoadedBefore, true);
   });
@@ -290,7 +290,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('сбой загрузки перед помещением: ошибка с точным текстом, помещение не запускалось, захват остаётся', async () => {
     p.updateResult = false;
     await assert.rejects(
-      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true }),
+      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true }, 'interactive'),
       (error: Error) => error.message === 'Загрузка правок проекта в базу не выполнена; помещение не выполнялось. Подробности — в журнале «1С Редактор».'
     );
     assert.strictEqual(p.runs.length, 0);
@@ -300,7 +300,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('keepLocked: захват сохраняется, keptLocked=true, -keepLocked в векторе; -force только при force', async () => {
     p.setResult(COMMITTED);
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, keepLocked: true, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, keepLocked: true, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'
     );
     assert.strictEqual(result.keptLocked, true);
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), true);
@@ -311,7 +311,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('очистка ссылок (-force, Э25): база помещающего изменена → ОБЯЗАТЕЛЬНЫЙ импорт cf, referencesCleaned=true, projectImported=true', async () => {
     p.setResult(CLEANED);
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'
     );
     assert.deepStrictEqual(p.events, ['repo:commit', 'import:cf']);
     assert.strictEqual(result.referencesCleaned, true);
@@ -323,7 +323,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('очистка ссылок, цель cfe: импорт расширения', async () => {
     p.lock([T], p.cfeTarget);
     p.setResult(CLEANED);
-    await runCommitChain(p.services, p.cfeTarget, p.refs.cfeCatalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
+    await runCommitChain(p.services, p.cfeTarget, p.refs.cfeCatalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(p.events, ['repo:commit', 'import:cfe:Расш']);
   });
 
@@ -331,7 +331,7 @@ suite('repositoryChains: runCommitChain', () => {
     p.setResult(CLEANED);
     p.importResult = false;
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'
     );
     assert.strictEqual(result.projectImported, false);
     assert.deepStrictEqual(result.warnings, [describeImportFailureAfterCommit('Основная')]);
@@ -341,7 +341,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('помещение без правок (все «не был изменен»): успех, committedObjects пуст, предупреждение «нечего помещать»', async () => {
     p.setResult(opLog(COMMIT_DONE, `Объект не был изменен: ${T}`));
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(result.committedObjects, []);
     assert.strictEqual(result.warnings.length, 1);
     assert.ok(result.warnings[0].includes('нечего помещать'), result.warnings[0]);
@@ -350,7 +350,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('лог не распознан: committedObjects — все запрошенные, предупреждения «нечего помещать» нет, импорта нет', async () => {
     p.setResult('');
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(result.committedObjects, [T]);
     assert.deepStrictEqual(result.warnings, []);
     assert.deepStrictEqual(p.events, ['repo:commit']);
@@ -359,7 +359,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('exit≠0: RepositoryCliError, импорта нет, захват остаётся', async () => {
     p.setResult('Объект содержит ссылки на удаленные объекты', 1);
     await assert.rejects(
-      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }),
+      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive'),
       RepositoryCliError
     );
     assert.deepStrictEqual(p.events, ['repo:commit']);
@@ -378,7 +378,7 @@ suite('repositoryChains: runUnlockChain', () => {
 
   test('освобождено: результат, учёт снят, проект чист — предупреждений нет; вектор без -force', async () => {
     p.setResult(opLog(UNLOCK_DONE, `Захват объекта отменен: ${T}`));
-    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0);
+    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0, 'interactive');
     assert.deepStrictEqual(result, { unlockedObjects: [T], lockedByOthers: [], notUnlocked: [], warnings: [] });
     assert.deepStrictEqual(p.events, ['repo:unlock']);
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), false);
@@ -388,13 +388,13 @@ suite('repositoryChains: runUnlockChain', () => {
 
   test('незагруженные правки проекта и освобождено что-то: предупреждение, что загрузить их по освобождённым объектам будет нельзя', async () => {
     p.setResult(opLog(UNLOCK_DONE, `Захват объекта отменен: ${T}`));
-    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 3);
+    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 3, 'interactive');
     assert.ok(result.warnings.some((warning) => warning.includes(PHRASE)), result.warnings.join('|'));
   });
 
   test('чужой захват: НЕ исключение — структура {unlockedObjects:[], lockedByOthers, notUnlocked}; учёт остаётся', async () => {
     p.setResult(opLog(UNLOCK_DONE, `${FOREIGN}${T} (Иванов) `));
-    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0);
+    const result = await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0, 'interactive');
     assert.deepStrictEqual(result.unlockedObjects, []);
     assert.deepStrictEqual(result.lockedByOthers, [{ name: T, user: 'Иванов' }]);
     assert.deepStrictEqual(result.notUnlocked, [T]);
@@ -403,7 +403,7 @@ suite('repositoryChains: runUnlockChain', () => {
 
   test('force=true доходит до вектора (UI открывает force, MCP — нет)', async () => {
     p.setResult('');
-    await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, { recursive: false, force: true }, 0);
+    await runUnlockChain(p.services, p.cfTarget, p.refs.catalog, { recursive: false, force: true }, 0, 'interactive');
     assert.ok(operationTail(p.args()).includes('-force'));
   });
 
@@ -411,7 +411,7 @@ suite('repositoryChains: runUnlockChain', () => {
     p.lock(['Справочник.Склады']);
     p.setResult(opLog('Ошибка', 'Захват объекта отменен: Справочник.Склады'), 1);
     await assert.rejects(
-      () => runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0),
+      () => runUnlockChain(p.services, p.cfTarget, p.refs.catalog, request, 0, 'interactive'),
       RepositoryCliError
     );
     assert.strictEqual(p.service.isLocked(p.cfTarget, 'Справочник.Склады'), false);

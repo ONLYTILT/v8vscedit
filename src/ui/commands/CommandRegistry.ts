@@ -13,6 +13,7 @@ import { registerCfeBatchCommands } from './ext/CfeBatchCommands';
 import { registerCfeToolsCommands } from './ext/CfeToolsCommands';
 import { registerExtensionCommands } from './ext/ExtensionCommands';
 import { registerDatabaseConfigCommands } from './ext/DatabaseConfigCommands';
+import { registerImportConfigurationsCommand } from './ext/ImportConfigurationsCommands';
 import { registerFormToolsCommands } from './form/FormToolsCommands';
 import { registerAddMetadataCommand } from './metadata/AddMetadataCommand';
 import { registerMetadataReportCommands } from './metadata/MetadataReportCommands';
@@ -66,6 +67,7 @@ export function registerCommands(
   registerInstallAiSkillsCommand(context, services);
   registerExtensionCommands(context, services);
   registerDatabaseConfigCommands(context, services);
+  registerImportConfigurationsCommand(context, services);
   registerCfFileCommands(context, services);
   registerCfeBatchCommands(context, services);
   registerRepositoryCommands(context, services);

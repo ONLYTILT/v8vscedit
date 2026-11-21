@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices, NodeArg } from '../_shared';
+import type { OperationInteraction } from '../ext/configurationOperationTypes';
 import type { RepositoryCliServices } from './RepositoryCommandRunner';
 import type { RepositoryChainServices } from './repositoryPostSync';
 
@@ -11,14 +12,32 @@ import type { RepositoryChainServices } from './repositoryPostSync';
 
 export type RepositoryCommandNode = NodeArg & RepositoryNodeRef;
 
-export function toCliServices(services: RepositoryChainServices): RepositoryCliServices {
+/** Отказ вместо окна ввода пароля удалённого сервера, когда отвечать некому (MCP). */
+export const UNATTENDED_REMOTE_PASSWORD_MISSING =
+  'Пароль учётной записи PowerShell-сессии с удалённым сервером 1С не сохранён, а вызов идёт без участия человека: ' +
+  'окно ввода пароля не открывается. Выполните любую операцию с удалённым сервером из интерфейса VS Code — пароль ' +
+  'будет запрошен и сохранён в SecretStorage, после этого повторите вызов.';
+
+/**
+ * Сервисы операции хранилища. В unattended окно ввода пароля PSSession подменяется отказом: модальное окно из
+ * MCP висело бы до прихода человека. Сохранённый пароль используется как обычно.
+ */
+export function toCliServices(
+  services: RepositoryChainServices,
+  interaction: OperationInteraction = 'interactive'
+): RepositoryCliServices {
   return {
     workspaceFolder: services.workspaceFolder,
     outputChannel: services.outputChannel,
     repositoryService: services.repositoryService,
     projectSecretStorage: services.projectSecretStorage,
     createDesignerExecutor: services.createDesignerExecutor,
-    designerExecutorDeps: services.designerExecutorDeps,
+    designerExecutorDeps: interaction === 'unattended'
+      ? {
+          ...services.designerExecutorDeps,
+          promptRemotePassword: () => Promise.reject(new Error(UNATTENDED_REMOTE_PASSWORD_MISSING)),
+        }
+      : services.designerExecutorDeps,
   };
 }
 

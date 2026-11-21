@@ -18,6 +18,7 @@ import {
   tryBeginConfigurationOperation,
 } from '../../ui/commands/ext/configurationOperationLock';
 import { registerConfigLifecycleTools } from '../../ui/mcp/registration/McpConfigLifecycleTools';
+import { registerImportTools } from '../../ui/mcp/registration/McpImportTools';
 import { registerRepositoryTools } from '../../ui/mcp/registration/McpRepositoryTools';
 import type { MetadataNode } from '../../ui/tree/TreeNode';
 import { ManualScheduler, deferred } from './support/manualScheduler';
@@ -388,7 +389,7 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
     readonly name: string;
     readonly args: () => Record<string, unknown>;
   }
-  /** Все инструменты контракта 1.5 и v8vscedit_load_configuration_changes (одиннадцатый, долгий). `confirm: true` — у load-ов и commit. */
+  /** Все инструменты контракта 1.5 и v8vscedit_load_configuration_changes (одиннадцатый, долгий) и v8vscedit_import_configurations (двенадцатый, долгий). `confirm: true` — у load-ов и commit. */
   const CASES: readonly ToolCase[] = [
     { name: 'v8vscedit_repository_lock', args: () => ({ path: 'Справочники.Товары' }) },
     { name: 'v8vscedit_repository_update', args: () => ({ path: 'Справочники.Товары' }) },
@@ -400,6 +401,7 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
     { name: 'v8vscedit_load_cf', args: () => ({ inputFile: path.join(p.root, 'in.cf'), confirm: true }) },
     { name: 'v8vscedit_dump_all_cfe', args: () => ({ outputDir: p.root }) },
     { name: 'v8vscedit_load_all_cfe', args: () => ({ inputDir: p.root, confirm: true }) },
+    { name: 'v8vscedit_import_configurations', args: () => ({ targets: 'all' }) },
     { name: 'v8vscedit_execute_command', args: () => ({ command: 'v8vscedit.importConfigurations' }) },
   ];
 
@@ -434,6 +436,7 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
     const deps = { services: p.services, xmlEditor: {}, paths, properties: {}, mutations: {}, gate } as never;
     registerRepositoryTools(server as never, deps);
     registerConfigLifecycleTools(server as never, deps);
+    registerImportTools(server as never, deps);
 
     // Команды расширения не исполняются по-настоящему: фиксируется только факт вызова `v8vscedit.*`.
     const commands = vscode.commands as unknown as { executeCommand: unknown };
@@ -460,7 +463,7 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
     return found;
   };
 
-  suite('замок занят: MCP-текст, пульс взведён и погашен (все 10 инструментов)', () => {
+  suite('замок занят: MCP-текст, пульс взведён и погашен (все 12 инструментов)', () => {
     for (const { name, args } of CASES) {
       test(`${name}: isError с MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE, чужой замок цел, платформа не вызвана`, async () => {
         assert.strictEqual(await tryBeginConfigurationOperation(), true);
@@ -510,15 +513,31 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
         assert.deepStrictEqual(executed, []);
         assert.strictEqual(isConfigurationOperationRunning(), true);
       });
-
-      test(`${command}: замок свободен — команда выполняется как прежде; MCP замок не занимает (его берёт сама команда)`, async () => {
-        const result = await handler('v8vscedit_execute_command')({ command }, fakeExtra('t'));
-        assert.strictEqual(result.isError, undefined, text(result));
-        assert.deepStrictEqual(JSON.parse(text(result)), { command, result: null });
-        assert.deepStrictEqual(executed, [command]);
-        assert.strictEqual(isConfigurationOperationRunning(), false);
-      });
     }
+
+    test('v8vscedit.updateChangedConfigurations: замок свободен — команда UI выполняется как прежде; MCP замок не занимает (его берёт сама команда)', async () => {
+      const command = 'v8vscedit.updateChangedConfigurations';
+      const result = await handler('v8vscedit_execute_command')({ command }, fakeExtra('t'));
+      assert.strictEqual(result.isError, undefined, text(result));
+      assert.deepStrictEqual(JSON.parse(text(result)), { command, result: null });
+      assert.deepStrictEqual(executed, [command]);
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
+
+    test('v8vscedit.importConfigurations: замок свободен — UI-команда НЕ вызывается, импорт идёт общим путём (unattended) под замком MCP-пути; замок снят', async () => {
+      const result = await handler('v8vscedit_execute_command')({ command: 'v8vscedit.importConfigurations' }, fakeExtra('t'));
+      assert.strictEqual(result.isError, undefined, text(result));
+      const parsed = JSON.parse(text(result)) as { command: string; result: { requested: string; completed: boolean; imported: number } };
+      assert.strictEqual(parsed.command, 'v8vscedit.importConfigurations');
+      assert.strictEqual(parsed.result.requested, 'all');
+      assert.strictEqual(parsed.result.completed, true);
+      assert.strictEqual(parsed.result.imported, 2);
+      assert.deepStrictEqual(executed, []);
+      assert.deepStrictEqual(p.events, ['import:cf', 'import:cfe:Расш']);
+      assert.strictEqual(p.lockHeldAt['import:cf'], true);
+      assert.strictEqual(p.importOptions()?.interaction, 'unattended');
+      assert.strictEqual(isConfigurationOperationRunning(), false);
+    });
 
     test('refresh не блокируется занятым замком', async () => {
       assert.strictEqual(await tryBeginConfigurationOperation(), true);

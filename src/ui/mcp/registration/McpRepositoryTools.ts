@@ -156,7 +156,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
           updateDatabase,
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
-        return runChain(() => runLockChain(services, target, ref, isRecursive, plan));
+        return runChain(() => runLockChain(services, target, ref, isRecursive, plan, 'unattended'));
       });
       return { path, ...result };
     }))
@@ -192,7 +192,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
         const chain = await runChain(
-          () => runUpdateChain(services, target, ref, { recursive: isRecursive, force: false }, plan)
+          () => runUpdateChain(services, target, ref, { recursive: isRecursive, force: false }, plan, 'unattended')
         );
         return { ...chain, lockedOverwritten: lockedInSelection };
       });
@@ -234,7 +234,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
           updateDatabase: args.updateDatabase,
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
-        return runChain(() => runCommitChain(services, target, ref, request, plan));
+        return runChain(() => runCommitChain(services, target, ref, request, plan, 'unattended'));
       });
       return { path: args.path, ...result };
     }))
@@ -258,7 +258,7 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       const request = { recursive: recursive ?? false, force: false };
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
         const dirty = await dirtyFilesCount(target);
-        return runChain(() => runUnlockChain(services, target, ref, request, dirty));
+        return runChain(() => runUnlockChain(services, target, ref, request, dirty, 'unattended'));
       });
       if (result.unlockedObjects.length === 0 && result.notUnlocked.length > 0) {
         throw new Error(describeUnlockNotDone(result.notUnlocked, result.lockedByOthers));

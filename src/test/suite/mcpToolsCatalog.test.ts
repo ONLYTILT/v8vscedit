@@ -12,7 +12,7 @@
  * провалить именно этот тест.
  *
  * Зафиксировано:
- *  1) Полный каталог из 68 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
+ *  1) Полный каталог из 69 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
  *     `registerTools` (`server.registerTool(...)` прямо в V8McpServer.ts).
  *     Для каждого — имя, title, description (построчно, дословно) и набор
  *     ключей inputSchema с их опциональностью. Было 59 на момент снятия эталона;
@@ -608,7 +608,7 @@ const EXPECTED_TOOLS: readonly ExpectedTool[] = [
   {
     name: 'v8vscedit_execute_command',
     title: 'Выполнить команду расширения',
-    description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
+    description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. importConfigurations импортирует ВСЕ подключённые конфигурации без окна выбора и без участия человека (как v8vscedit_import_configurations с targets: "all"; для выбора целей и подробного результата используйте его). updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
     schemaKeys: { command: false },
   },
   {
@@ -653,24 +653,30 @@ const EXPECTED_TOOLS: readonly ExpectedTool[] = [
     description: 'Загружает изменённые файлы проекта корня конфигурации или расширения в основную конфигурацию базы (тот же путь, что команды «Обновить в базе» и «Загрузить в базу без обновления БД»). updateDatabase обязателен: true — после загрузки обновить конфигурацию БД (/UpdateDBCfg, возможна долгая реструктуризация данных); false — только основная конфигурация (для помещения в хранилище этого достаточно), конфигурация БД отмечается как не обновлённая (databaseConfigurationBehind) до v8vscedit_update_database_configuration. Если изменений нет, а конфигурация БД отстаёт, при updateDatabase: true выполняется только обновление БД. Принимает канонический путь корня: Конфигурация или Расширение.',
     schemaKeys: { path: false, configuration: true, updateDatabase: false },
   },
+  {
+    name: 'v8vscedit_import_configurations',
+    title: 'Импортировать конфигурации из базы',
+    description: 'Импортирует основную конфигурацию и/или расширения из базы в файлы выгрузки проекта (тот же код, что команда «Импортировать конфигурации из базы»), без окна выбора. targets обязателен: "all" — все подключённые (src/cf и src/cfe/*; так же выполняется первичный импорт пустого src/cf) или список корней [{ path: "Конфигурация" | "Расширение", configuration? }] — канон корня, как у v8vscedit_load_configuration_changes. Порядок: основная конфигурация, затем расширения по алфавиту; на первой неудаче импорт останавливается (status: imported | failed | skipped). Вызов без участия человека: если нужна полная выгрузка на сервере (пустое зеркало агента и т.п.) или агент конфигуратора задал вопрос, цель получает failed с requiresUserAction: true и инструкцией выполнить импорт из интерфейса VS Code; посев зеркала из выгрузки проекта и удаление осиротевших файлов не выполняются. Проверяйте completed и failed. databaseConfigurationBehind — признак «конфигурация БД не обновлена» по цели.',
+    schemaKeys: { targets: false },
+  },
 ];
 
 suite('V8McpServer.registerTools — golden-каталог перед декомпозицией (характеризационный)', () => {
-  test('регистрирует ровно 68 прямых tool (без учёта registerAllAddTools)', () => {
+  test('регистрирует ровно 69 прямых tool (без учёта registerAllAddTools)', () => {
     const { tools } = registerAllTools(createBaselineServices());
     // registerAllAddTools добавляет ещё 45 root + 11 child = 56 tool-ов поверх
-    // этих 68 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
+    // этих 69 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
     // фиксируем именно прямые регистрации, чтобы дробление не потеряло и не
     // задвоило ни одну из них.
     assert.strictEqual(tools.size, EXPECTED_TOOLS.length + 56,
-      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (68 прямых + 56 add-tools)`);
+      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (69 прямых + 56 add-tools)`);
     for (const expected of EXPECTED_TOOLS) {
       assert.ok(tools.has(expected.name), `должен быть зарегистрирован tool "${expected.name}"`);
     }
   });
 
-  test('ровно 68 прямых tool описаны в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
-    assert.strictEqual(EXPECTED_TOOLS.length, 68);
+  test('ровно 69 прямых tool описаны в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
+    assert.strictEqual(EXPECTED_TOOLS.length, 69);
     const uniqueNames = new Set(EXPECTED_TOOLS.map((tool) => tool.name));
     assert.strictEqual(uniqueNames.size, EXPECTED_TOOLS.length, 'имена tools в эталоне не должны повторяться');
   });

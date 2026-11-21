@@ -123,7 +123,7 @@ async function runLockChainWithUi(
   plan: RepositoryLockPlan
 ): Promise<boolean> {
   try {
-    const result = await runLockChain(services, target, node, recursive, plan);
+    const result = await runLockChain(services, target, node, recursive, plan, 'interactive');
     void vscode.window.showInformationMessage(describeRepositoryActionSuccess('lock', node.label ?? target.displayName));
     showRepositoryChainWarnings(result.warnings);
     return true;

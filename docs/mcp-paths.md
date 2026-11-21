@@ -649,7 +649,8 @@ MCP-инструменты принимают только канон. Люба�
 | `v8vscedit_repository_unlock` | Отмена захвата (чужой захват не снимается). | как `repository_status` |
 | `v8vscedit_update_database_configuration` | `/UpdateDBCfg`: применяет конфигурацию к БД; файлы проекта не загружает. | `Конфигурация` / `Расширение` (только корень) |
 | `v8vscedit_load_configuration_changes` | Загружает изменённые файлы проекта корня в базу; обязательный `updateDatabase` - обновлять ли конфигурацию БД. | `Конфигурация` / `Расширение` (только корень) |
-| `v8vscedit_execute_command` | Allowlist команд расширения: `refresh`, `importConfigurations`, `updateChangedConfigurations`. | — |
+| `v8vscedit_import_configurations` | Импорт конфигураций из базы в файлы проекта без окна выбора; `targets` обязателен: `'all'` или `[{ path, configuration? }]`. | `Конфигурация` / `Расширение` (только корень, пара `path` + `configuration`) |
+| `v8vscedit_execute_command` | Allowlist команд расширения: `refresh`, `importConfigurations` (= импорт всех конфигураций без окна и без участия человека, как `v8vscedit_import_configurations` с `targets: "all"`), `updateChangedConfigurations`. | — |
 
 Несколько инструментов (`create_epf`/`create_erf`/`validate_external_object`/
 `epf_bsp_*`/`cfe_borrow`/`cfe_diff`) работают с EPF/ERF/CFE по обычному
@@ -664,6 +665,14 @@ MCP-инструменты принимают только канон. Люба�
 `databaseConfigurationBehind` (признак «БД не обновлена», см.
 [architecture.md](./architecture.md#отставание-конфигурации-бд-infradatabasedatabaseconfiglag)).
 `updateChangedConfigurations` через `v8vscedit_execute_command` следует настройке `updateDatabaseAfterLoad`.
+
+**Импорт без участия человека.** `v8vscedit_import_configurations` принимает обязательный `targets` (без значения
+по умолчанию): `'all'` либо непустой массив `{ path: 'Конфигурация' | 'Расширение', configuration? }`. Адресуется
+только корень; расширение выбирается ПАРОЙ `path: 'Расширение'` + `configuration` - формы `Расширение.<Имя>` в
+каноне нет (она разбирается как модуль уровня конфигурации). Первичный импорт пустого `src/cf` (нет
+`Configuration.xml`, корня в дереве нет) возможен только через `'all'`. Порядок: основная конфигурация, затем
+расширения по алфавиту; на первой неудаче импорт останавливается. Полная форма ответа и режим unattended -
+[architecture.md](./architecture.md#неинтерактивные-операции-mcp-operationinteraction).
 
 ### 6.2. Инструменты обмена CF/CFE через пакетный Конфигуратор
 

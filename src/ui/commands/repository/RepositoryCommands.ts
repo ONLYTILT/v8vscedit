@@ -200,7 +200,7 @@ export function registerRepositoryCommands(
       const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
       const ok = await runWithConfigurationOperationLock(async () => {
         try {
-          const result = await runUnlockChain(services, target, repositoryNode, { recursive, force }, dirtyFilesCount);
+          const result = await runUnlockChain(services, target, repositoryNode, { recursive, force }, dirtyFilesCount, 'interactive');
           // Э24: освобождение чужого захвата — успех платформы без снятия; «освобождены» здесь было бы неправдой.
           if (result.unlockedObjects.length === 0 && result.notUnlocked.length > 0) {
             void vscode.window.showWarningMessage(describeUnlockNotDone(result.notUnlocked, result.lockedByOthers));
@@ -252,7 +252,7 @@ export function registerRepositoryCommands(
 
       const ok = await runWithConfigurationOperationLock(async () => {
         try {
-          const result = await runCommitChain(services, target, repositoryNode, formData, plan);
+          const result = await runCommitChain(services, target, repositoryNode, formData, plan, 'interactive');
           void vscode.window.showInformationMessage(
             describeRepositoryActionSuccess('commit', repositoryNode.label ?? target.displayName)
           );

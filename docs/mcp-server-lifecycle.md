@@ -172,9 +172,9 @@ Code к «SSE stream disconnected: TimeoutError», затем «response presume
 
 ### Какие инструменты долгие
 
-Через `gate.wrapLongRunning(toolName, extra, fn)` (`ui/mcp/registration/McpMutationGate.ts`) идут 11
+Через `gate.wrapLongRunning(toolName, extra, fn)` (`ui/mcp/registration/McpMutationGate.ts`) идут 12
 инструментов: `repository_lock`, `repository_update`, `repository_commit`, `repository_unlock`,
-`update_database_configuration`, `dump_cf`, `load_cf`, `dump_all_cfe`, `load_all_cfe`, `load_configuration_changes`, `execute_command`.
+`update_database_configuration`, `dump_cf`, `load_cf`, `dump_all_cfe`, `load_all_cfe`, `load_configuration_changes`, `import_configurations`, `execute_command`.
 Без `extra` (старые тесты с фейковым сервером) обёртка эквивалентна `wrapAsync`. Новый долгий инструмент —
 только так, не через `wrapAsync`.
 

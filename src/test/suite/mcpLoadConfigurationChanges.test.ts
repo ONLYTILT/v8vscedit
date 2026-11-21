@@ -157,6 +157,34 @@ suite('v8vscedit_load_configuration_changes', function () {
     assert.strictEqual(isConfigurationOperationRunning(), false);
   });
 
+  test('режим unattended: раннер получает interaction=unattended (вопросы агента и batch-fallback не показывают окон)', async () => {
+    parse(await run({ path: 'Конфигурация', updateDatabase: false }));
+    assert.strictEqual(p.updateOptions().interaction, 'unattended');
+  });
+
+  test('платформа вернула неуспех С причиной (onFailure): isError с причиной вместо «Подробности — в журнале»', async () => {
+    p.updateResult = false;
+    p.loadFailureReason = 'Загрузка отменена; база и проект не изменены. Выполните загрузку из интерфейса VS Code.';
+
+    const result = await run({ path: 'Конфигурация', updateDatabase: true });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(text(result), p.loadFailureReason);
+    assert.ok(!text(result).includes('Подробности — в журнале'), text(result));
+    assert.deepStrictEqual(p.cleaned, []);
+    assert.strictEqual(isConfigurationOperationRunning(), false);
+  });
+
+  test('пустая причина отказа не публикуется: isError с общим текстом про журнал', async () => {
+    p.updateResult = false;
+    p.loadFailureReason = '';
+
+    const result = await run({ path: 'Конфигурация', updateDatabase: true });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(text(result), 'Загрузка изменений в базу не выполнена. Подробности — в журнале «1С Редактор».');
+  });
+
   test('не корень (объект): ошибка с ТЕМ ЖЕ текстом, что у resolveConfigurationXmlByCanonical; раннер не вызывался', async () => {
     let expected = '';
     try {

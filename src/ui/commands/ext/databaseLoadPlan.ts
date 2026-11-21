@@ -6,6 +6,7 @@ import type {
   DatabaseLagTarget,
 } from '../../../infra/database/DatabaseConfigLag';
 import type { ChangedConfiguration } from '../../../infra/fs/ConfigurationChangeDetector';
+import type { OperationInteraction } from './configurationOperationTypes';
 
 /**
  * Чистые решения загрузки изменений в базу с обновлением конфигурации БД и без него. Без `vscode`: вектор
@@ -90,6 +91,22 @@ export interface DatabaseLoadOptions {
   readonly silent?: boolean;
   /** Исход успешной операции; при отказе не вызывается. */
   readonly onOutcome?: (outcome: DatabaseLoadOutcome) => void;
+  /** По умолчанию interactive. unattended — без окон и тостов (подразумевает silent), вопрос = отказ. */
+  readonly interaction?: OperationInteraction;
+  /** Причина отказа (агент, CLI, отказ unattended); при успехе не вызывается. */
+  readonly onFailure?: (reason: string) => void;
+}
+
+/** Без уведомлений: явный `silent` или вызов без участия человека. */
+export function isSilentLoad(options: Pick<DatabaseLoadOptions, 'silent' | 'interaction'>): boolean {
+  return options.silent === true || options.interaction === 'unattended';
+}
+
+/** Текст отказа от полной загрузки (запасной путь пакетного режима), когда подтвердить её некому. */
+export function describeUnattendedFullLoadRefusal(targetLabel: string, failureReason: string): string {
+  const reason = failureReason ? `: ${failureReason}` : '';
+  return `Быстрая загрузка изменений ${targetLabel} не выполнена${reason}. Полная загрузка перезаписывает ` +
+    'конфигурацию базы и без подтверждения человека не запускается: выполните «Обновить в базе» из интерфейса VS Code.';
 }
 
 /** Причина отставания по режиму: без обновления — намеренно, с обновлением — обновление не завершилось. */

@@ -28,6 +28,8 @@ import { FakeLagRecorder } from './databaseLagFakes';
 import { removeTreeSync } from './tempTree';
 import type { DatabaseConfigLagRecorder, DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
 import type { DatabaseLoadOptions } from '../../../ui/commands/ext/databaseLoadPlan';
+import type { ConfigEntry } from '../../../domain/Configuration';
+import type { ConfigurationImportOptions, OperationInteraction } from '../../../ui/commands/ext/configurationOperationTypes';
 
 export const BEGIN = '---- Начало операции с хранилищем конфигурации ----';
 export const END = '---- Операция с хранилищем конфигурации завершена ----';
@@ -108,7 +110,17 @@ export interface RepoProject {
   /** Признак «БД отстаёт» — в памяти; тот же объект лежит в `services.databaseConfigLag`. */
   readonly lag: FakeLagRecorder;
   /** Опции раннера загрузки по порядку вызовов. */
-  updateOptions(index?: number): { updateDatabase: boolean; lag: DatabaseConfigLagRecorder };
+  updateOptions(index?: number): { updateDatabase: boolean; lag: DatabaseConfigLagRecorder; interaction?: OperationInteraction };
+  /** Записи дерева (`treeProvider.getEntries()`): по умолчанию основная конфигурация и расширение «Расш». */
+  entries: ConfigEntry[];
+  /** Состояния `setTreeProcessingState` по порядку (последнее `{ active: false }` — прогресс погашен). */
+  processing: unknown[];
+  /** Причина отказа, которую заглушка импорта сообщает в `options.onOutcome` при `importResult === false`. */
+  importFailureReason?: string;
+  /** Причина отказа, которую заглушка загрузки сообщает в `options.onFailure` при `updateResult === false`. */
+  loadFailureReason?: string;
+  /** Опции (`{ interaction, onOutcome }`) раннера импорта по порядку вызовов (6-й параметр). */
+  importOptions(index?: number): ConfigurationImportOptions | undefined;
   /** Результат исполнителя для ЛЮБОЙ операции хранилища. */
   result: DesignerBatchResult;
   updateResult: boolean;
@@ -206,7 +218,10 @@ export async function createRepoProject(): Promise<RepoProject> {
     runs: [], events: [], lockHeldAt: {}, changed: [], cleaned: [],
     reloads: 0, refreshes: 0, actionViewRefreshes: 0, suppressCalls: [], markChangedCalls: [],
     disposedExecutors: 0, importCalls: [], applyCalls: [], updateCalls: [], lag: new FakeLagRecorder(),
-    updateOptions(index = 0) { return project.updateCalls[index][6] as { updateDatabase: boolean; lag: DatabaseConfigLagRecorder }; },
+    entries: [],
+    processing: [],
+    importOptions(index = 0) { return project.importCalls[index][5] as ConfigurationImportOptions | undefined; },
+    updateOptions(index = 0) { return project.updateCalls[index][6] as { updateDatabase: boolean; lag: DatabaseConfigLagRecorder; interaction?: OperationInteraction }; },
     result: { exitCode: 0, log: '', outputs: new Map() },
     updateResult: true, importResult: true, applyResult: true, loadWarnings: [],
     toasts: [],
@@ -279,6 +294,9 @@ export async function createRepoProject(): Promise<RepoProject> {
   // «без обновления» — ставит (загрузка прошла, UpdateDBCfg не выполнялся).
   const settleLag = (target: DatabaseLagTarget, options: DatabaseLoadOptions): void => {
     if (!project.updateResult) {
+      if (project.loadFailureReason !== undefined) {
+        options.onFailure?.(project.loadFailureReason);
+      }
       return;
     }
     // Исход успешной загрузки для MCP (фактическое обновление БД, предупреждения сверки).
@@ -288,6 +306,13 @@ export async function createRepoProject(): Promise<RepoProject> {
     } else {
       options.lag.markBehind(target, 'load-without-update');
     }
+  };
+  // Заглушка повторяет контракт раннера: исход уходит в `options.onOutcome` ровно один раз.
+  const reportImportOutcome = (args: unknown[]): void => {
+    const options = args[5] as ConfigurationImportOptions | undefined;
+    options?.onOutcome?.(project.importResult
+      ? { success: true, warnings: [] }
+      : { success: false, reason: project.importFailureReason, warnings: [] });
   };
   runnerRef.runUpdateMainConfiguration = (...args: unknown[]) => {
     project.events.push('update:cf'); held('update:cf'); project.updateCalls.push(args);
@@ -302,11 +327,13 @@ export async function createRepoProject(): Promise<RepoProject> {
   };
   runnerRef.runDecompileMainConfiguration = (...args: unknown[]) => {
     project.events.push('import:cf'); held('import:cf'); project.importCalls.push(args);
+    reportImportOutcome(args);
     return Promise.resolve(project.importResult);
   };
   runnerRef.runDecompileExtension = (...args: unknown[]) => {
     const event = `import:cfe:${String(args[0])}`;
     project.events.push(event); held(event); project.importCalls.push(args);
+    reportImportOutcome(args);
     return Promise.resolve(project.importResult);
   };
   runnerRef.runApplyDatabaseConfiguration = (...args: unknown[]) => {
@@ -324,12 +351,15 @@ export async function createRepoProject(): Promise<RepoProject> {
     warnings: [],
   });
 
+  project.entries = [{ kind: 'cf', rootPath: cfRoot }, { kind: 'cfe', rootPath: cfeRoot }];
   (project as { services: CommandServices }).services = {
     workspaceFolder: { uri: vscode.Uri.file(root), name: 'repo-mcp', index: 0 },
     outputChannel: { appendLine: () => undefined, show: () => undefined } as unknown as vscode.OutputChannel,
     repositoryService: service,
     projectSecretStorage: secrets,
-    treeProvider: { refresh: () => { project.refreshes += 1; } },
+    treeProvider: { refresh: () => { project.refreshes += 1; }, getEntries: () => project.entries },
+    setTreeProcessingState: (state: unknown) => { project.processing.push(state); },
+    standaloneServerService: { refreshHealth: () => Promise.resolve({ configured: false, state: 'stopped' }) },
     refreshActionsView: () => { project.actionViewRefreshes += 1; },
     getChangedConfigurations: () => Promise.resolve(project.changed),
     markConfigurationsClean: (roots: string[]) => { project.cleaned.push(roots); },

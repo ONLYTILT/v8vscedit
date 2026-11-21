@@ -1,3 +1,4 @@
+import type { OperationInteraction } from '../ext/configurationOperationTypes';
 import { formatRepositoryLockName, type RepositoryNodeRef, type RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { LockedByOther } from '../../../infra/repository/RepositoryLockLog';
 import {
@@ -60,6 +61,26 @@ const LOAD_BEFORE_COMMIT_FAILED =
   'Загрузка правок проекта в базу не выполнена; помещение не выполнялось. Подробности — в журнале «1С Редактор».';
 
 /**
+ * Текст отказа шага с причиной раннера. В interactive причину уже показал сам раннер (тост), тексты UI
+ * прежние; в unattended тостов нет, и без причины агент получил бы лишь «подробности — в журнале».
+ */
+export function describeChainStepFailure(base: string, reason: string | undefined, interaction: OperationInteraction): string {
+  return interaction === 'unattended' && reason ? `${base} Причина: ${reason}` : base;
+}
+
+/** Шаг синхронизации цепочки с запоминанием причины отказа раннера. */
+function chainStep(interaction: OperationInteraction): {
+  readonly options: { readonly interaction: OperationInteraction; readonly onFailure: (reason: string) => void };
+  describe(base: string): string;
+} {
+  let reason: string | undefined;
+  return {
+    options: { interaction, onFailure: (value) => { reason = value; } },
+    describe: (base) => describeChainStepFailure(base, reason, interaction),
+  };
+}
+
+/**
  * Поля признака «БД отстаёт» в результатах цепочек: `databaseConfigurationUpdated` — шаг загрузки цепочки
  * выполнен С обновлением БД; `databaseConfigurationBehind` — признак цели в конце цепочки (оба могут быть
  * true: UpdateDBCfg до захвата не покрывает версии, полученные захватом позже).
@@ -104,15 +125,17 @@ export async function runLockChain(
   target: RepositoryTarget,
   node: RepositoryNodeRef,
   recursive: boolean,
-  plan: RepositoryLockPlan
+  plan: RepositoryLockPlan,
+  interaction: OperationInteraction
 ): Promise<LockChainResult> {
   const requestedObjects = services.repositoryService.buildObjectsSelectionForNode(node, recursive).fullNames;
+  const load = chainStep(interaction);
   // Сбой загрузки (в т.ч. отказ платформы загрузить незахваченный объект) — захвата не было.
   if (plan.updateDatabaseFirst
-    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
-    throw new RepositoryStepFailedError(LOAD_BEFORE_LOCK_FAILED);
+    && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
+    throw new RepositoryStepFailedError(load.describe(LOAD_BEFORE_LOCK_FAILED));
   }
-  const outcome = await executeRepositoryLockAction(toCliServices(services), node, recursive, { revised: plan.revised });
+  const outcome = await executeRepositoryLockAction(toCliServices(services, interaction), node, recursive, { revised: plan.revised });
   if (outcome.receivedFromRepository) {
     markReceivedFromRepository(services, target);
   }
@@ -120,10 +143,11 @@ export async function runLockChain(
   let projectImported = false;
   let projectBehind = false;
   if (shouldImportAfterLock(plan, outcome)) {
-    projectImported = await importTargetFromDatabase(target, services);
+    const step = chainStep(interaction);
+    projectImported = await importTargetFromDatabase(target, services, step.options);
     if (!projectImported) {
       projectBehind = true;
-      warnings.push(describeImportFailureAfterLock(target.displayName));
+      warnings.push(step.describe(describeImportFailureAfterLock(target.displayName)));
     }
   } else if (!plan.importAfterLock && outcome.receivedFromRepository) {
     projectBehind = true;
@@ -155,22 +179,24 @@ export async function runUpdateChain(
   target: RepositoryTarget,
   node: RepositoryNodeRef,
   request: { readonly recursive: boolean; readonly force: boolean; readonly version?: string },
-  plan: RepositoryUpdatePlan
+  plan: RepositoryUpdatePlan,
+  interaction: OperationInteraction
 ): Promise<UpdateChainResult> {
-  const outcome = await executeRepositoryUpdateAction(toCliServices(services), node, request);
+  const outcome = await executeRepositoryUpdateAction(toCliServices(services, interaction), node, request);
   const received = outcome.receivedFromRepository;
   if (received) {
     markReceivedFromRepository(services, target);
   }
+  const load = chainStep(interaction);
   if (plan.loadChangesAfterReceive
-    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
+    && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
     // Импорт перезаписал бы незагруженные правки проекта — не выполняется; получение уже успешно.
     return {
       receivedFromRepository: received,
       changesLoadedAfter: false,
       projectImported: false,
       projectBehind: received,
-      warnings: [describeLoadFailureAfterReceive(target.displayName)],
+      warnings: [load.describe(describeLoadFailureAfterReceive(target.displayName))],
       ...databaseLagFields(services, target, false),
     };
   }
@@ -178,10 +204,11 @@ export async function runUpdateChain(
   let projectImported = false;
   let projectBehind = false;
   if (shouldImportAfterReceive(plan, outcome)) {
-    projectImported = await importTargetFromDatabase(target, services);
+    const step = chainStep(interaction);
+    projectImported = await importTargetFromDatabase(target, services, step.options);
     if (!projectImported) {
       projectBehind = true;
-      warnings.push(describeImportFailureAfterReceive(target.displayName));
+      warnings.push(step.describe(describeImportFailureAfterReceive(target.displayName)));
     }
   } else if (!plan.importAfterReceive && received) {
     projectBehind = true;
@@ -212,22 +239,25 @@ export async function runCommitChain(
   target: RepositoryTarget,
   node: RepositoryNodeRef,
   request: { readonly recursive: boolean; readonly comment: string; readonly keepLocked: boolean; readonly force: boolean },
-  plan: RepositoryCommitPlan
+  plan: RepositoryCommitPlan,
+  interaction: OperationInteraction
 ): Promise<CommitChainResult> {
+  const load = chainStep(interaction);
   if (plan.updateDatabaseFirst
-    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
-    throw new RepositoryStepFailedError(LOAD_BEFORE_COMMIT_FAILED);
+    && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
+    throw new RepositoryStepFailedError(load.describe(LOAD_BEFORE_COMMIT_FAILED));
   }
-  const outcome = await executeRepositoryCommitAction(toCliServices(services), node, request);
+  const outcome = await executeRepositoryCommitAction(toCliServices(services, interaction), node, request);
   if (outcome.referencesCleaned) {
     markReceivedFromRepository(services, target);
   }
   const warnings: string[] = [];
   let projectImported = false;
   if (shouldImportAfterCommit(outcome)) {
-    projectImported = await importTargetFromDatabase(target, services);
+    const step = chainStep(interaction);
+    projectImported = await importTargetFromDatabase(target, services, step.options);
     if (!projectImported) {
-      warnings.push(describeImportFailureAfterCommit(target.displayName));
+      warnings.push(step.describe(describeImportFailureAfterCommit(target.displayName)));
     }
   }
   if (outcome.committedFullNames.length === 0) {
@@ -257,9 +287,10 @@ export async function runUnlockChain(
   target: RepositoryTarget,
   node: RepositoryNodeRef,
   request: { readonly recursive: boolean; readonly force: boolean },
-  dirtyFilesCount: number
+  dirtyFilesCount: number,
+  interaction: OperationInteraction
 ): Promise<UnlockChainResult> {
-  const outcome = await executeRepositoryUnlockAction(toCliServices(services), node, request.recursive, request.force);
+  const outcome = await executeRepositoryUnlockAction(toCliServices(services, interaction), node, request.recursive, request.force);
   const warnings = dirtyFilesCount > 0 && outcome.unlocked.length > 0
     ? [describeUnloadedChangesAfterUnlock(target.displayName, dirtyFilesCount)]
     : [];

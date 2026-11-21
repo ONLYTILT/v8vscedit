@@ -1,8 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { ConfigEntry } from '../../../domain/Configuration';
-import { parseConfigXml } from '../../../infra/xml';
 import type { CommandServices, NodeArg } from '../_shared';
 import {
   type ConfigurationImportHooks,
@@ -21,25 +19,23 @@ import { describeExtensionListFailure, listConnectedDatabaseExtensions } from '.
 import { getAgentExecutionMode } from './agent/agentSettings';
 import { planExtensionChoices } from '../../../infra/environment';
 import { removeTreeSync } from '../../../infra/fs/TreeRemoval';
-import {
-  endConfigurationOperation,
-  isConfigurationOperationRunning,
-  tryBeginConfigurationOperation,
-} from './configurationOperationLock';
+import { endConfigurationOperation, tryBeginConfigurationOperation } from './configurationOperationLock';
+import type { OperationInteraction } from './configurationOperationTypes';
+import { isDirectory, type ImportTarget } from './importTargets';
 
 interface ActionItem extends vscode.QuickPickItem {
   actionId: 'import' | 'update' | 'compileAndUpdateExt';
 }
 
-interface ImportTarget {
-  kind: 'cf' | 'cfe';
-  name: string;
-  rootPath: string;
+export interface RootConfigurationTarget extends ImportTarget {
+  readonly extensionName?: string;
 }
 
-export interface RootConfigurationTarget extends ImportTarget {
-  extensionName?: string;
-}
+/** Сервисы прогресса и автономного сервера: узко, чтобы MCP (без aiMcpViewProvider) мог их передать. */
+export type ConfigurationUiServices = Pick<
+  CommandServices,
+  'setTreeProcessingState' | 'outputChannel' | 'standaloneServerService' | 'refreshActionsView' | 'suppressConfigurationReloadForFiles'
+>;
 
 /** Регистрирует команды управления расширением 1С. */
 export function registerExtensionCommands(
@@ -47,91 +43,6 @@ export function registerExtensionCommands(
   services: CommandServices
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('v8vscedit.importConfigurations', async () => {
-      if (isConfigurationOperationRunning()) {
-        await showOperationAlreadyRunningMessage();
-        return;
-      }
-
-      const targets = collectImportTargets(
-        services.treeProvider.getEntries(),
-        services.workspaceFolder.uri.fsPath
-      );
-      if (targets.length === 0) {
-        await vscode.window.showWarningMessage('Нет каталога src/cf для импорта основной конфигурации.');
-        return;
-      }
-
-      const selected = await pickImportTargets(targets);
-      if (!selected || selected.length === 0) {
-        return;
-      }
-
-      if (!await tryBeginConfigurationOperation()) {
-        await showOperationAlreadyRunningMessage();
-        return;
-      }
-      beginConfigurationProgress(services, 'Импорт конфигураций', 'подготовка');
-      await yieldToUi();
-      const completedRootPaths: string[] = [];
-      try {
-        const ok = await runWithStandaloneServerStopped(services, 'Импорт конфигураций', async () => {
-          const ordered = orderImportTargets(selected);
-          for (let index = 0; index < ordered.length; index += 1) {
-            const target = ordered[index];
-            setConfigurationProgress(
-              services,
-              'Импорт конфигураций',
-              `${String(index + 1)}/${String(ordered.length)}: ${target.name}`,
-              true
-            );
-            const progressPrefix = `${String(index + 1)}/${String(ordered.length)}: ${target.name}`;
-            const hooks = createImportHooks(services, 'Импорт конфигураций', progressPrefix);
-            const imported = target.kind === 'cf'
-              ? await runDecompileMainConfiguration(
-                  target.name,
-                  target.rootPath,
-                  services.workspaceFolder,
-                  services.outputChannel,
-                  hooks
-                )
-              : await runDecompileExtension(
-                  target.name,
-                  target.rootPath,
-                  services.workspaceFolder,
-                  services.outputChannel,
-                  hooks
-                );
-
-            if (!imported) {
-              setConfigurationProgress(services, 'Импорт конфигураций', `остановлено на "${target.name}"`, false);
-              return false;
-            }
-            completedRootPaths.push(target.rootPath);
-          }
-
-          if (ordered.length > 1) {
-            void vscode.window.showInformationMessage(`Импортировано конфигураций: ${String(ordered.length)}.`);
-          }
-          setConfigurationProgress(services, 'Импорт конфигураций', 'обновление дерева метаданных', true);
-          await yieldToUi();
-          await services.reloadEntries();
-          setConfigurationProgress(services, 'Импорт конфигураций', 'завершено', false);
-          return true;
-        });
-        if (!ok) {
-          return;
-        }
-      } catch (error) {
-        setConfigurationProgress(services, 'Импорт конфигураций', 'ошибка', false);
-        showConfigurationCommandError('Ошибка импорта конфигураций.', error, services);
-      } finally {
-        await endConfigurationOperation();
-        services.markConfigurationsClean(completedRootPaths);
-        clearConfigurationProgress(services);
-      }
-    }),
-
     vscode.commands.registerCommand('v8vscedit.connectExtension', async () => {
       /* c8 ignore next -- строка вызова vscode-команды; не юнит-тестируется без полного харнесса CommandServices, ветвящаяся логика выбора имени — в planExtensionChoices (покрыта на 100%) */
       const normalizedExtensionName = await resolveExtensionNameToConnect(services);
@@ -387,11 +298,24 @@ export function registerExtensionCommands(
   );
 }
 
+/**
+ * Автономный сервер держит базу: на время операции он останавливается и после успеха запускается снова.
+ * В unattended тосты о неудачном перезапуске не показываются — тексты уходят в `onWarning` (ответ MCP).
+ */
 export async function runWithStandaloneServerStopped(
-  services: CommandServices,
+  services: ConfigurationUiServices,
   operationTitle: string,
-  operation: () => Promise<boolean>
+  operation: () => Promise<boolean>,
+  interaction: OperationInteraction = 'interactive',
+  onWarning?: (text: string) => void
 ): Promise<boolean> {
+  const warn = (text: string, toast: (message: string) => unknown): void => {
+    if (interaction === 'unattended') {
+      onWarning?.(text);
+    } else {
+      void toast(text);
+    }
+  };
   const status = await services.standaloneServerService.refreshHealth();
   const shouldRestart = status.configured && (
     status.state === 'running' || status.state === 'unresponsive'
@@ -426,15 +350,17 @@ export async function runWithStandaloneServerStopped(
           `[standalone] После операции "${operationTitle}": state=${restartedStatus.state}, pid=${String(restartedStatus.pid ?? '-')}, url=${restartedStatus.url ?? '-'}`
         );
         if (restartedStatus.state !== 'running') {
-          void vscode.window.showWarningMessage(
-            `Операция "${operationTitle}" выполнена, но автономный сервер не перешёл в состояние "запущен": ${restartedStatus.message}`
+          warn(
+            `Операция "${operationTitle}" выполнена, но автономный сервер не перешёл в состояние "запущен": ${restartedStatus.message}`,
+            (message) => vscode.window.showWarningMessage(message)
           );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         services.outputChannel.appendLine(`[standalone][error] Не удалось запустить сервер после операции "${operationTitle}": ${message}`);
-        void vscode.window.showErrorMessage(
-          `Операция "${operationTitle}" выполнена, но автономный сервер не запустился.\n${message}`
+        warn(
+          `Операция "${operationTitle}" выполнена, но автономный сервер не запустился.\n${message}`,
+          (text) => vscode.window.showErrorMessage(text)
         );
       } finally {
         setConfigurationProgress(services, operationTitle, 'завершено', false);
@@ -444,47 +370,12 @@ export async function runWithStandaloneServerStopped(
       services.outputChannel.appendLine(`[standalone] Операция "${operationTitle}" завершилась неуспешно, автономный сервер не запускается.`);
       setConfigurationProgress(services, operationTitle, 'остановлено', false);
       services.refreshActionsView();
+      // Человек видит остановленный сервер в панели; агенту MCP об этом сообщает только ответ.
+      if (interaction === 'unattended') {
+        onWarning?.(`Автономный сервер остановлен и не перезапущен: операция "${operationTitle}" завершилась с ошибкой.`);
+      }
     }
   }
-}
-
-function collectImportTargets(entries: ConfigEntry[], workspaceRoot: string): ImportTarget[] {
-  const targets = entries.map((entry) => {
-    const name = readConfigName(entry);
-    return {
-      kind: entry.kind,
-      name,
-      rootPath: entry.rootPath,
-    };
-  });
-  appendInitialMainConfigurationTarget(targets, workspaceRoot);
-  return targets.sort((left, right) => {
-    if (left.kind !== right.kind) {
-      return left.kind === 'cf' ? -1 : 1;
-    }
-    return left.name.localeCompare(right.name);
-  });
-}
-
-function appendInitialMainConfigurationTarget(targets: ImportTarget[], workspaceRoot: string): void {
-  const mainConfigRoot = path.join(workspaceRoot, 'src', 'cf');
-  if (!isDirectory(mainConfigRoot)) {
-    return;
-  }
-
-  const normalizedRoot = path.resolve(mainConfigRoot).toLowerCase();
-  const hasMainConfig = targets.some((target) =>
-    target.kind === 'cf' && path.resolve(target.rootPath).toLowerCase() === normalizedRoot
-  );
-  if (hasMainConfig) {
-    return;
-  }
-
-  targets.push({
-    kind: 'cf',
-    name: 'Основная конфигурация',
-    rootPath: mainConfigRoot,
-  });
 }
 
 function getConnectedExtensionRoots(services: CommandServices, extensionRoot: string): string[] {
@@ -497,27 +388,6 @@ function getConnectedExtensionRoots(services: CommandServices, extensionRoot: st
   roots.add(extensionRoot);
   return [...roots];
 }
-
-function readConfigName(entry: ConfigEntry): string {
-  try {
-    const info = parseConfigXml(path.join(entry.rootPath, 'Configuration.xml'));
-    if (info.name) {
-      return info.name;
-    }
-  } catch {
-    // При повреждённом XML оставляем путь как диагностически полезное имя в списке выбора.
-  }
-  return path.basename(entry.rootPath);
-}
-
-function isDirectory(directoryPath: string): boolean {
-  try {
-    return fs.statSync(directoryPath).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
 
 /**
  * Определяет имя расширения для подключения ТОЛЬКО из списка расширений базы,
@@ -582,7 +452,7 @@ export function yieldToUi(): Promise<void> {
 export function showConfigurationCommandError(
   title: string,
   error: unknown,
-  services: CommandServices
+  services: ConfigurationUiServices
 ): void {
   const message = error instanceof Error ? error.message : String(error);
   services.outputChannel.appendLine(`[actions][error] ${title} ${message}`);
@@ -597,7 +467,7 @@ export function showConfigurationCommandError(
  * Начало операции с конфигурацией: единственная точка инкремента счётчика активных
  * операций статус-бара. Парная точка — {@link clearConfigurationProgress} в finally.
  */
-export function beginConfigurationProgress(services: CommandServices, title: string, message: string): void {
+export function beginConfigurationProgress(services: ConfigurationUiServices, title: string, message: string): void {
   beginConfigurationOperationStatus(title, message);
   services.setTreeProcessingState({ active: true, title, message });
 }
@@ -609,7 +479,7 @@ export function beginConfigurationProgress(services: CommandServices, title: str
  * сюда как текст; фактический декремент выполняет clearConfigurationProgress в finally.
  */
 export function setConfigurationProgress(
-  services: CommandServices,
+  services: ConfigurationUiServices,
   title: string,
   message: string,
   running: boolean
@@ -622,13 +492,13 @@ export function setConfigurationProgress(
  * Завершение операции: единственная точка декремента счётчика активных операций
  * (парная к beginConfigurationProgress). Вызывается из finally каждой команды.
  */
-export function clearConfigurationProgress(services: CommandServices): void {
+export function clearConfigurationProgress(services: ConfigurationUiServices): void {
   endConfigurationOperationStatus();
   services.setTreeProcessingState({ active: false });
 }
 
-function createImportHooks(
-  services: CommandServices,
+export function createImportHooks(
+  services: ConfigurationUiServices,
   title: string,
   messagePrefix?: string
 ): ConfigurationImportHooks {
@@ -641,7 +511,7 @@ function createImportHooks(
 }
 
 export function createProgressHooks(
-  services: CommandServices,
+  services: ConfigurationUiServices,
   title: string,
   messagePrefix?: string
 ): ConfigurationProgressHooks {
@@ -658,7 +528,7 @@ interface ImportTargetPickItem extends vscode.QuickPickItem {
   selectAll?: boolean;
 }
 
-async function pickImportTargets(
+export async function pickImportTargets(
   targets: ImportTarget[]
 ): Promise<ImportTarget[] | undefined> {
   return new Promise((resolve) => {
@@ -732,15 +602,6 @@ async function pickImportTargets(
       }
     });
     quickPick.show();
-  });
-}
-
-function orderImportTargets(targets: ImportTarget[]): ImportTarget[] {
-  return [...targets].sort((left, right) => {
-    if (left.kind !== right.kind) {
-      return left.kind === 'cf' ? -1 : 1;
-    }
-    return left.name.localeCompare(right.name);
   });
 }
 
