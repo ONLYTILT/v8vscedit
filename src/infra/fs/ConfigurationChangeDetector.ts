@@ -19,7 +19,7 @@ export interface ChangedConfiguration {
 
 export interface ConfigurationChangeDetectorOptions {
   /** Шов быстрой проверки (ФС и часы) — для тестов; отчёт прохода детектор формирует сам. */
-  readonly scan?: Omit<HashScanOptions, 'onReport'>;
+  readonly scan?: Omit<HashScanOptions, 'onReport' | 'signal'>;
   readonly log?: (line: string) => void;
 }
 
@@ -49,16 +49,21 @@ export class ConfigurationChangeDetector {
    * Первичная инициализация базовой линии (бывший `ensureCaches`) выполняется здесь же, в том же
    * прогоне, — так порядок «кэш создан → сравнение» соблюдается по построению, а single-flight
    * (`ChangeDetectionRunner`) исключает параллельный прогон, читающий недописанный кэш.
+   *
+   * `signal` прерывает проверку (`ChangeDetectionRunner.discard`): между конфигурациями, внутри прохода
+   * и перед первичной записью базовой линии — прерванный проход её не инициализирует.
    */
-  async detect(entries: readonly ConfigEntry[]): Promise<ChangedConfiguration[]> {
+  async detect(entries: readonly ConfigEntry[], signal?: AbortSignal): Promise<ChangedConfiguration[]> {
     const result: ChangedConfiguration[] = [];
     const log = this.options.log;
 
     for (const entry of entries) {
+      signal?.throwIfAborted();
       const scope = this.resolveScope(entry);
       const previous = loadHashCache(this.projectRoot, scope.scopeKey);
       const current = await scanHashSnapshot(this.projectRoot, scope.scopeKey, entry.rootPath, {
         ...this.options.scan,
+        signal,
         onReport: (report) => {
           log?.(
             `[hash-cache] ${scope.name}: файлов ${String(report.files)}, перехешировано ${String(report.hashed)} `
@@ -68,6 +73,7 @@ export class ConfigurationChangeDetector {
       });
 
       if (!hasHashBaseline(previous)) {
+        signal?.throwIfAborted();
         // Базовую линию мог записать CLI (импорт) за время прохода — её нельзя затирать снимком,
         // снятым до импорта. В обоих случаях этот проход изменений не сообщает: сравнивать не с чем.
         if (!hasHashBaseline(loadHashCache(this.projectRoot, scope.scopeKey))) {

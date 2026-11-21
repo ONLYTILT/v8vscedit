@@ -62,7 +62,7 @@ async function loadWithPlan(context: SyncOperationContext, mode: AgentLoadMode):
   if (!fs.existsSync(projectDir)) {
     throw new Error(`${mode === 'full' ? 'Каталог источника не найден' : 'Каталог исходников не найден'}: ${projectDir}`);
   }
-  const files = await buildSyncManifestFiles(projectDir, context.projectRoot);
+  const files = await buildSyncManifestFiles(projectDir, context.projectRoot, context.hashScan);
   const storeKind = context.store.kind;
   const fullVia = storeKind === 'local' ? 'dir' : 'archive';
   if (mode === 'full') {

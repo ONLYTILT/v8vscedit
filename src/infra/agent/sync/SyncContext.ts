@@ -2,6 +2,7 @@ import type { AgentCommandExecutor } from '../AgentInfoBaseSession';
 import type { AgentConfigurationOperationTarget, AgentOperationHooks } from '../AgentOperationService';
 import type { AgentWorkspacePaths, AgentWorkspaceService } from '../AgentWorkspaceService';
 import type { AgentFileStore } from '../files/AgentFileStore';
+import type { HashScanOptions } from '../../cache/HashScanner';
 import { AgentTransferCancelledError, type AgentTransferOptions } from '../files/AgentFileTransfer';
 import type { LocalExchange } from './LocalExchange';
 import type { SyncManifest, SyncMirrorCoverage } from './SyncManifest';
@@ -86,6 +87,11 @@ export interface SyncOperationContext {
    * B, и следующий импорт обязан идти полным путём (`mirrorState: 'empty'`).
    */
   markMirrorMutated(): void;
+  /**
+   * Шов ФС/часов быстрой проверки P (тесты считают обращения). Передают ВСЕ снимки P внутри операции и
+   * построение B, иначе счётчики разошлись бы с реальным числом проходов.
+   */
+  readonly hashScan?: Omit<HashScanOptions, 'onReport' | 'signal'>;
 }
 
 export function throwIfCancelled(context: Pick<SyncOperationContext, 'hooks'>): void {

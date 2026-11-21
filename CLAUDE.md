@@ -168,10 +168,14 @@ src/
 │   │   │                              # для расширения и CLI (cli/core/projectLayout.ts —
 │   │   │                              # тонкий re-export)
 │   │   ├── ConfigurationCleanWindow.ts # окно тишины по корню конфигурации после
-│   │   │                              # импорта/обновления БД (Container.markConfigurationsClean,
-│   │   │                              # см. docs/architecture.md)
+│   │   │                              # импорта/обновления БД (владеет ChangeDetectionScheduler;
+│   │   │                              # Container.markConfigurationsClean, см. docs/architecture.md)
+│   │   ├── ChangeDetectionScheduler.ts # окно тишины + ОДИН проход settle (~16 с) + отложенные
+│   │   │                              # запросы + flush («Обновить конфигурации»); заменил cleanWindow
+│   │   │                              # и settle-таймер в Container
 │   │   └── ChangeDetectionRunner.ts  # single-flight фоновой проверки изменений: request/
-│   │                                  # invalidate/whenIdle/dispose (Container.changeDetection)
+│   │                                  # invalidate (без abort)/discard (abort без повтора)/whenIdle/dispose
+│   │                                  # (Container.changeDetection)
 │   ├── cfe/                          # расширения: CfeBorrowService, CfeDiffService, CfePatchMethodService
 │   ├── support/                      # ParentConfigurationsParser (чистый разбор bin), SupportMode,
 │   │                                  # SupportInfoService (кэш + режим по пути), SupportFiles (имена файлов
@@ -180,6 +184,7 @@ src/
 │   ├── cache/                        # MetadataCache; хеш-кэш выгрузки: HashCache (базовая линия
 │   │                                  # .v8vscedit/cache), HashStatMemo (stat-мемо .v8vscedit/hash-stat),
 │   │                                  # HashScanner (scanHashSnapshot — быстрый async-проход;
+│   │                                  # hashTrackedFiles — точечное перехеширование известных путей;
 │   │                                  # docs/architecture.md, «Хеш-кэш: базовая линия и stat-мемо»)
 │   ├── repository/                   # хранилище 1С, локальные захваты; RepositoryLockLog — разбор лога захвата
 │   ├── git/                          # статус Git для узлов метаданных (GitMetadataStatusService,
@@ -567,7 +572,14 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   первичной инициализации, если линии нет. Stat-отпечатки в файл базовой линии не добавлять — гонка с CLI
   за линию импорта, см. [architecture.md](./docs/architecture.md#хеш-кэш-базовая-линия-и-stat-мемо).
   Проверку в расширении запускать через `Container.refreshChangedConfigurationState()`
-  (`ChangeDetectionRunner`), а не прямым `await detect`.
+  (`ChangeDetectionRunner`), а не прямым `await detect`. **Точечное перехеширование известных путей** (пути,
+  записанные/удалённые операцией, без обхода выгрузки) — только `hashTrackedFiles`: он проверяет регистр по
+  `readdir` и не трогает мемо; `collectCurrentHashes` в новом коде не использовать (синхронный, читает файл
+  целиком, регистр не проверяет). B после дельта-импорта агента — `buildSyncBaselineAfterImport`: снимок P №0
+  операции + `hashTrackedFiles`; ПОЛНЫЙ проход обязателен для архива, локального сравнения (`compare`), путей,
+  различающихся только регистром, и пути вне каталога цели (причина — в журнал, строка «Базовая линия
+  синхронизации: …»). Запуск детектора после операции с базой — только через `ChangeDetectionScheduler`
+  (settle ~16 с, `flush` для «Обновить конфигурации»), собственные таймеры в `Container` не заводить.
 - **Новая команда:** класс в `ui/commands/...` с `readonly id` → регистрация в `CommandRegistry.registerAll` → `package.json → contributes.commands` → при меню узла `contributes.menus` c `when: viewItem =~ /…/` → при хоткее `contributes.keybindings`.
 - **Новый потребитель пути формы** (MCP-инструмент или команда навигатора, которым нужно тело
   `Ext/Form.xml`, дескриптор формы или XML владельца по узлу дерева): только через

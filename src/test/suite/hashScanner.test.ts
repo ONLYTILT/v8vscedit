@@ -520,4 +520,89 @@ suite('HashScanner', function () {
       await assert.rejects(scanHashSnapshot(projectRoot, SCOPE, configDir, { fs: counting }), (e: unknown) => e === 'строка');
     });
   });
+
+  suite('прерывание прохода (signal)', () => {
+    const isAbort = (error: unknown): boolean => error instanceof Error && error.name === 'AbortError';
+
+    test('S1 уже прерванный сигнал → AbortError, ни одного readdir', async () => {
+      seedTree();
+      const counting = countingFs();
+      const controller = new AbortController();
+      controller.abort();
+
+      await assert.rejects(
+        scanHashSnapshot(projectRoot, SCOPE, configDir, { fs: counting, now: futureNow, signal: controller.signal }),
+        isAbort
+      );
+
+      assert.strictEqual(counting.counts.readdir, 0);
+      assert.ok(!fs.existsSync(memoFile()), 'мемо не создан');
+    });
+
+    test('S2 abort посреди хеширования: AbortError, мемо побайтно прежний, onReport не вызван', async () => {
+      seedTree();
+      await scanHashSnapshot(projectRoot, SCOPE, configDir, { now: futureNow });
+      const memoBefore = fs.readFileSync(memoFile());
+      // Два изменённых файла: полный проход переписал бы мемо, прерванный — обязан не писать частичный.
+      writeRel(configDir, 'Catalogs/Товары.xml', '<Catalog>другое</Catalog>');
+      writeRel(configDir, 'Configuration.xml', '<Configuration>другое</Configuration>');
+      const counting = countingFs();
+      const controller = new AbortController();
+      let statCalls = 0;
+      counting.beforeStat = () => {
+        statCalls += 1;
+        if (statCalls === 3) {
+          controller.abort();
+        }
+      };
+      const reports: HashScanReport[] = [];
+
+      await assert.rejects(
+        scanHashSnapshot(projectRoot, SCOPE, configDir, {
+          fs: counting,
+          now: futureNow,
+          signal: controller.signal,
+          onReport: (report) => { reports.push(report); },
+        }),
+        isAbort
+      );
+
+      assert.ok(memoBefore.equals(fs.readFileSync(memoFile())), 'частичный мемо не записан');
+      assert.deepStrictEqual(reports, []);
+    });
+
+    test('S3 abort во время обхода (readdir подкаталога) → AbortError, мемо не записан', async () => {
+      seedTree();
+      const counting = countingFs();
+      const controller = new AbortController();
+      counting.beforeReaddir = (dir) => {
+        if (dir !== configDir) {
+          controller.abort();
+        }
+      };
+
+      await assert.rejects(
+        scanHashSnapshot(projectRoot, SCOPE, configDir, { fs: counting, now: futureNow, signal: controller.signal }),
+        isAbort
+      );
+
+      assert.ok(!fs.existsSync(memoFile()), 'мемо не создан прерванным проходом');
+    });
+
+    test('S4 непрерванный сигнал: результат и мемо те же, что без сигнала', async () => {
+      seedTree();
+      const plain = await scanHashSnapshot(projectRoot, SCOPE, configDir, { now: futureNow });
+      const memoPlain = fs.readFileSync(memoFile());
+      fs.unlinkSync(memoFile());
+
+      const withSignal = await scanHashSnapshot(projectRoot, SCOPE, configDir, {
+        now: futureNow,
+        signal: new AbortController().signal,
+      });
+
+      assert.deepStrictEqual(withSignal.files, plain.files);
+      // Порядок записей мемо — порядок завершения полос пула, он недетерминирован; сравнивается содержимое.
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(memoFile(), 'utf-8')), JSON.parse(memoPlain.toString('utf-8')), 'мемо идентично');
+    });
+  });
 });

@@ -27,6 +27,7 @@ import {
   type SyncMirrorState,
 } from '../../../infra/agent/sync/SyncManifest';
 import { buildScopeKey } from '../../../infra/cache/HashCache';
+import type { HashScanOptions } from '../../../infra/cache/HashScanner';
 import { AgentConfigEmulator } from './agentConfigEmulator';
 import { AgentSshTestServer } from './agentSshTestServer';
 import { removeTreeSync } from './tempTree';
@@ -53,6 +54,10 @@ export interface HarnessOptions {
   readonly largeFileWarnBytes?: number;
   /** Подмена проверки свободного места каталога обмена (по умолчанию — `fs.statfs`). */
   readonly freeDiskSpace?: (dir: string) => Promise<number | undefined>;
+  /** Шов ФС/часов быстрой проверки выгрузки (счётчики обращений к P): пробрасывается всем снимкам операции и B. */
+  readonly hashScan?: Omit<HashScanOptions, 'onReport' | 'signal'>;
+  /** Часы времени итоговой строки журнала про B; по умолчанию — `Date.now` движка. */
+  readonly baselineClock?: () => number;
 }
 
 export interface SyncHarness {
@@ -179,6 +184,8 @@ export async function createHarness(kind: HarnessKind, options: HarnessOptions =
     largeFileThresholdBytes: options.largeFileThresholdBytes,
     largeFileWarnBytes: options.largeFileWarnBytes,
     freeDiskSpace: options.freeDiskSpace,
+    hashScan: options.hashScan,
+    baselineClock: options.baselineClock,
   });
   const emulator = new AgentConfigEmulator(userRoot);
   const mirrorDir = targetKind === 'cf' ? `workspace/${projectId}/cf` : `workspace/${projectId}/cfe/${HARNESS_EXTENSION_NAME}`;

@@ -10,6 +10,7 @@ import {
   loadHashCache,
   saveHashCache,
 } from '../../infra/cache/HashCache';
+import { scanHashSnapshot } from '../../infra/cache/HashScanner';
 import { loadHashStatMemo, resolveHashStatMemoPath } from '../../infra/cache/HashStatMemo';
 import { ConfigurationChangeDetector } from '../../infra/fs/ConfigurationChangeDetector';
 import { buildMinimalConfigXml, countingFs, futureNow, writeRel, type CountingFs } from './support/hashScanFixtures';
@@ -212,6 +213,88 @@ suite('ConfigurationChangeDetector (быстрая проверка)', function 
 
     test('пустой список конфигураций → []', async () => {
       assert.deepStrictEqual(await newDetector().detect([]), []);
+    });
+  });
+
+  suite('прерывание прохода (signal)', () => {
+    const isAbort = (error: unknown): boolean => error instanceof Error && error.name === 'AbortError';
+
+    function seedCfe(name: string): ConfigEntry {
+      const root = path.join(projectRoot, 'src', 'cfe', name);
+      writeRel(root, 'Configuration.xml', buildMinimalConfigXml(name, true));
+      writeRel(root, 'Catalogs/Расш_Товары.xml', `<Catalog>${name}</Catalog>`);
+      return { rootPath: root, kind: 'cfe' };
+    }
+
+    test('D1 abort в первой конфигурации без базовой линии → отклонение; базовая линия не создана, мемо побайтно прежний', async () => {
+      await scanHashSnapshot(projectRoot, '', cfRoot, { now: futureNow });
+      const memoPath = resolveHashStatMemoPath(projectRoot, cfRoot);
+      const memoBefore = fs.readFileSync(memoPath);
+      writeRel(cfRoot, 'Catalogs/Товары.xml', '<Catalog>другое</Catalog>');
+      const controller = new AbortController();
+      let statCalls = 0;
+      counting.beforeStat = () => {
+        statCalls += 1;
+        if (statCalls === 2) {
+          controller.abort();
+        }
+      };
+
+      await assert.rejects(newDetector().detect([cf], controller.signal), isAbort);
+
+      assert.ok(!fs.existsSync(baselineFile(cfScope())), 'базовая линия не инициализирована прерванным проходом');
+      assert.ok(memoBefore.equals(fs.readFileSync(memoPath)), 'частичный мемо не записан');
+    });
+
+    test('D1б abort после прохода, но до первичной записи базовой линии → отклонение, базовой линии нет', async () => {
+      const controller = new AbortController();
+      const detector = new ConfigurationChangeDetector(projectRoot, {
+        scan: { fs: counting, now: futureNow },
+        // Проход первой конфигурации уже отчитался, остался только шаг записи базовой линии.
+        log: (line) => { if (line.startsWith('[hash-cache]')) { controller.abort(); } },
+      });
+
+      await assert.rejects(detector.detect([cf], controller.signal), isAbort);
+
+      assert.ok(!fs.existsSync(baselineFile(cfScope())));
+    });
+
+    test('D2 abort между конфигурациями (после первой) → отклонение, вторая область не тронута и не инициализирована', async () => {
+      const ext = seedCfe('Альфа');
+      saveHashCache(projectRoot, buildHashSnapshot(cfScope(), cfRoot));
+      const controller = new AbortController();
+      const detector = new ConfigurationChangeDetector(projectRoot, {
+        scan: { fs: counting, now: futureNow },
+        log: (line) => { if (line.includes('Бухгалтерия')) { controller.abort(); } },
+      });
+
+      await assert.rejects(detector.detect([cf, ext], controller.signal), isAbort);
+
+      assert.ok(!fs.existsSync(baselineFile(buildScopeKey('cfe', ext.rootPath, 'Альфа'))), 'вторая область не инициализирована');
+      assert.ok(!counting.readPaths.some((file) => file.startsWith(ext.rootPath)), 'файлы второй области не читались');
+    });
+
+    test('D2б abort во время обхода второй конфигурации (readdir её корня) → отклонение, базовая линия второй не создана', async () => {
+      const ext = seedCfe('Бэта');
+      saveHashCache(projectRoot, buildHashSnapshot(cfScope(), cfRoot));
+      const controller = new AbortController();
+      counting.beforeReaddir = (dir) => { if (dir === ext.rootPath) { controller.abort(); } };
+
+      await assert.rejects(newDetector().detect([cf, ext], controller.signal), isAbort);
+
+      assert.ok(!fs.existsSync(baselineFile(buildScopeKey('cfe', ext.rootPath, 'Бэта'))));
+    });
+
+    test('D3 непрерванный сигнал: поведение как без сигнала (инициализация, затем видна правка)', async () => {
+      const signal = new AbortController().signal;
+      const detector = newDetector();
+
+      assert.deepStrictEqual(await detector.detect([cf], signal), []);
+      assert.ok(fs.existsSync(baselineFile(cfScope())), 'базовая линия создана');
+
+      writeRel(cfRoot, 'Catalogs/Ещё.xml', '<Catalog/>');
+      const changed = await detector.detect([cf], signal);
+      assert.strictEqual(changed[0]?.changedFilesCount, 1);
     });
   });
 

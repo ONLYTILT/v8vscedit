@@ -77,6 +77,12 @@ export interface HashScanOptions {
   readonly onReport?: (report: HashScanReport) => void;
   /** Порог потокового хеша (по умолчанию {@link HASH_STREAM_THRESHOLD_BYTES}); тесты ставят малый. */
   readonly streamThresholdBytes?: number;
+  /**
+   * Прерывание прохода: проверяется между каталогами и перед каждым файлом. Прерванный проход мемо
+   * НЕ пишет (частичный мемо выкинул бы записи непройденных файлов, и следующий проход перечитал бы
+   * всю выгрузку) и `onReport` не зовёт; промис отклоняется `signal.reason` (AbortError).
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface HashScanResult {
@@ -103,7 +109,8 @@ export async function scanCurrentHashes(
   // Момент старта берётся ДО любого stat/read — на этом держится racy-защита (см. isRacyFingerprint).
   const scanStartedAtMs = now();
 
-  const tracked = await listTrackedFiles(scanFs, configDir);
+  const signal = options.signal;
+  const tracked = await listTrackedFiles(scanFs, configDir, signal);
   const files: Record<string, string> = {};
   const entries: Record<string, HashStatEntry> = {};
   let hashed = 0;
@@ -111,6 +118,7 @@ export async function scanCurrentHashes(
   let reused = 0;
 
   await runPool(tracked, async ({ fullPath, relativePath }) => {
+    signal?.throwIfAborted();
     let fp: FileFingerprint;
     try {
       fp = await scanFs.stat(fullPath);
@@ -142,6 +150,9 @@ export async function scanCurrentHashes(
     }
     entries[relativePath] = [fp.mtimeMs, fp.ctimeMs, fp.size, hash];
   });
+  // Сигнал, пришедший во время последних файлов пула, тоже обрывает проход: иначе вызывающий записал бы
+  // мемо и применил результат, от которого уже отказался.
+  signal?.throwIfAborted();
 
   // Новый мемо содержит только существующие файлы — записи удалённых вычищаются сами собой.
   const memoChanged = Object.keys(entries).length !== reused || Object.keys(previous.entries).length !== reused;
@@ -200,11 +211,94 @@ export async function scanHashSnapshot(
   };
 }
 
+export interface TrackedFilesRehash {
+  /** Хеши существующих отслеживаемых файлов; ключ — запрошенный путь (совпал с диском побайтно, с регистром). */
+  readonly hashes: Record<string, string>;
+  /** Отслеживаемые пути, которых на диске нет (в том числе исчезнувшие во время чтения). */
+  readonly missing: string[];
+  /** Пути, у которых на диске есть совпадение только без учёта регистра (в любом сегменте). */
+  readonly caseMismatch: string[];
+  readonly hashed: number;
+}
+
+/**
+ * Точечное перехеширование известных путей (после записи операцией): тот же критерий отслеживаемости
+ * (`isSupportedConfigFile`), тот же хеш (буфер или поток по `streamThresholdBytes`) и то же правило
+ * ошибок (`ENOENT`/`ENOTDIR` — файла нет, остальное пробрасывается), что у полного прохода.
+ *
+ * Существование и регистр проверяются по `readdir` каждого предка (кэш на вызов), а не по `stat`: на
+ * регистронезависимой ФС `stat('A.xml')` нашёл бы `a.xml`, и ключ результата разошёлся бы с ключом,
+ * который полный проход берёт из имени на диске. `stat` зовётся только у найденного файла — ради размера
+ * (выбор буфер/поток). Stat-мемо не читается и не пишется: только что записанные файлы racy и в мемо всё
+ * равно не попали бы, а вторая точка записи мемо дала бы гонку с детектором изменений.
+ */
+export async function hashTrackedFiles(
+  configDir: string,
+  relativePaths: readonly string[],
+  options: Pick<HashScanOptions, 'fs' | 'streamThresholdBytes'> = {}
+): Promise<TrackedFilesRehash> {
+  const scanFs = options.fs ?? nodeHashScanFs;
+  const streamThreshold = options.streamThresholdBytes ?? HASH_STREAM_THRESHOLD_BYTES;
+  const requested = [...new Set(relativePaths)].filter((rel) => isSupportedConfigFile(rel));
+  // Промис, а не результат: параллельные пути одного каталога ждут один и тот же readdir.
+  const listings = new Map<string, Promise<readonly fs.Dirent[] | undefined>>();
+  const listDir = (dir: string): Promise<readonly fs.Dirent[] | undefined> => {
+    let listing = listings.get(dir);
+    if (listing === undefined) {
+      listing = scanFs.readdir(dir).catch((error: unknown) => {
+        rethrowUnlessGone(error);
+        return undefined;
+      });
+      listings.set(dir, listing);
+    }
+    return listing;
+  };
+
+  const hashes: Record<string, string> = {};
+  const missing: string[] = [];
+  const caseMismatch: string[] = [];
+  await runPool(requested, async (relativePath) => {
+    const segments = relativePath.split('/');
+    let dir = configDir;
+    for (const segment of segments) {
+      const entries = await listDir(dir);
+      const presence = entries === undefined ? 'missing' : segmentPresence(entries, segment);
+      if (presence !== 'exact') {
+        (presence === 'missing' ? missing : caseMismatch).push(relativePath);
+        return;
+      }
+      dir = path.join(dir, segment);
+    }
+    try {
+      const fp = await scanFs.stat(dir);
+      hashes[relativePath] = fp.size >= streamThreshold ? await scanFs.hashFile(dir) : hashContent(await scanFs.readFile(dir));
+    } catch (error) {
+      rethrowUnlessGone(error);
+      missing.push(relativePath);
+    }
+  });
+
+  return { hashes, missing: missing.sort(), caseMismatch: caseMismatch.sort(), hashed: Object.keys(hashes).length };
+}
+
+/**
+ * Предок-файл (не каталог) здесь не отсекается: следующий `readdir` даст `ENOTDIR`, то есть «нет файла» —
+ * ровно как у полного прохода. Сравнение без регистра — через верхний регистр, как таблица NTFS.
+ */
+function segmentPresence(entries: readonly fs.Dirent[], segment: string): 'exact' | 'case' | 'missing' {
+  if (entries.some((entry) => entry.name === segment)) {
+    return 'exact';
+  }
+  const upper = segment.toUpperCase();
+  return entries.some((entry) => entry.name.toUpperCase() === upper) ? 'case' : 'missing';
+}
+
 /** Тот же критерий отслеживаемого файла и те же POSIX-пути, что у `walkSupportedFiles` в HashCache. */
-async function listTrackedFiles(scanFs: HashScanFs, configDir: string): Promise<TrackedFile[]> {
+async function listTrackedFiles(scanFs: HashScanFs, configDir: string, signal: AbortSignal | undefined): Promise<TrackedFile[]> {
   const tracked: TrackedFile[] = [];
   const pending = [configDir];
   while (pending.length > 0) {
+    signal?.throwIfAborted();
     const batch = pending.splice(0, HASH_SCAN_CONCURRENCY);
     await Promise.all(batch.map(async (dir) => {
       let entries: readonly fs.Dirent[];
@@ -231,16 +325,29 @@ async function listTrackedFiles(scanFs: HashScanFs, configDir: string): Promise<
   return tracked;
 }
 
+/**
+ * Отказ одной полосы (прерывание, EBUSY) останавливает выдачу новых файлов, но промис отклоняется только
+ * после того, как ВСЕ полосы закончили текущее обращение: иначе чтения продолжались бы после отказа, держа
+ * открытые дескрипторы в каталоге, который вызывающий уже удаляет или перезаписывает.
+ */
 async function runPool<T>(items: readonly T[], worker: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
+  const errors: unknown[] = [];
   const lane = async (): Promise<void> => {
-    while (next < items.length) {
+    while (errors.length === 0 && next < items.length) {
       const item = items[next];
       next += 1;
-      await worker(item);
+      try {
+        await worker(item);
+      } catch (error) {
+        errors.push(error);
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(HASH_SCAN_CONCURRENCY, items.length) }, lane));
+  if (errors.length > 0) {
+    throw errors[0];
+  }
 }
 
 /**

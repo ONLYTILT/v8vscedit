@@ -15,7 +15,8 @@ import * as path from 'path';
  * актуализировала, а полный пересчёт (`ConfigurationChangeDetector.detect` обходит
  * и хеширует всю выгрузку) на каждом из тысяч событий заблокировал бы Extension
  * Host. Единственный авторитетный пересчёт по окончании окна планирует тот же код,
- * который окно открыл (`Container.markConfigurationsClean`).
+ * который окно открыл: `ChangeDetectionScheduler.markClean` (владелец окна; зовётся из
+ * `Container.markConfigurationsClean`).
  *
  * Класс намеренно не знает про `vscode`: источник времени внедряется, чтобы тест
  * проверял истечение окна без ожидания реального таймера.

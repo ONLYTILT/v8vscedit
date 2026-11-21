@@ -5,7 +5,7 @@ import type { ConfigEntry } from './domain/Configuration';
 import { findConfigurations } from './infra/fs/ConfigLocator';
 import { type ChangedConfiguration, ConfigurationChangeDetector } from './infra/fs/ConfigurationChangeDetector';
 import { ChangeDetectionRunner } from './infra/fs/ChangeDetectionRunner';
-import { ConfigurationCleanWindow } from './infra/fs/ConfigurationCleanWindow';
+import { ChangeDetectionScheduler } from './infra/fs/ChangeDetectionScheduler';
 import { MetadataTreeProvider } from './ui/tree/MetadataTreeProvider';
 import { registerCommands } from './ui/commands/CommandRegistry';
 import type { CommandServices } from './ui/commands/_shared';
@@ -138,6 +138,9 @@ export class Container {
   // Фоновая проверка изменений с single-flight: проход по выгрузке не должен блокировать поток
   // Extension Host, а повторные запросы во время прохода схлопываются в один повтор.
   private readonly changeDetection: ChangeDetectionRunner<ChangedConfiguration[]>;
+  // Окно тишины, проход settle и отложенные запросы поверх changeDetection: после операции с базой —
+  // ровно один проход по выгрузке (docs/architecture.md, «Фоновая проверка в расширении»).
+  private readonly detectionScheduler: ChangeDetectionScheduler;
 
   private changeStateTimer: NodeJS.Timeout | undefined;
   private treeCacheTimer: NodeJS.Timeout | undefined;
@@ -147,11 +150,9 @@ export class Container {
   private treeProcessingState: UniversalPanelProcessingState = { active: false };
   // Два разных механизма подавления собственных записей, не путать:
   // suppressedConfigurationReloads — пофайловый, гасит ПЕРЕСТРОЙКУ КЭША дерева по
-  // конкретным записанным файлам; cleanWindow — по корню конфигурации, гасит
+  // конкретным записанным файлам; окно тишины detectionScheduler — по корню конфигурации, гасит
   // пометку «изменена» на хвосте запоздавших событий watcher после операции с базой.
   private readonly suppressedConfigurationReloads = new Map<string, number>();
-  private readonly cleanWindow = new ConfigurationCleanWindow();
-  private cleanWindowSettleTimer: NodeJS.Timeout | undefined;
 
   private constructor(
     private readonly context: vscode.ExtensionContext,
@@ -159,16 +160,6 @@ export class Container {
   ) {
     this.outputChannel = vscode.window.createOutputChannel('1С Редактор');
     context.subscriptions.push(this.outputChannel);
-    // Отложенный пересчёт состояния живёт дольше окна тишины: если расширение
-    // выгрузят в это время, обратный вызов дёрнул бы уже мёртвые сервисы.
-    context.subscriptions.push({
-      dispose: () => {
-        if (this.cleanWindowSettleTimer) {
-          clearTimeout(this.cleanWindowSettleTimer);
-          this.cleanWindowSettleTimer = undefined;
-        }
-      },
-    });
     this.outputChannel.appendLine('[init] Расширение активировано');
 
     this.supportService = new SupportInfoService(this.outputChannel);
@@ -322,7 +313,7 @@ export class Container {
     });
     this.changeDetection = new ChangeDetectionRunner<ChangedConfiguration[]>({
       // Состав конфигураций берётся при старте КАЖДОГО прогона: повтор подхватывает новый состав.
-      run: () => this.changeDetector.detect(this.treeProvider.getEntries()),
+      run: (signal) => this.changeDetector.detect(this.treeProvider.getEntries(), signal),
       apply: (changed) => {
         this.changedConfigurations = changed;
         void vscode.commands.executeCommand('setContext', 'v8vscedit.hasChangedConfigurations', changed.length > 0);
@@ -333,6 +324,10 @@ export class Container {
       },
     });
     context.subscriptions.push({ dispose: () => this.changeDetection.dispose() });
+    this.detectionScheduler = new ChangeDetectionScheduler(this.changeDetection);
+    // Таймер settle живёт дольше окна тишины: если расширение выгрузят в это время, обратный вызов
+    // дёрнул бы уже мёртвые сервисы.
+    context.subscriptions.push({ dispose: () => this.detectionScheduler.dispose() });
 
     this.lspManager = new LspManager(context, this.outputChannel);
     const extensionPackageJson = context.extension.packageJSON as { version?: string };
@@ -419,6 +414,7 @@ export class Container {
     // Статус-бар хранилища создаётся лениво и не попадает в subscriptions —
     // диспозим его явно, наравне с disposeCachedAgentOperationServices.
     disposeRepositoryCommandStatusBar();
+    this.detectionScheduler.dispose();
     this.changeDetection.dispose();
     await Promise.allSettled([
       this.mcpServer.stop(),
@@ -703,7 +699,7 @@ export class Container {
     // актуализировала, а пересчёт (detect делает stat каждого файла выгрузки) на
     // каждое из тысяч событий был бы лишней нагрузкой на диск.
     // Единственный авторитетный пересчёт по окончании окна ставит markConfigurationsClean.
-    if (uri && this.cleanWindow.isOpenFor(uri.fsPath)) {
+    if (uri && this.detectionScheduler.isSilenced(uri.fsPath)) {
       return;
     }
     if (uri && this.markChangedConfigurationByFile(uri.fsPath)) {
@@ -769,9 +765,12 @@ export class Container {
     }, 500);
   }
 
-  /** Ставит фоновую проверку; результат применяет `changeDetection.apply`. */
+  /**
+   * Ставит фоновую проверку; результат применяет `changeDetection.apply`. Пока ожидается проход settle
+   * после операции с базой, запрос откладывается до него (см. `ChangeDetectionScheduler.request`).
+   */
   private refreshChangedConfigurationState(): void {
-    void this.changeDetection.request();
+    this.detectionScheduler.request();
   }
 
   private markChangedConfigurationByFiles(filePaths: string[]): void {
@@ -799,10 +798,11 @@ export class Container {
 
   /**
    * Ждёт окончания фоновой проверки: в окне после старта или reloadEntries ответ без ожидания был
-   * бы ложным «изменений нет», и «Обновить конфигурации» пропустило бы загрузку в БД.
+   * бы ложным «изменений нет», и «Обновить конфигурации» пропустило бы загрузку в БД. Отложенный до
+   * settle запрос здесь выполняется сразу (`flush`).
    */
   private async getChangedConfigurations(): Promise<ChangedConfiguration[]> {
-    await this.changeDetection.whenIdle();
+    await this.detectionScheduler.flush();
     return [...this.changedConfigurations];
   }
 
@@ -810,18 +810,11 @@ export class Container {
     if (rootPaths.length === 0) {
       return;
     }
-    // Watcher доставит события файлов, записанных операцией, уже после этой точки.
-    // Окно тишины гасит их, а по его закрытии ровно один раз пересчитывается
-    // фактическое состояние по хеш-кэшу — так правка, сделанная пользователем
-    // во время окна, не теряется, а полный пересчёт выполняется единожды.
-    this.cleanWindow.open(rootPaths);
-    if (this.cleanWindowSettleTimer) {
-      clearTimeout(this.cleanWindowSettleTimer);
-    }
-    this.cleanWindowSettleTimer = setTimeout(() => {
-      this.cleanWindowSettleTimer = undefined;
-      this.refreshChangedConfigurationState();
-    }, ConfigurationCleanWindow.defaultDurationMs + 1_000);
+    // Watcher доставит события файлов, записанных операцией, уже после этой точки. Окно тишины гасит
+    // их, идущий проход (начат до записи новой базовой линии) прерывается без повтора, а по закрытии
+    // окна ровно один раз пересчитывается фактическое состояние — так правка, сделанная пользователем
+    // во время окна, не теряется, а полный проход выполняется единожды.
+    this.detectionScheduler.markClean(rootPaths);
     const clean = new Set(rootPaths.map((item) => path.resolve(item).toLowerCase()));
     this.changedConfigurations = this.changedConfigurations.filter(
       (item) => !clean.has(path.resolve(item.rootPath).toLowerCase())
@@ -831,8 +824,6 @@ export class Container {
       'v8vscedit.hasChangedConfigurations',
       this.changedConfigurations.length > 0
     );
-    // Прогон, начатый до записи импортом новой базовой линии, сравнивал бы со старой — отбрасываем.
-    this.changeDetection.invalidate();
   }
 
   private markChangedConfigurationByFile(filePath: string): boolean {

@@ -76,22 +76,34 @@ export interface AgentImportOutcome {
   readonly result: AgentImportResult;
   /** Полнота M после операции — пишется в манифест вместе с B. */
   readonly mirrorCoverage: SyncMirrorCoverage;
+  /**
+   * Снимок P этой операции до записи — основа B по изменённым файлам (`buildSyncBaselineAfterImport`).
+   * Есть только у итоговой стратегии `delta`: архив и сравнение снимка P не снимают.
+   */
+  readonly projectSnapshot?: Readonly<Record<string, string>>;
+}
+
+/** Результат стратегии вместе со снимком P фазы 2 (только у дельты). */
+interface ImportStrategyOutcome {
+  readonly result: AgentImportResult;
+  readonly projectSnapshot?: Readonly<Record<string, string>>;
 }
 
 export async function runImport(context: SyncOperationContext): Promise<AgentImportOutcome> {
-  const result = context.store.kind === 'local' ? await importByCompare(context) : await importRemote(context);
-  return { result, mirrorCoverage: context.mirror.coverage };
+  const { result, projectSnapshot } = context.store.kind === 'local'
+    ? { result: await importByCompare(context), projectSnapshot: undefined }
+    : await importRemote(context);
+  return { result, mirrorCoverage: context.mirror.coverage, ...(projectSnapshot === undefined ? {} : { projectSnapshot }) };
 }
 
 // --- удалённое хранилище: список изменений, дельта, архив --------------------------------------
 
 /** Результат фазы 2 вместе с владельцами списка изменений — их знает поиск сирот после посева. */
-interface ChangesOutcome {
-  readonly result: AgentImportResult;
+interface ChangesOutcome extends ImportStrategyOutcome {
   readonly changedOwners: ReadonlySet<string>;
 }
 
-async function importRemote(context: SyncOperationContext): Promise<AgentImportResult> {
+async function importRemote(context: SyncOperationContext): Promise<ImportStrategyOutcome> {
   const mirrorState = await effectiveMirrorState(context);
   if (mirrorState !== 'empty') {
     // Ручная замена выгрузки проекта (новый файл версий): та же развилка посева, что у пустого M.
@@ -104,7 +116,8 @@ async function importRemote(context: SyncOperationContext): Promise<AgentImportR
         return importSeeded(context, seed.base);
       }
     }
-    return (await importChanges(context, mirrorState, undefined)).result;
+    const { result, projectSnapshot } = await importChanges(context, mirrorState, undefined);
+    return { result, projectSnapshot };
   }
   const seed = await seedFromProject(context, 'mirror-empty');
   if (seed.kind === 'seeded') {
@@ -119,15 +132,16 @@ async function importRemote(context: SyncOperationContext): Promise<AgentImportR
   }
   context.markMirrorMutated();
   await context.store.remove(context.workspace.targetAgentDir, { recursive: true });
-  return importByArchive(context, 'mirror-empty', 'confirmed');
+  return { result: await importByArchive(context, 'mirror-empty', 'confirmed') };
 }
 
 /** Импорт после посева из выгрузки проекта: D = ∅ относительно hash(P), затем поиск сирот. */
-async function importSeeded(context: SyncOperationContext, base: Record<string, string>): Promise<AgentImportResult> {
-  const { result, changedOwners } = await importChanges(context, 'fresh', base, { afterSeed: true });
+async function importSeeded(context: SyncOperationContext, base: Record<string, string>): Promise<ImportStrategyOutcome> {
+  const { result, changedOwners, projectSnapshot } = await importChanges(context, 'fresh', base, { afterSeed: true });
   // Архив сам удаляет из P всё, чего нет в базе: сирот после него не бывает.
   const orphans = result.strategy === 'archive' ? undefined : await findOrphans(context, changedOwners);
-  return { ...withOrphans(result, orphans), seededFrom: 'project' };
+  // Удалённые сироты попадают в changedProjectFiles (withOrphans) — B по снимку их учтёт.
+  return { result: { ...withOrphans(result, orphans), seededFrom: 'project' }, projectSnapshot };
 }
 
 function findOrphans(context: SyncOperationContext, changedOwners: ReadonlySet<string>): Promise<OrphanFilesOutcome | undefined> {
@@ -282,7 +296,17 @@ async function importPhase2(
   const removed = new Set(removedOwnerFiles);
   context.progress.step('Проверка локальных изменений проекта…');
   const base = assumedBase ?? context.manifest.files;
-  const dirty = diffSyncFiles(base, await buildSyncManifestFiles(projectDir, context.projectRoot));
+  // Снимок №0 — единственный полный проход по P на пути дельты: он же основа B после записи.
+  const projectSnapshot = await buildSyncManifestFiles(projectDir, context.projectRoot, {
+    ...context.hashScan,
+    onReport: (report) => {
+      context.progress.step(
+        `Проверка локальных изменений проекта: файлов ${String(report.files)}, перехешировано ${String(report.hashed)} ` +
+        `(racy ${String(report.racy)}), ${String(report.elapsedMs)} мс`
+      );
+    },
+  });
+  const dirty = diffSyncFiles(base, projectSnapshot);
   const dirtyFiles = [...dirty.added, ...dirty.modified, ...dirty.deleted];
   // Сверх порога план и так даст архив — лишние STAT по M не нужны; после перезаписи порога нет.
   const dirtyAbsentFromMirror = coverage === 'sparse'
@@ -327,7 +351,7 @@ async function importPhase2(
     rootPartEvidence: input.rootPartEvidence,
   };
   if (restore.length === 0) {
-    return { result: withFullDump(await importByDelta(context, delta)), changedOwners };
+    return { result: withFullDump(await importByDelta(context, delta)), changedOwners, projectSnapshot };
   }
   context.hooks?.onMessage?.(`Точечная выгрузка из базы локально изменённых файлов: ${String(restore.length)}.`);
   const restored = await restoreFromDatabase(context, restore);
@@ -339,7 +363,7 @@ async function importPhase2(
   }
   const source = { dir: restored.sourceDir, files: new Set(restore) };
   const result = await importByDelta(context, { ...delta, restore: source });
-  return { result: { ...withFullDump(result), restoredFromDatabase: restore.length }, changedOwners };
+  return { result: { ...withFullDump(result), restoredFromDatabase: restore.length }, changedOwners, projectSnapshot };
 }
 
 /** Файлы владельцев в M (LIST поддеревьев) со счётчиком просмотра. */

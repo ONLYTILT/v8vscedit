@@ -10,7 +10,10 @@ import type { SyncProgress } from './SyncProgress';
  *    вызова (`Container.suppressConfigurationReloadForFiles`); запись может идти дольше окна, поэтому
  *    хук зовётся до первой записи, непосредственно перед Configuration.xml и после последней записи;
  *  - Configuration.xml пишется последним: его событие watcher перезагружает всё дерево;
- *  - файлы пишутся только через writeFileAtomic/writeFileAtomicWith — обрыв не оставляет обрезанный XML.
+ *  - файлы пишутся только через writeFileAtomic/writeFileAtomicWith — обрыв не оставляет обрезанный XML;
+ *  - `applyProjectChanges` — ЕДИНСТВЕННЫЙ писатель P в импорте, а его результат (`changedProjectFiles`) —
+ *    вход базовой линии B (`buildSyncBaselineAfterImport`: снимок P операции + перехеширование записанного).
+ *    Писатель P в обход этой функции молча сломал бы B: его файлы остались бы в B с хешем снимка.
  */
 
 export const CONFIGURATION_XML = 'Configuration.xml';

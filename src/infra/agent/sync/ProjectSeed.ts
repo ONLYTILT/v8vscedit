@@ -35,7 +35,7 @@ export async function seedFromProject(context: SyncOperationContext, reason: Age
     return { kind: 'skipped' };
   }
   const projectDir = context.target.rootPath;
-  const current = await buildSyncManifestFiles(projectDir, context.projectRoot);
+  const current = await buildSyncManifestFiles(projectDir, context.projectRoot, context.hashScan);
   const base = context.manifest.files;
   const decision = await confirm({
     ...inspection.candidate,

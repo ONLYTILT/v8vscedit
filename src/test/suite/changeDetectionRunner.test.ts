@@ -29,6 +29,8 @@ async function flush(): Promise<void> {
 interface Harness {
   readonly runner: ChangeDetectionRunner<number>;
   readonly runs: Deferred<number>[];
+  /** Сигналы прерывания, выданные прогонам (индекс совпадает с `runs`). */
+  readonly signals: AbortSignal[];
   readonly applied: number[];
   readonly errors: unknown[];
   applyThrows?: Error;
@@ -36,14 +38,17 @@ interface Harness {
 
 function createHarness(): Harness {
   const runs: Deferred<number>[] = [];
+  const signals: AbortSignal[] = [];
   const applied: number[] = [];
   const errors: unknown[] = [];
   const harness: Harness = {
     runs,
+    signals,
     applied,
     errors,
     runner: new ChangeDetectionRunner<number>({
-      run: () => {
+      run: (signal) => {
+        signals.push(signal);
         const d = deferred<number>();
         runs.push(d);
         return d.promise;
@@ -250,5 +255,147 @@ suite('ChangeDetectionRunner', () => {
     await flush();
     assert.strictEqual(h.runs.length, 0);
     await h.runner.whenIdle();
+  });
+
+  suite('signal и discard()', () => {
+    const abortError = (): Error => Object.assign(new Error('прервано'), { name: 'AbortError' });
+
+    test('R1 прогон получает непрерванный signal; каждый прогон — свой', async () => {
+      const h = createHarness();
+      const first = h.runner.request();
+      await flush();
+      void h.runner.request();
+      assert.strictEqual(h.signals[0].aborted, false);
+      h.runs[0].resolve(1);
+      await flush();
+      assert.strictEqual(h.signals.length, 2);
+      assert.notStrictEqual(h.signals[0], h.signals[1]);
+      assert.strictEqual(h.signals[1].aborted, false);
+      h.runs[1].resolve(2);
+      await first;
+    });
+
+    test('R2 discard() во время прогона: signal прерван, результат не применён, отказ AbortError не доходит до onError, повтора нет, whenIdle резолвится', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+
+      h.runner.discard();
+      assert.strictEqual(h.signals[0].aborted, true);
+      h.runs[0].reject(abortError());
+      await done;
+      await h.runner.whenIdle();
+
+      assert.deepStrictEqual(h.applied, []);
+      assert.deepStrictEqual(h.errors, []);
+      assert.strictEqual(h.runs.length, 1, 'повтор не поставлен');
+      assert.strictEqual(h.runner.running, false);
+    });
+
+    test('R2б discard(): прогон, успевший вернуть результат, тоже не применяется', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.discard();
+      h.runs[0].resolve(7);
+      await done;
+      assert.deepStrictEqual(h.applied, []);
+      assert.deepStrictEqual(h.errors, []);
+      assert.strictEqual(h.runs.length, 1);
+    });
+
+    test('R3 discard() снимает повтор, поставленный request() во время прогона', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      void h.runner.request();
+      h.runner.discard();
+      h.runs[0].resolve(1);
+      await done;
+      assert.strictEqual(h.runs.length, 1, 'повтор снят');
+      assert.deepStrictEqual(h.applied, []);
+    });
+
+    test('R3б discard() снимает и повтор, поставленный invalidate()', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.invalidate();
+      h.runner.discard();
+      h.runs[0].resolve(1);
+      await done;
+      assert.strictEqual(h.runs.length, 1);
+    });
+
+    test('R4 discard() в простое — no-op; следующий request() запускает прогон', async () => {
+      const h = createHarness();
+      h.runner.discard();
+      await flush();
+      assert.strictEqual(h.runs.length, 0);
+      const done = h.runner.request();
+      await flush();
+      assert.strictEqual(h.runs.length, 1);
+      assert.strictEqual(h.signals[0].aborted, false);
+      h.runs[0].resolve(4);
+      await done;
+      assert.deepStrictEqual(h.applied, [4]);
+    });
+
+    test('R5 request() после discard() в том же цикле → повтор выполняется и применяется', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.discard();
+      const again = h.runner.request();
+      h.runs[0].reject(abortError());
+      await flush();
+      assert.strictEqual(h.runs.length, 2, 'повтор после discard');
+      assert.strictEqual(h.signals[1].aborted, false);
+      h.runs[1].resolve(5);
+      await Promise.all([done, again]);
+      assert.deepStrictEqual(h.applied, [5]);
+      assert.deepStrictEqual(h.errors, []);
+    });
+
+    test('R6 invalidate() прогон НЕ прерывает (signal.aborted === false), повтор есть (прежний контракт)', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.invalidate();
+      assert.strictEqual(h.signals[0].aborted, false);
+      h.runs[0].resolve(1);
+      await flush();
+      assert.deepStrictEqual(h.applied, []);
+      assert.strictEqual(h.runs.length, 2);
+      h.runs[1].resolve(2);
+      await done;
+      assert.deepStrictEqual(h.applied, [2]);
+    });
+
+    test('R7 dispose() прерывает идущий прогон; в простое signal не создаётся', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.dispose();
+      assert.strictEqual(h.signals[0].aborted, true);
+      h.runs[0].reject(abortError());
+      await done;
+      assert.deepStrictEqual(h.errors, []);
+      assert.deepStrictEqual(h.applied, []);
+
+      const idle = createHarness();
+      idle.runner.dispose();
+      assert.strictEqual(idle.signals.length, 0);
+    });
+
+    test('реальный сбой после discard() (не AbortError) тоже не доходит до onError: результат прогона отброшен', async () => {
+      const h = createHarness();
+      const done = h.runner.request();
+      await flush();
+      h.runner.discard();
+      h.runs[0].reject(new Error('любой отказ отброшенного прогона'));
+      await done;
+      assert.deepStrictEqual(h.errors, []);
+    });
   });
 });

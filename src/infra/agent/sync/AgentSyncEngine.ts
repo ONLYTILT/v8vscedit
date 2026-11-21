@@ -5,6 +5,7 @@ import { sanitizePathPart, type AgentWorkspaceService } from '../AgentWorkspaceS
 import type { AgentFileStore } from '../files/AgentFileStore';
 import { DEFAULT_AGENT_TRANSFER_CONCURRENCY } from '../files/AgentFileTransfer';
 import { buildScopeKey, saveHashCache } from '../../cache/HashCache';
+import type { HashScanOptions } from '../../cache/HashScanner';
 import { freeDiskSpaceOf } from '../../fs/FreeDiskSpace';
 import { runImport, type AgentImportResult } from './AgentImportFlow';
 import { runLoad, type AgentLoadMode, type AgentLoadResult } from './AgentLoadFlow';
@@ -13,11 +14,13 @@ import { fingerprintProjectDumpInfo } from './ProjectDumpInfo';
 import { AgentSyncCancelledError, EXCHANGE_SIDE_SUFFIXES, throwIfCancelled, type SyncOperationContext } from './SyncContext';
 import { createSyncProgress } from './SyncProgress';
 import {
-  buildSyncManifestFiles,
+  buildSyncBaselineAfterImport,
   loadSyncManifest,
   mirrorCoverageOf,
   saveSyncManifest,
   type ProjectDumpInfoFingerprint,
+  type SyncBaselineFullReason,
+  type SyncBaselineResult,
   type SyncManifest,
   type SyncMirrorCoverage,
   type SyncMirrorState,
@@ -69,6 +72,30 @@ export interface AgentSyncEngineOptions {
   readonly largeFileWarnBytes?: number;
   /** Свободное место тома каталога (по умолчанию — `fs.statfs`); подменяется в тестах. */
   readonly freeDiskSpace?: (dir: string) => Promise<number | undefined>;
+  /** Шов ФС/часов быстрой проверки P: передаётся всем снимкам P операции и построению B (тесты считают обращения). */
+  readonly hashScan?: Omit<HashScanOptions, 'onReport' | 'signal'>;
+  /** Часы времени построения B в журнале (по умолчанию `Date.now`). */
+  readonly baselineClock?: () => number;
+}
+
+const FULL_BASELINE_REASON_TEXT: Record<SyncBaselineFullReason, string> = {
+  compare: 'полное сравнение с локальным зеркалом',
+  archive: 'импорт архивом',
+  'no-project-snapshot': 'нет снимка проекта операции',
+  'case-mismatch': 'пути, отличающиеся только регистром',
+  'foreign-path': 'файл вне каталога выгрузки',
+};
+
+/** Итог построения B одной строкой журнала: режим, объём и время (plan-fast-baseline.md §2.3). */
+function describeBaseline({ mode, elapsedMs }: SyncBaselineResult): string {
+  const elapsed = `${String(elapsedMs)} мс`;
+  if (mode.kind === 'incremental') {
+    return `Базовая линия синхронизации: по изменённым файлам — перехешировано ${String(mode.rehashed)}, ` +
+      `удалено ${String(mode.removed)}, ${elapsed}`;
+  }
+  const { files, hashed, racy } = mode.report;
+  return `Базовая линия синхронизации: полный проход (${FULL_BASELINE_REASON_TEXT[mode.reason]}) — файлов ${String(files)}, ` +
+    `перехешировано ${String(hashed)} (racy ${String(racy)}), ${elapsed}`;
 }
 
 type OperationKind = 'import' | 'load';
@@ -105,19 +132,32 @@ export class AgentSyncEngine {
     this.now = options.now ?? Date.now;
   }
 
-  /** БД → P. После успеха P ≡ M по отслеживаемым файлам, B = hash(P), M — `fresh`. */
+  /**
+   * БД → P. После успеха P ≡ M по отслеживаемым файлам, M — `fresh`, B = hash(P) по снимку операции:
+   * правки P во время операции в файлах, которые импорт не трогал, в B не поглощаются.
+   */
   importTarget(
     target: AgentConfigurationOperationTarget,
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentImportResult> {
     return this.runOperation('import', target, exec, hooks, async (context) => {
-      const { result, mirrorCoverage } = await runImport(context);
+      const { result, mirrorCoverage, projectSnapshot } = await runImport(context);
       context.progress.step('Сохранение базовой линии синхронизации…');
+      const baseline = await buildSyncBaselineAfterImport({
+        configDir: target.rootPath,
+        projectRoot: this.options.projectRoot,
+        projectSnapshot,
+        fullReason: result.strategy === 'delta' ? undefined : result.strategy,
+        changedFiles: result.changedProjectFiles,
+        scan: this.options.hashScan,
+        clock: this.options.baselineClock,
+      });
+      context.progress.step(describeBaseline(baseline));
       return {
         result,
         baseline: {
-          files: await buildSyncManifestFiles(target.rootPath, this.options.projectRoot),
+          files: baseline.files,
           mirrorState: 'fresh',
           mirrorCoverage,
           projectDumpInfo: { current: await fingerprintProjectDumpInfo(target.rootPath, context.manifest.projectDumpInfo) },
@@ -192,6 +232,7 @@ export class AgentSyncEngine {
       // Локальный M всегда полный: импорт сравнивает его с P целиком, посева там нет.
       mirror: { coverage: store.kind === 'local' ? 'full' : mirrorCoverageOf(manifest) },
       markMirrorMutated: () => { mirror.mutated = true; },
+      hashScan: this.options.hashScan,
     };
 
     // Уборка обмена явно на обоих путях, а не в finally: removeExchange не бросает, и исход

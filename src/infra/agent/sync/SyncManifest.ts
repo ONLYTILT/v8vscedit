@@ -1,8 +1,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { loadHashCache } from '../../cache/HashCache';
-import { scanHashSnapshot, type HashScanOptions } from '../../cache/HashScanner';
+import { isSupportedConfigFile, loadHashCache } from '../../cache/HashCache';
+import { hashTrackedFiles, scanHashSnapshot, type HashScanOptions, type HashScanReport } from '../../cache/HashScanner';
 import { writeFileAtomic } from '../../fs/AtomicFileWriter';
 
 /**
@@ -80,6 +80,106 @@ export async function buildSyncManifestFiles(
   options?: HashScanOptions
 ): Promise<Record<string, string>> {
   return (await scanHashSnapshot(projectRoot, '', configDir, options)).files;
+}
+
+/** Почему B после импорта снята полным проходом, а не по изменённым файлам. */
+export type SyncBaselineFullReason = 'compare' | 'archive' | 'no-project-snapshot' | 'case-mismatch' | 'foreign-path';
+
+export type SyncBaselineMode =
+  | { readonly kind: 'incremental'; readonly rehashed: number; readonly removed: number }
+  | { readonly kind: 'full'; readonly reason: SyncBaselineFullReason; readonly report: HashScanReport };
+
+export interface SyncBaselineInput {
+  readonly configDir: string;
+  readonly projectRoot: string;
+  /** Снимок P, снятый ЭТОЙ ЖЕ операцией до записи; нет — полный проход. */
+  readonly projectSnapshot?: Readonly<Record<string, string>>;
+  /** Причина полного прохода по построению стратегии; задана — полный проход даже при наличии снимка. */
+  readonly fullReason?: 'compare' | 'archive';
+  /** Абсолютные пути, записанные или удалённые операцией (`AgentImportResult.changedProjectFiles`). */
+  readonly changedFiles: readonly string[];
+  readonly scan?: Omit<HashScanOptions, 'onReport' | 'signal'>;
+  readonly clock?: () => number;
+}
+
+export interface SyncBaselineResult {
+  /** Новый объект: снимок операции не мутируется. */
+  readonly files: Record<string, string>;
+  readonly mode: SyncBaselineMode;
+  readonly elapsedMs: number;
+}
+
+/**
+ * B после импорта = снимок P операции ⊕ перехеширование записанного. Прежняя B в расчёте не участвует:
+ * грязные файлы снимок уже содержит текущим содержимым. Для пути, который импорт не трогал, P после
+ * операции равна снимку — `applyProjectChanges` единственный писатель P в импорте, и его результат
+ * (`changedProjectFiles`) и есть вход сюда.
+ *
+ * Осознанное расхождение с полным проходом — правка пользователя во время операции в нетронутом файле:
+ * полный проход молча поглотил бы её в B, здесь в B остаётся хеш снимка, и правка видна как изменение.
+ *
+ * Полный проход: нет снимка (архив, сравнение с локальным зеркалом), путь вне каталога цели (не бывает,
+ * но молча пропустить нельзя), пути, отличающиеся только регистром (переименование объекта регистром:
+ * полный проход берёт имена из `readdir`, а патч по запрошенному пути оставил бы старый ключ).
+ */
+export async function buildSyncBaselineAfterImport(input: SyncBaselineInput): Promise<SyncBaselineResult> {
+  const clock = input.clock ?? Date.now;
+  const startedAt = clock();
+  const finish = (files: Record<string, string>, mode: SyncBaselineMode): SyncBaselineResult =>
+    ({ files, mode, elapsedMs: clock() - startedAt });
+  const full = async (reason: SyncBaselineFullReason): Promise<SyncBaselineResult> => {
+    const reports: HashScanReport[] = [];
+    const snapshot = await scanHashSnapshot(input.projectRoot, '', input.configDir, {
+      ...input.scan,
+      onReport: (scanReport) => { reports.push(scanReport); },
+    });
+    // onReport зовётся ровно один раз до возврата успешного scanHashSnapshot.
+    return finish(snapshot.files, { kind: 'full', reason, report: reports[0] });
+  };
+
+  const snapshot = input.projectSnapshot;
+  // Явная причина полного прохода сильнее снимка: стратегия (архив, сравнение) переписала P мимо
+  // перечня изменений, и патч по снимку дал бы неверную B.
+  if (input.fullReason !== undefined) {
+    return full(input.fullReason);
+  }
+  if (snapshot === undefined) {
+    return full('no-project-snapshot');
+  }
+  const changed: string[] = [];
+  for (const file of input.changedFiles) {
+    const rel = path.relative(input.configDir, file);
+    if (/^\.\.(?:[\\/]|$)/.test(rel) || path.isAbsolute(rel)) {
+      return full('foreign-path');
+    }
+    const posix = rel.replace(/\\/g, '/');
+    if (isSupportedConfigFile(posix)) {
+      changed.push(posix);
+    }
+  }
+  const snapshotKeysByUpper = new Map(Object.keys(snapshot).map((key) => [key.toUpperCase(), key]));
+  for (const rel of changed) {
+    const key = snapshotKeysByUpper.get(rel.toUpperCase());
+    if (key !== undefined && key !== rel) {
+      return full('case-mismatch');
+    }
+  }
+  const rehash = await hashTrackedFiles(input.configDir, changed, input.scan);
+  if (rehash.caseMismatch.length > 0) {
+    return full('case-mismatch');
+  }
+  const missing = new Set(rehash.missing);
+  const files: Record<string, string> = {};
+  let removed = 0;
+  for (const [rel, hash] of Object.entries(snapshot)) {
+    if (missing.has(rel)) {
+      removed += 1;
+    } else {
+      files[rel] = hash;
+    }
+  }
+  Object.assign(files, rehash.hashes);
+  return finish(files, { kind: 'incremental', rehashed: rehash.hashed, removed });
 }
 
 /**
