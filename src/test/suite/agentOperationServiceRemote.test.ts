@@ -207,7 +207,7 @@ suite('Агент Э8: AgentOperationService поверх SFTP-хранилищ�
     });
 
     const journal: string[] = [];
-    await assert.rejects(svc.loadChangedAndUpdate(target(), { onMessage: (text) => journal.push(text) }), (error: unknown) => {
+    await assert.rejects(svc.loadChanged(target(), { updateDatabase: true }, { onMessage: (text) => journal.push(text) }), (error: unknown) => {
       assert.ok(error instanceof AgentConnectionLostError, String(error));
       const text = describeAgentCommandFailure(error);
       assert.ok(text.includes('Соединение с агентом конфигуратора потеряно во время команды «config update-db-cfg»'), text);
@@ -221,7 +221,7 @@ suite('Агент Э8: AgentOperationService поверх SFTP-хранилищ�
 
     await srv.whenClientCount(0);
     fs.appendFileSync(path.join(cfRoot, 'Catalogs', 'Товары.xml'), '\n<!-- ещё правка -->');
-    await svc.loadChangedAndUpdate(target());
+    await svc.loadChanged(target(), { updateDatabase: true });
     assert.strictEqual(srv.sftp.sessionCount, 2, 'потерянное SFTP-соединение заменено новым');
     assert.ok(dbAsText(emulator.dbFiles())['Catalogs/Товары.xml'].includes('ещё правка'), 'вторая загрузка дошла до базы');
   });
@@ -279,7 +279,7 @@ suite('Агент Э8: AgentOperationService поверх SFTP-хранилищ�
       const { svc, srv } = await prepareChangedLoad(2);
       assert.ok(srv.sftp);
       const gate = srv.sftp.hold('WRITE');
-      const loading = svc.loadChangedAndUpdate(target());
+      const loading = svc.loadChanged(target(), { updateDatabase: true });
       await gate.waitForPending(2);
       // Оба исполнителя пула заблокированы на WRITE, третьему стартовать некому: число детерминировано.
       await new Promise((resolve) => setImmediate(resolve));
@@ -293,7 +293,7 @@ suite('Агент Э8: AgentOperationService поверх SFTP-хранилищ�
       const { svc, srv } = await prepareChangedLoad(16);
       assert.ok(srv.sftp);
       const gate = srv.sftp.hold('WRITE');
-      const loading = svc.loadChangedAndUpdate(target());
+      const loading = svc.loadChanged(target(), { updateDatabase: true });
       await gate.waitForPending(3);
       assert.ok(gate.pendingCount() >= 3);
       gate.release();

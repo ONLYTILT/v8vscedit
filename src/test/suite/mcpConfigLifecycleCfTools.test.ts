@@ -44,6 +44,7 @@ import { McpMutationGate } from '../../ui/mcp/registration/McpMutationGate';
 import type { McpRegistrationDeps } from '../../ui/mcp/registration/McpRegistrationDeps';
 import { EXTENSION_MCP_TOOLS } from '../../infra/ai/AiMcpConfiguration';
 import { tryRequireProductionModule } from './support/tryRequireProductionModule';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 
 type CfFileOperation = 'dump' | 'load';
 
@@ -377,7 +378,7 @@ function createFakeDesignerExecutable(dir: string, variant: 'noop' | 'dump'): st
  */
 function createDepsWithWorkspace(workspaceFolder: vscode.WorkspaceFolder, outputChannel: vscode.OutputChannel): McpRegistrationDeps {
   return {
-    services: { workspaceFolder, outputChannel },
+    services: { workspaceFolder, outputChannel, databaseConfigLag: new FakeLagRecorder() },
     xmlEditor: {},
     paths: {},
     properties: {},

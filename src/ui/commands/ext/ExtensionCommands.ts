@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { ChangedConfiguration } from '../../../infra/fs/ConfigurationChangeDetector';
 import type { ConfigEntry } from '../../../domain/Configuration';
 import { parseConfigXml } from '../../../infra/xml';
 import type { CommandServices, NodeArg } from '../_shared';
@@ -38,7 +37,7 @@ interface ImportTarget {
   rootPath: string;
 }
 
-interface RootConfigurationTarget extends ImportTarget {
+export interface RootConfigurationTarget extends ImportTarget {
   extensionName?: string;
 }
 
@@ -126,87 +125,6 @@ export function registerExtensionCommands(
       } catch (error) {
         setConfigurationProgress(services, 'Импорт конфигураций', 'ошибка', false);
         showConfigurationCommandError('Ошибка импорта конфигураций.', error, services);
-      } finally {
-        await endConfigurationOperation();
-        services.markConfigurationsClean(completedRootPaths);
-        clearConfigurationProgress(services);
-      }
-    }),
-
-    vscode.commands.registerCommand('v8vscedit.updateChangedConfigurations', async () => {
-      if (!await tryBeginConfigurationOperation()) {
-        await showOperationAlreadyRunningMessage();
-        return false;
-      }
-      beginConfigurationProgress(services, 'Обновление конфигураций', 'проверка изменений');
-      await yieldToUi();
-      const completedRootPaths: string[] = [];
-      try {
-        const changed = await services.getChangedConfigurations();
-
-        if (changed.length === 0) {
-          setConfigurationProgress(services, 'Обновление конфигураций', 'изменений нет', false);
-          // Уведомление показываем без await: `await` внутри критической секции
-          // держал бы замок операции занятым до закрытия нотификации
-          // пользователем, а до тех пор любая операция отбивалась сообщением
-          // «уже выполняется» (состояние «идёт обновление» залипало).
-          void vscode.window.showInformationMessage('Изменений в конфигурациях не обнаружено.');
-          return true;
-        }
-
-        const selected = changed.length === 1
-          ? changed
-          : await pickChangedConfigurations(changed);
-        if (!selected || selected.length === 0) {
-          setConfigurationProgress(services, 'Обновление конфигураций', 'отменено', false);
-          return false;
-        }
-
-        return await runWithStandaloneServerStopped(services, 'Обновление конфигураций', async () => {
-          const ordered = orderUpdateTargets(selected);
-          for (let index = 0; index < ordered.length; index += 1) {
-            const target = ordered[index];
-            setConfigurationProgress(
-              services,
-              'Обновление конфигураций',
-              `${String(index + 1)}/${String(ordered.length)}: ${target.name}`,
-              true
-            );
-            const updated = target.kind === 'cf'
-              ? await runUpdateMainConfiguration(
-                  target.name,
-                  target.rootPath,
-                  services.workspaceFolder,
-                  services.outputChannel,
-                  ordered.length === 1,
-                  createProgressHooks(services, 'Обновление конфигураций', `${String(index + 1)}/${String(ordered.length)}: ${target.name}`)
-                )
-              : await runUpdateExtension(
-                  target.name,
-                  target.rootPath,
-                  services.workspaceFolder,
-                  services.outputChannel,
-                  ordered.length === 1,
-                  createProgressHooks(services, 'Обновление конфигураций', `${String(index + 1)}/${String(ordered.length)}: ${target.name}`)
-                );
-
-            if (!updated) {
-              setConfigurationProgress(services, 'Обновление конфигураций', `остановлено на "${target.name}"`, false);
-              return false;
-            }
-            completedRootPaths.push(target.rootPath);
-          }
-
-          if (ordered.length > 1) {
-            void vscode.window.showInformationMessage(`Обновлено конфигураций: ${String(ordered.length)}.`);
-          }
-          setConfigurationProgress(services, 'Обновление конфигураций', 'завершено', false);
-          return true;
-        });
-      } catch (error) {
-        setConfigurationProgress(services, 'Обновление конфигураций', 'ошибка', false);
-        showConfigurationCommandError('Ошибка обновления конфигураций.', error, services);
-        return false;
       } finally {
         await endConfigurationOperation();
         services.markConfigurationsClean(completedRootPaths);
@@ -341,6 +259,8 @@ export function registerExtensionCommands(
           services,
         },
         async () => {
+          // Явная команда узла: загрузка всегда с UpdateDBCfg, настройка updateDatabaseAfterLoad не учитывается.
+          const options = { updateDatabase: true, lag: services.databaseConfigLag };
           const ok = target.kind === 'cf'
             ? await runUpdateMainConfiguration(
                 target.name,
@@ -348,7 +268,8 @@ export function registerExtensionCommands(
                 services.workspaceFolder,
                 services.outputChannel,
                 true,
-                createProgressHooks(services, `Обновление ${target.name}`)
+                createProgressHooks(services, `Обновление ${target.name}`),
+                options
               )
             : await runUpdateExtension(
                 target.name,
@@ -356,7 +277,8 @@ export function registerExtensionCommands(
                 services.workspaceFolder,
                 services.outputChannel,
                 true,
-                createProgressHooks(services, `Обновление ${target.name}`)
+                createProgressHooks(services, `Обновление ${target.name}`),
+                options
               );
           return ok;
         }
@@ -407,7 +329,10 @@ export function registerExtensionCommands(
             target.extensionName,
             target.extensionRoot,
             services.workspaceFolder,
-            services.outputChannel
+            services.outputChannel,
+            true,
+            undefined,
+            { updateDatabase: true, lag: services.databaseConfigLag }
           )
       );
     }),
@@ -432,7 +357,8 @@ export function registerExtensionCommands(
             target.extensionRoot,
             services.workspaceFolder,
             services.outputChannel,
-            false
+            false,
+            services.databaseConfigLag
           );
           if (!compiled) {
             return false;
@@ -443,7 +369,9 @@ export function registerExtensionCommands(
             target.extensionRoot,
             services.workspaceFolder,
             services.outputChannel,
-            false
+            false,
+            undefined,
+            { updateDatabase: true, lag: services.databaseConfigLag }
           );
           if (!updated) {
             return false;
@@ -459,7 +387,7 @@ export function registerExtensionCommands(
   );
 }
 
-async function runWithStandaloneServerStopped(
+export async function runWithStandaloneServerStopped(
   services: CommandServices,
   operationTitle: string,
   operation: () => Promise<boolean>
@@ -647,11 +575,11 @@ function isPathInside(filePath: string, rootPath: string): boolean {
   return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
-function yieldToUi(): Promise<void> {
+export function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function showConfigurationCommandError(
+export function showConfigurationCommandError(
   title: string,
   error: unknown,
   services: CommandServices
@@ -669,7 +597,7 @@ function showConfigurationCommandError(
  * Начало операции с конфигурацией: единственная точка инкремента счётчика активных
  * операций статус-бара. Парная точка — {@link clearConfigurationProgress} в finally.
  */
-function beginConfigurationProgress(services: CommandServices, title: string, message: string): void {
+export function beginConfigurationProgress(services: CommandServices, title: string, message: string): void {
   beginConfigurationOperationStatus(title, message);
   services.setTreeProcessingState({ active: true, title, message });
 }
@@ -680,7 +608,7 @@ function beginConfigurationProgress(services: CommandServices, title: string, me
  * (регресс M9). Терминальные текстовые сообщения ('завершено'/'ошибка'/…) тоже идут
  * сюда как текст; фактический декремент выполняет clearConfigurationProgress в finally.
  */
-function setConfigurationProgress(
+export function setConfigurationProgress(
   services: CommandServices,
   title: string,
   message: string,
@@ -694,7 +622,7 @@ function setConfigurationProgress(
  * Завершение операции: единственная точка декремента счётчика активных операций
  * (парная к beginConfigurationProgress). Вызывается из finally каждой команды.
  */
-function clearConfigurationProgress(services: CommandServices): void {
+export function clearConfigurationProgress(services: CommandServices): void {
   endConfigurationOperationStatus();
   services.setTreeProcessingState({ active: false });
 }
@@ -712,7 +640,7 @@ function createImportHooks(
   };
 }
 
-function createProgressHooks(
+export function createProgressHooks(
   services: CommandServices,
   title: string,
   messagePrefix?: string
@@ -816,98 +744,7 @@ function orderImportTargets(targets: ImportTarget[]): ImportTarget[] {
   });
 }
 
-interface ChangedConfigurationPickItem extends vscode.QuickPickItem {
-  target?: ChangedConfiguration;
-  selectAll?: boolean;
-}
-
-async function pickChangedConfigurations(
-  changed: ChangedConfiguration[]
-): Promise<ChangedConfiguration[] | undefined> {
-  return new Promise((resolve) => {
-    const quickPick = vscode.window.createQuickPick<ChangedConfigurationPickItem>();
-    let resolved = false;
-    const selectAllItem: ChangedConfigurationPickItem = {
-      label: '$(check-all) Все изменённые',
-      description: String(changed.length),
-      selectAll: true,
-    };
-    const targetItems = changed.map((target): ChangedConfigurationPickItem => ({
-      label: `${target.kind === 'cf' ? '$(database)' : '$(extensions)'} ${target.name}`,
-      description: target.kind === 'cf' ? 'Основная конфигурация' : 'Расширение',
-      detail: `${String(target.changedFilesCount)} изменённых файлов`,
-      target,
-    }));
-
-    let applyingSelectAll = false;
-    let selectAllActive = false;
-    quickPick.canSelectMany = true;
-    quickPick.title = 'Что обновлять';
-    quickPick.placeholder = 'Выберите конфигурации для обновления';
-    quickPick.items = [selectAllItem, ...targetItems];
-    quickPick.selectedItems = [];
-
-    quickPick.onDidChangeSelection((selection) => {
-      if (applyingSelectAll) {
-        return;
-      }
-      const hasSelectAll = selection.some((item) => item.selectAll);
-      const selectedTargets = selection.filter((item) => item.target);
-      if (hasSelectAll && !selectAllActive) {
-        applyingSelectAll = true;
-        quickPick.selectedItems = [selectAllItem, ...targetItems];
-        selectAllActive = true;
-        applyingSelectAll = false;
-        return;
-      }
-      if (hasSelectAll && selectAllActive && selectedTargets.length < targetItems.length) {
-        applyingSelectAll = true;
-        quickPick.selectedItems = selectedTargets;
-        selectAllActive = false;
-        applyingSelectAll = false;
-        return;
-      }
-      if (!hasSelectAll && selectedTargets.length === targetItems.length) {
-        applyingSelectAll = true;
-        quickPick.selectedItems = [selectAllItem, ...targetItems];
-        selectAllActive = true;
-        applyingSelectAll = false;
-        return;
-      }
-      selectAllActive = hasSelectAll;
-    });
-
-    quickPick.onDidAccept(() => {
-      const selected = quickPick.selectedItems;
-      const targets = selected.some((item) => item.selectAll)
-        ? changed
-        : selected
-            .map((item) => item.target)
-            .filter((item): item is ChangedConfiguration => Boolean(item));
-      resolved = true;
-      quickPick.hide();
-      resolve(targets);
-    });
-    quickPick.onDidHide(() => {
-      quickPick.dispose();
-      if (!resolved) {
-        resolve(undefined);
-      }
-    });
-    quickPick.show();
-  });
-}
-
-function orderUpdateTargets(targets: ChangedConfiguration[]): ChangedConfiguration[] {
-  return [...targets].sort((left, right) => {
-    if (left.kind !== right.kind) {
-      return left.kind === 'cf' ? -1 : 1;
-    }
-    return left.name.localeCompare(right.name);
-  });
-}
-
-function extractRootConfigurationTarget(node: NodeArg): RootConfigurationTarget | null {
+export function extractRootConfigurationTarget(node: NodeArg): RootConfigurationTarget | null {
   const nodeKind = node.nodeKind;
   const xmlPath = node.xmlPath;
   if (!xmlPath) {
@@ -938,7 +775,7 @@ function extractRootConfigurationTarget(node: NodeArg): RootConfigurationTarget 
   return null;
 }
 
-async function runExclusiveConfigurationOperation(
+export async function runExclusiveConfigurationOperation(
   options: {
     title: string;
     startMessage: string;
@@ -993,6 +830,6 @@ async function runExclusiveConfigurationOperation(
   }
 }
 
-async function showOperationAlreadyRunningMessage(): Promise<void> {
+export async function showOperationAlreadyRunningMessage(): Promise<void> {
   await vscode.window.showInformationMessage('Операция с конфигурацией уже выполняется. Дождитесь её завершения.');
 }

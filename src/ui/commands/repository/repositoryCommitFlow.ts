@@ -15,6 +15,12 @@ export type CommitLocalChangesChoice = 'load-first' | 'cancel';
 export interface RepositoryCommitPlan {
   /** Загрузить правки проекта в базу перед помещением. */
   readonly updateDatabaseFirst: boolean;
+  /**
+   * Обновлять ли конфигурацию БД на шаге загрузки (настройка `updateDatabaseAfterLoad`). Для помещения
+   * достаточно основной конфигурации, поэтому режим — выбор пользователя, а не обязательный шаг.
+   * Шага загрузки нет — `false`.
+   */
+  readonly updateDatabaseOnLoad: boolean;
 }
 
 export interface RepositoryCommitOutcome {
@@ -26,15 +32,16 @@ export interface RepositoryCommitOutcome {
 export function planRepositoryCommit(input: {
   readonly dirtyFilesCount: number;
   readonly choice?: CommitLocalChangesChoice;
+  readonly updateDatabaseAfterLoad: boolean;
 }): RepositoryCommitPlan | 'ask' | 'cancel' {
   if (input.dirtyFilesCount <= 0) {
-    return { updateDatabaseFirst: false };
+    return { updateDatabaseFirst: false, updateDatabaseOnLoad: false };
   }
   switch (input.choice) {
     case undefined:
       return 'ask';
     case 'load-first':
-      return { updateDatabaseFirst: true };
+      return { updateDatabaseFirst: true, updateDatabaseOnLoad: input.updateDatabaseAfterLoad };
     case 'cancel':
       return 'cancel';
   }

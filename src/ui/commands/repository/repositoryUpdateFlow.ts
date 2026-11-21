@@ -22,6 +22,8 @@ export type UpdateLocalChangesChoice = 'receive-then-load' | 'receive-without-im
 export interface RepositoryUpdatePlan {
   /** Загрузить правки проекта в базу после получения, до импорта. */
   readonly loadChangesAfterReceive: boolean;
+  /** Обновлять ли конфигурацию БД на шаге загрузки (настройка `updateDatabaseAfterLoad`); шага нет — `false`. */
+  readonly updateDatabaseOnLoad: boolean;
   /** Разрешён ли импорт после получения; выполняется он, только если получение что-то получило. */
   readonly importAfterReceive: boolean;
 }
@@ -41,6 +43,7 @@ export function planRepositoryUpdate(input: {
   readonly lockedInSelection: readonly string[];
   readonly lockedOverwriteConfirmed?: boolean;
   readonly choice?: UpdateLocalChangesChoice;
+  readonly updateDatabaseAfterLoad: boolean;
 }): RepositoryUpdateDecision {
   if (input.lockedInSelection.length > 0) {
     if (input.lockedOverwriteConfirmed === undefined) {
@@ -51,15 +54,15 @@ export function planRepositoryUpdate(input: {
     }
   }
   if (input.dirtyFilesCount <= 0) {
-    return { loadChangesAfterReceive: false, importAfterReceive: true };
+    return { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: true };
   }
   switch (input.choice) {
     case undefined:
       return 'ask-local-changes';
     case 'receive-then-load':
-      return { loadChangesAfterReceive: true, importAfterReceive: true };
+      return { loadChangesAfterReceive: true, updateDatabaseOnLoad: input.updateDatabaseAfterLoad, importAfterReceive: true };
     case 'receive-without-import':
-      return { loadChangesAfterReceive: false, importAfterReceive: false };
+      return { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: false };
     case 'cancel':
       return 'cancel';
   }

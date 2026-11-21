@@ -2,7 +2,7 @@
  * MCP-инструменты жизненного цикла конфигурации/расширения и мостов CFE.
  *
  * Домен «configLifecycle»: create_configuration, create_extension, cfe_borrow,
- * cfe_patch_method, cfe_diff, execute_command, update_database_configuration.
+ * cfe_patch_method, cfe_diff, execute_command, update_database_configuration, load_configuration_changes.
  *
  * Долгие инструменты (обмен с базой через Конфигуратор, команды импорта/обновления) обёрнуты в
  * `gate.wrapLongRunning`: пульс держит поток вызова живым, исход попадает в `lastOperation`.
@@ -14,13 +14,19 @@ import { runDumpConfigurationToCf, runLoadConfigurationFromCf } from '../../comm
 import { runDumpAllExtensionsToCfe, runLoadAllExtensionsFromCfe } from '../../commands/ext/CfeBatchCommandRunner';
 import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport } from '../../../infra/cfFile';
 import { buildCfApplyTarget, resolveApplyTargetFromNode } from '../../commands/ext/CfFileTarget';
-import { runApplyDatabaseConfigurationWithOutcome } from '../../commands/ext/ExtensionCommandRunner';
+import {
+  runApplyDatabaseConfigurationWithOutcome,
+  runUpdateExtension,
+  runUpdateMainConfiguration,
+} from '../../commands/ext/ExtensionCommandRunner';
 import {
   MCP_CONFIGURATION_OPERATION_BUSY_MESSAGE,
   isConfigurationOperationRunning,
   runWithConfigurationOperationLockOrThrow,
 } from '../../commands/ext/configurationOperationLock';
-import { findChangedConfiguration } from '../../commands/repository/repositoryPostSync';
+import { findChangedConfiguration, refreshRepositoryUi } from '../../commands/repository/repositoryPostSync';
+import type { DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
+import { settleCfFileLoadLag, settleCfeBatchLoadLag, type DatabaseLoadOutcome } from '../../commands/ext/databaseLoadPlan';
 import { canonicalToLegacyModulePath, resolveConfigurationXmlByCanonical } from '../McpPathResolvers';
 import type { McpRegistrationDeps } from './McpRegistrationDeps';
 
@@ -176,19 +182,24 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           extensionName,
           silent: true,
         });
+        const applyTarget = buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName ?? '');
         if (!loaded.success) {
+          // Сбой /LoadCfg оставляет побочные эффекты (часть изменений могла быть применена) — консервативно.
+          services.databaseConfigLag.markBehind(applyTarget, 'cf-file-load');
           throw new Error(loaded.failureReason ?? (
             'Загрузка из файла не выполнена. Часть изменений могла быть применена — проверьте состояние базы. '
             + 'Подробности — в журнале «1С Редактор».'
           ));
         }
         const appliedAutomatically = loaded.appliedToDatabase === true;
+        settleCfFileLoadLag(services.databaseConfigLag, applyTarget, appliedAutomatically);
         // Уже применённое агентом новое расширение повторно не применяется.
         const applyOutcome = applyToDatabase === true && !appliedAutomatically
           ? await runApplyDatabaseConfigurationWithOutcome(
-              buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName ?? ''),
+              applyTarget,
               services.workspaceFolder,
               services.outputChannel,
+              services.databaseConfigLag,
               false,
               true
             )
@@ -202,6 +213,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           inputFile,
           extensionName: extensionName ?? '',
           databaseConfigurationUpdated: applied || appliedAutomatically,
+          databaseConfigurationBehind: services.databaseConfigLag.isBehind(applyTarget),
           projectSourcesOutdated: true,
           // Поля агентской ветки; в batch-ответе их нет (ключи без значения не публикуются).
           ...definedFields({
@@ -302,6 +314,8 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           silent: true,
         });
         const report = assertBatchReport(result.report, 'Пакетная загрузка расширений не выполнена.', result.failureReason);
+        const lagTargetOf = (name: string): DatabaseLagTarget => buildCfApplyTarget(services.workspaceFolder.uri.fsPath, name);
+        settleCfeBatchLoadLag(services.databaseConfigLag, report, lagTargetOf);
         if (report.failedAt) {
           // Частичный отказ загрузки — исключение, а не «успех со списком»:
           // база в промежуточном состоянии, и штатным итогом это не является.
@@ -329,9 +343,10 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           // расширения, которых мы не грузили.
           for (const extensionName of loaded.filter((name) => !appliedAutomatically.includes(name))) {
             const outcome = await runApplyDatabaseConfigurationWithOutcome(
-              buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName),
+              lagTargetOf(extensionName),
               services.workspaceFolder,
               services.outputChannel,
+              services.databaseConfigLag,
               false,
               true
             );
@@ -356,6 +371,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           // что в базу могло уехать чужое поколение бэкапа.
           restoredByFileName: report.restoredByFileName,
           databaseConfigurationUpdated: applyToDatabase === true || appliedAutomatically.length > 0,
+          databaseConfigurationBehind: loaded.some((name) => services.databaseConfigLag.isBehind(lagTargetOf(name))),
           projectSourcesOutdated: true,
           appliedAutomatically,
           ...definedFields({
@@ -447,7 +463,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     'v8vscedit_execute_command',
     {
       title: 'Выполнить команду расширения',
-      description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations.',
+      description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
       inputSchema: z.object({
         command: z.enum([...ALLOWED_COMMANDS] as [string, ...string[]]),
       }),
@@ -468,7 +484,7 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
     'v8vscedit_update_database_configuration',
     {
       title: 'Обновить конфигурацию БД',
-      description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_execute_command с updateChangedConfigurations. Принимает канонический путь корня: Конфигурация или Расширение.',
+      description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Снимает признак «конфигурация БД не обновлена» (databaseConfigurationBehind). Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_load_configuration_changes. Принимает канонический путь корня: Конфигурация или Расширение.',
       inputSchema: z.object({
         path: z.string(),
         configuration: z.string().optional(),
@@ -488,7 +504,9 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
         throw new Error(`Путь "${path}" должен указывать на корень конфигурации или расширения.`);
       }
       return runWithConfigurationOperationLockOrThrow(async () => {
-        const updated = await runApplyDatabaseConfigurationWithOutcome(target, services.workspaceFolder, services.outputChannel, false, true);
+        const updated = await runApplyDatabaseConfigurationWithOutcome(
+          target, services.workspaceFolder, services.outputChannel, services.databaseConfigLag, false, true
+        );
         if (!updated.success) {
           throw new Error('Обновление конфигурации БД не выполнено. Подробности — в журнале «1С Редактор».');
         }
@@ -502,11 +520,71 @@ export function registerConfigLifecycleTools(server: McpServer, deps: McpRegistr
           name: target.name,
           databaseConfigurationUpdated: true,
           unloadedChangedFilesCount,
+          databaseConfigurationBehind: services.databaseConfigLag.isBehind(target),
           ...(unloadedChangedFilesCount > 0
-            ? { note: '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_execute_command v8vscedit.updateChangedConfigurations' }
+            ? { note: '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_load_configuration_changes' }
             : {}),
           // Предупреждения сверки после применения расширения (E11: имя в базе взято из файла).
           ...definedFields({ warnings: mergeWarnings(updated.warnings) }),
+        };
+      });
+    })
+  );
+
+  server.registerTool(
+    'v8vscedit_load_configuration_changes',
+    {
+      title: 'Загрузить изменения в базу',
+      description: 'Загружает изменённые файлы проекта корня конфигурации или расширения в основную конфигурацию базы (тот же путь, что команды «Обновить в базе» и «Загрузить в базу без обновления БД»). updateDatabase обязателен: true — после загрузки обновить конфигурацию БД (/UpdateDBCfg, возможна долгая реструктуризация данных); false — только основная конфигурация (для помещения в хранилище этого достаточно), конфигурация БД отмечается как не обновлённая (databaseConfigurationBehind) до v8vscedit_update_database_configuration. Если изменений нет, а конфигурация БД отстаёт, при updateDatabase: true выполняется только обновление БД. Принимает канонический путь корня: Конфигурация или Расширение.',
+      inputSchema: z.object({
+        path: z.string(),
+        configuration: z.string().optional(),
+        // Без умолчания: минуты реструктуризации — решение вызывающего агента, а не настройки.
+        updateDatabase: z.boolean(),
+      }),
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    // gate.afterMutation не вызывается: файлы проекта не менялись (как у update_database_configuration).
+    ({ path, configuration, updateDatabase }, extra) => gate.wrapLongRunning('v8vscedit_load_configuration_changes', extra, async () => {
+      resolveConfigurationXmlByCanonical(deps.paths, path, configuration);
+      const target = resolveApplyTargetFromNode(deps.paths.resolveNode(path, configuration));
+      /* c8 ignore next 3 -- защитная ветка: корень с Configuration.xml проверен выше */
+      if (!target) {
+        throw new Error(`Путь "${path}" должен указывать на корень конфигурации или расширения.`);
+      }
+      return runWithConfigurationOperationLockOrThrow(async () => {
+        let outcome: DatabaseLoadOutcome = { databaseUpdated: false, warnings: [] };
+        const options = {
+          updateDatabase,
+          lag: services.databaseConfigLag,
+          silent: true,
+          onOutcome: (reported: DatabaseLoadOutcome) => { outcome = reported; },
+        };
+        const loaded = target.kind === 'cfe'
+          // У корня расширения имя цели и есть имя расширения (resolveApplyTargetFromNode).
+          ? await runUpdateExtension(
+              target.name, target.rootPath, services.workspaceFolder, services.outputChannel, false, undefined, options
+            )
+          : await runUpdateMainConfiguration(
+              target.name, target.rootPath, services.workspaceFolder, services.outputChannel, false, undefined, options
+            );
+        if (!loaded) {
+          throw new Error('Загрузка изменений в базу не выполнена. Подробности — в журнале «1С Редактор».');
+        }
+        services.markConfigurationsClean([target.rootPath]);
+        refreshRepositoryUi(services);
+        return {
+          path,
+          kind: target.kind,
+          name: target.name,
+          updateDatabase,
+          // Фактически: при updateDatabase: true без изменений и без отставания UpdateDBCfg не выполняется.
+          databaseConfigurationUpdated: outcome.databaseUpdated,
+          databaseConfigurationBehind: services.databaseConfigLag.isBehind(target),
+          // Предупреждения сверки после применения расширения (E11: имя в базе взято из файла).
+          ...definedFields({ warnings: mergeWarnings(outcome.warnings) }),
         };
       });
     })

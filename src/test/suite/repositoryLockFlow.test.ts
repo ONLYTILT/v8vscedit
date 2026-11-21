@@ -12,49 +12,53 @@ import {
 
 suite('repositoryLockFlow: planRepositoryLock (поправки Э14)', () => {
   for (const revisedSetting of [true, false]) {
-    test(`чистый проект, revisedSetting=${String(revisedSetting)}: revised = настройка, обновления БД нет, импорт по логу разрешён`, () => {
-      assert.deepStrictEqual(
-        planRepositoryLock({ revisedSetting, dirtyFilesCount: 0 }),
-        { revised: revisedSetting, updateDatabaseFirst: false, importAfterLock: true }
-      );
-    });
+    for (const updateDatabaseAfterLoad of [true, false]) {
+      const tag = `revisedSetting=${String(revisedSetting)}, updateDatabaseAfterLoad=${String(updateDatabaseAfterLoad)}`;
 
-    test(`грязный проект без ответа, revisedSetting=${String(revisedSetting)}: вопрос задаётся при любом значении настройки`, () => {
-      assert.strictEqual(planRepositoryLock({ revisedSetting, dirtyFilesCount: 3 }), 'ask');
-    });
-
-    test(`update-then-lock, revisedSetting=${String(revisedSetting)}: сначала загрузка в базу, revised = настройка`, () => {
-      assert.deepStrictEqual(
-        planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'update-then-lock' }),
-        { revised: revisedSetting, updateDatabaseFirst: true, importAfterLock: true }
-      );
-    });
-
-    test(`lock-without-import, revisedSetting=${String(revisedSetting)}: без -revised, без обновления БД, без импорта`, () => {
-      assert.deepStrictEqual(
-        planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'lock-without-import' }),
-        { revised: false, updateDatabaseFirst: false, importAfterLock: false }
-      );
-    });
-
-    test(`cancel, revisedSetting=${String(revisedSetting)}: 'cancel'`, () => {
-      assert.strictEqual(planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'cancel' }), 'cancel');
-    });
-
-    test(`dirty=0 и choice задан (revisedSetting=${String(revisedSetting)}): choice не используется — вопрос не задавался`, () => {
-      const choices: LockLocalChangesChoice[] = ['update-then-lock', 'lock-without-import', 'cancel'];
-      for (const choice of choices) {
+      test(`чистый проект, ${tag}: revised = настройка, шага загрузки нет (updateDatabaseOnLoad=false), импорт по логу разрешён`, () => {
         assert.deepStrictEqual(
-          planRepositoryLock({ revisedSetting, dirtyFilesCount: 0, choice }),
-          { revised: revisedSetting, updateDatabaseFirst: false, importAfterLock: true }
+          planRepositoryLock({ revisedSetting, dirtyFilesCount: 0, updateDatabaseAfterLoad }),
+          { revised: revisedSetting, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: true }
         );
-      }
-    });
+      });
+
+      test(`грязный проект без ответа, ${tag}: вопрос задаётся при любом значении настройки`, () => {
+        assert.strictEqual(planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, updateDatabaseAfterLoad }), 'ask');
+      });
+
+      test(`update-then-lock, ${tag}: сначала загрузка в базу (с обновлением БД — по настройке), revised = настройка`, () => {
+        assert.deepStrictEqual(
+          planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'update-then-lock', updateDatabaseAfterLoad }),
+          { revised: revisedSetting, updateDatabaseFirst: true, updateDatabaseOnLoad: updateDatabaseAfterLoad, importAfterLock: true }
+        );
+      });
+
+      test(`lock-without-import, ${tag}: без -revised, без загрузки (updateDatabaseOnLoad=false) и без импорта`, () => {
+        assert.deepStrictEqual(
+          planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'lock-without-import', updateDatabaseAfterLoad }),
+          { revised: false, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: false }
+        );
+      });
+
+      test(`cancel, ${tag}: 'cancel'`, () => {
+        assert.strictEqual(planRepositoryLock({ revisedSetting, dirtyFilesCount: 3, choice: 'cancel', updateDatabaseAfterLoad }), 'cancel');
+      });
+
+      test(`dirty=0 и choice задан (${tag}): choice не используется — вопрос не задавался`, () => {
+        const choices: LockLocalChangesChoice[] = ['update-then-lock', 'lock-without-import', 'cancel'];
+        for (const choice of choices) {
+          assert.deepStrictEqual(
+            planRepositoryLock({ revisedSetting, dirtyFilesCount: 0, choice, updateDatabaseAfterLoad }),
+            { revised: revisedSetting, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: true }
+          );
+        }
+      });
+    }
   }
 });
 
 suite('repositoryLockFlow: shouldImportAfterLock', () => {
-  const plan = (importAfterLock: boolean): RepositoryLockPlan => ({ revised: true, updateDatabaseFirst: false, importAfterLock });
+  const plan = (importAfterLock: boolean): RepositoryLockPlan => ({ revised: true, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock });
   const table: { importAfterLock: boolean; received: boolean; expected: boolean }[] = [
     { importAfterLock: true, received: true, expected: true },
     { importAfterLock: true, received: false, expected: false },

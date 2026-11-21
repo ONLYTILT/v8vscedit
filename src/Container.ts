@@ -70,6 +70,8 @@ import { AiSecretStorage } from './infra/ai/AiSecretStorage';
 import { disposeCachedAgentOperationServices, setProjectSecretStorage } from './ui/commands/ext/ExtensionCommandRunner';
 import { registerAgentSettingsWatcher } from './ui/commands/ext/agent/agentSettingsWatcher';
 import { disposeRepositoryCommandStatusBar } from './ui/commands/repository/RepositoryCommandRunner';
+import { DatabaseConfigLagStore } from './infra/database/DatabaseConfigLag';
+import { DatabaseLagStatusBar } from './ui/database/DatabaseLagStatusBar';
 import { GitStateObserver } from './ui/git/GitStateObserver';
 import type { GitApiLike, GitExtensionLike } from './ui/git/gitExtensionApi';
 
@@ -135,6 +137,8 @@ export class Container {
   readonly aiMcpViewProvider: AiMcpViewProvider;
   readonly lspManager: LspManager;
   readonly changeDetector: ConfigurationChangeDetector;
+  /** Признак «конфигурация БД отстаёт» (локальный учёт): общий для команд, MCP и индикатора статус-бара. */
+  readonly databaseConfigLag: DatabaseConfigLagStore;
   // Фоновая проверка изменений с single-flight: проход по выгрузке не должен блокировать поток
   // Extension Host, а повторные запросы во время прохода схлопываются в один повтор.
   private readonly changeDetection: ChangeDetectionRunner<ChangedConfiguration[]>;
@@ -311,6 +315,8 @@ export class Container {
     this.changeDetector = new ConfigurationChangeDetector(workspaceFolder.uri.fsPath, {
       log: (line) => this.outputChannel.appendLine(line),
     });
+    this.databaseConfigLag = new DatabaseConfigLagStore(workspaceFolder.uri.fsPath, this.outputChannel);
+    context.subscriptions.push(new DatabaseLagStatusBar(this.databaseConfigLag));
     this.changeDetection = new ChangeDetectionRunner<ChangedConfiguration[]>({
       // Состав конфигураций берётся при старте КАЖДОГО прогона: повтор подхватывает новый состав.
       run: (signal) => this.changeDetector.detect(this.treeProvider.getEntries(), signal),
@@ -397,6 +403,8 @@ export class Container {
     // поэтому кэш `findConfigRoot` нужно сбросить до перестроения дерева.
     this.repositoryService.invalidateConfigRootCache();
     this.treeProvider.updateEntries(entries);
+    // Удалённое из проекта расширение не должно вечно висеть в индикаторе «БД не обновлена».
+    this.databaseConfigLag.pruneMissingRoots(entries);
     // Состав корней выгрузки мог измениться — синхронизируем представление
     // изменений (заодно пересчитывается его модель git-статуса).
     this.changesConfigRoots = entries;
@@ -516,6 +524,7 @@ export class Container {
       setTreeMessage: () => undefined,
       setTreeProcessingState: (state) => this.setTreeProcessingState(state),
       refreshActionsView: () => this.refreshActionsView(),
+      databaseConfigLag: this.databaseConfigLag,
     };
   }
 

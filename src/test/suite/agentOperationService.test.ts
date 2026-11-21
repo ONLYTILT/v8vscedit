@@ -117,7 +117,7 @@ suite('AgentOperationService', () => {
       const factory = new ScriptedFactory();
       const service = newService(tempRoot, factory);
       await service.updateDatabaseConfiguration(target());
-      await service.loadChangedAndUpdate(target());
+      await service.loadChanged(target(), { updateDatabase: true });
 
       assert.strictEqual(factory.count('common connect-ib'), 1);
       assert.strictEqual(factory.count('common disconnect-ib'), 0);
@@ -231,7 +231,7 @@ suite('AgentOperationService', () => {
       const transport = new FakeTransport();
       const service = newService(tempRoot, new FakeTransportFactory(transport));
 
-      await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
+      await service.loadChanged({ kind: 'cf', name: 'Основная', rootPath: configRoot }, { updateDatabase: true });
 
       const agentRoot = mirrorDirOf(tempRoot);
       // Изменённый модуль скопирован.
@@ -270,7 +270,7 @@ suite('AgentOperationService', () => {
       const transport = new FakeTransport();
       const service = newService(tempRoot, new FakeTransportFactory(transport));
 
-      await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
+      await service.loadChanged({ kind: 'cf', name: 'Основная', rootPath: configRoot }, { updateDatabase: true });
 
       const loadCommand = transport.commands.find((command) => command.startsWith('config load-config-from-files'));
       assert.ok(loadCommand);
@@ -307,7 +307,7 @@ suite('AgentOperationService', () => {
 
       const transport = new FakeTransport();
       const service = newService(tempRoot, new FakeTransportFactory(transport));
-      await service.loadChangedAndUpdate({ kind: 'cf', name: 'Основная', rootPath: configRoot });
+      await service.loadChanged({ kind: 'cf', name: 'Основная', rootPath: configRoot }, { updateDatabase: true });
 
       const agentRoot = mirrorDirOf(tempRoot);
       assert.strictEqual(
@@ -397,7 +397,9 @@ suite('AgentOperationService: Э4, все операции идут через �
     assert.deepStrictEqual(factory.log.slice(-3), [
       PROPERTIES_GET_ALL, 'config update-db-cfg --extension=Расш3', PROPERTIES_GET_ALL,
     ]);
-    assert.strictEqual(factory.count(PROPERTIES_GET_ALL), 6, 'по два списка на каждое из трёх применений');
+    // По два списка на каждое из трёх применений и guard Э32 у полной загрузки ДО загрузки из файлов
+    // (загрузка в отсутствующее расширение молча создаёт заглушку).
+    assert.strictEqual(factory.count(PROPERTIES_GET_ALL), 7, 'по два списка на применение + guard до загрузки из файлов');
   });
 
   test('cf: применение не запрашивает список расширений (guard только для cfe)', async () => {
@@ -411,29 +413,29 @@ suite('AgentOperationService: Э4, все операции идут через �
     return run({ onMessage: (m) => messages.push(m) }).then(() => messages);
   }
 
-  test('loadChangedAndUpdate без кэша хешей → полная загрузка', async () => {
+  test('loadChanged без кэша хешей → полная загрузка', async () => {
     const factory = new ScriptedFactory();
     const service = newService(tempRoot, factory);
-    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    const messages = await messagesOf((hooks) => service.loadChanged(cf(), { updateDatabase: true }, hooks));
     assert.ok(messages.includes('Кэш изменений не найден, выполняется полная загрузка.'));
     assert.ok(factory.log.some((c) => c.startsWith('config load-config-from-files') && !c.includes('--partial')));
   });
 
-  test('loadChangedAndUpdate после удаления файла → полная загрузка с сообщением об удалении', async () => {
+  test('loadChanged после удаления файла → полная загрузка с сообщением об удалении', async () => {
     saveCurrentHashes();
     fs.rmSync(path.join(configRoot, 'Catalogs', 'Товары.xml'));
     const factory = new ScriptedFactory();
     const service = newService(tempRoot, factory);
-    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    const messages = await messagesOf((hooks) => service.loadChanged(cf(), { updateDatabase: true }, hooks));
     assert.ok(messages.includes('Обнаружено удаление файлов, выполняется полная загрузка.'), messages.join('|'));
   });
 
-  test('loadChangedAndUpdate после переименования объекта → полная загрузка с сообщением о переименовании', async () => {
+  test('loadChanged после переименования объекта → полная загрузка с сообщением о переименовании', async () => {
     saveCurrentHashes();
     fs.renameSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), path.join(configRoot, 'Catalogs', 'Номенклатура.xml'));
     const factory = new ScriptedFactory();
     const service = newService(tempRoot, factory);
-    const messages = await messagesOf((hooks) => service.loadChangedAndUpdate(cf(), hooks));
+    const messages = await messagesOf((hooks) => service.loadChanged(cf(), { updateDatabase: true }, hooks));
     assert.ok(messages.includes('Обнаружено переименование объектов, выполняется полная загрузка.'), messages.join('|'));
   });
 });

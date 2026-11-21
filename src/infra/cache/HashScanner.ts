@@ -1,7 +1,14 @@
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { hashContent, isSupportedConfigFile, type HashCacheSnapshot } from './HashCache';
+import {
+  buildScopeKey,
+  diffHashSnapshots,
+  hashContent,
+  isSupportedConfigFile,
+  loadHashCache,
+  type HashCacheSnapshot,
+} from './HashCache';
 import {
   emptyHashStatMemo,
   isRacyFingerprint,
@@ -361,4 +368,20 @@ function rethrowUnlessGone(error: unknown): void {
     return;
   }
   throw error;
+}
+
+/**
+ * Есть ли у цели изменения относительно базовой линии — ровно тот же критерий, что у первой проверки
+ * `import-git-changes` (нет базовой линии — все файлы новые). Нужна пакетной загрузке без обновления БД:
+ * CLI на «изменений нет» отвечает кодом 0, и без предпроверки это нельзя отличить от успешной загрузки.
+ */
+export async function hasPendingHashChanges(
+  projectRoot: string,
+  kind: 'cf' | 'cfe',
+  configDir: string,
+  extensionName = ''
+): Promise<boolean> {
+  const scopeKey = buildScopeKey(kind, configDir, extensionName);
+  const diff = diffHashSnapshots(loadHashCache(projectRoot, scopeKey), await scanHashSnapshot(projectRoot, scopeKey, configDir));
+  return diff.added.length + diff.modified.length + diff.deleted.length > 0;
 }

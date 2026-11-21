@@ -13,6 +13,8 @@
 import * as vscode from 'vscode';
 import type { CommandServices } from '../_shared';
 import { runDumpAllExtensionsToCfe, runLoadAllExtensionsFromCfe } from './CfeBatchCommandRunner';
+import { buildCfApplyTarget } from './CfFileTarget';
+import { settleCfeBatchLoadLag } from './databaseLoadPlan';
 import { CFE_MANIFEST_FILE_NAME, type CfeBatchReport, type CfeBatchReportItem } from '../../../infra/cfFile';
 import {
   endConfigurationOperation,
@@ -192,6 +194,8 @@ async function loadAllExtensionsFromCfe(services: CommandServices): Promise<void
     await endConfigurationOperation();
   }
 
+  // Признак «БД отстаёт» по каждому загруженному расширению — та же функция, что у MCP load_all_cfe.
+  settleCfeBatchLoadLag(services.databaseConfigLag, report, (name) => buildCfApplyTarget(services.workspaceFolder.uri.fsPath, name));
   // Новые расширения, применённые агентом сразу, и итог сверки — в любом исходе, в т.ч. при остановке на сбое:
   // база уже изменена, и молчать об этом нельзя.
   const appliedMessage = buildAppliedImmediatelyMessage(report);

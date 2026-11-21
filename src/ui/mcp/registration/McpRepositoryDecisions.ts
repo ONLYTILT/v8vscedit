@@ -57,7 +57,20 @@ const OVERWRITE_LOCKED_DECLINED =
   'Получение не выполнено: в выборке есть захваченные вами объекты (overwriteLocked: false).';
 const ABORTED_BY_PARAMETER = "отменено параметром localChanges: 'abort'.";
 
-export function resolveMcpLockPlan(input: {
+/**
+ * Режим шага загрузки: явный параметр агента или настройка `updateDatabaseAfterLoad`. Это не вопрос диалога
+ * (там умолчания нет), а режим работы — поэтому умолчание допустимо.
+ */
+interface McpLoadModeInput {
+  readonly updateDatabase?: boolean;
+  readonly updateDatabaseAfterLoad: boolean;
+}
+
+function effectiveUpdateDatabase(input: McpLoadModeInput): boolean {
+  return input.updateDatabase ?? input.updateDatabaseAfterLoad;
+}
+
+export function resolveMcpLockPlan(input: McpLoadModeInput & {
   readonly revisedSetting: boolean;
   readonly dirtyFilesCount: number;
   readonly localChanges?: McpLockLocalChanges;
@@ -66,6 +79,7 @@ export function resolveMcpLockPlan(input: {
     revisedSetting: input.revisedSetting,
     dirtyFilesCount: input.dirtyFilesCount,
     choice: input.localChanges === undefined ? undefined : LOCK_CHOICE[input.localChanges],
+    updateDatabaseAfterLoad: effectiveUpdateDatabase(input),
   });
   if (plan === 'ask') {
     throw new Error(
@@ -80,7 +94,7 @@ export function resolveMcpLockPlan(input: {
   return plan;
 }
 
-export function resolveMcpUpdatePlan(input: {
+export function resolveMcpUpdatePlan(input: McpLoadModeInput & {
   readonly dirtyFilesCount: number;
   readonly lockedInSelection: readonly string[];
   readonly overwriteLocked?: boolean;
@@ -91,6 +105,7 @@ export function resolveMcpUpdatePlan(input: {
     lockedInSelection: input.lockedInSelection,
     lockedOverwriteConfirmed: input.overwriteLocked,
     choice: input.localChanges === undefined ? undefined : UPDATE_CHOICE[input.localChanges],
+    updateDatabaseAfterLoad: effectiveUpdateDatabase(input),
   });
   switch (decision) {
     case 'ask-locked-overwrite':
@@ -113,13 +128,14 @@ export function resolveMcpUpdatePlan(input: {
   }
 }
 
-export function resolveMcpCommitPlan(input: {
+export function resolveMcpCommitPlan(input: McpLoadModeInput & {
   readonly dirtyFilesCount: number;
   readonly localChanges?: McpCommitLocalChanges;
 }): RepositoryCommitPlan {
   const plan = planRepositoryCommit({
     dirtyFilesCount: input.dirtyFilesCount,
     choice: input.localChanges === undefined ? undefined : COMMIT_CHOICE[input.localChanges],
+    updateDatabaseAfterLoad: effectiveUpdateDatabase(input),
   });
   if (plan === 'ask') {
     throw new Error(

@@ -350,6 +350,7 @@ export class AgentConfigEmulator {
         return;
       case 'config load-config-from-files':
         this.load(cmd);
+        this.extensions.noteLoadFromFiles(this.option(cmd, 'extension'));
         return;
       default:
         // connect-ib, disconnect-ib и прочие команды жизненного цикла: ответ «успешно».

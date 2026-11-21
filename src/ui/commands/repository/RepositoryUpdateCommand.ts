@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
+import { readUpdateDatabaseAfterLoad, withLoadModeNote } from '../ext/databaseSettings';
 import { describeRepositoryActionSuccess } from './RepositoryCommandRunner';
 import { runUpdateChain } from './repositoryChains';
 import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
@@ -86,15 +87,16 @@ async function resolveUpdatePlan(
   lockedInSelection: readonly string[]
 ): Promise<RepositoryUpdatePlan | 'cancel'> {
   const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
+  const updateDatabaseAfterLoad = readUpdateDatabaseAfterLoad();
   let lockedOverwriteConfirmed: boolean | undefined;
   let choice: UpdateLocalChangesChoice | undefined;
   // Таблица решения одна: после каждого ответа она сама скажет, что делать дальше.
   for (;;) {
-    const plan = planRepositoryUpdate({ dirtyFilesCount, lockedInSelection, lockedOverwriteConfirmed, choice });
+    const plan = planRepositoryUpdate({ dirtyFilesCount, lockedInSelection, lockedOverwriteConfirmed, choice, updateDatabaseAfterLoad });
     if (plan === 'ask-locked-overwrite') {
       lockedOverwriteConfirmed = await promptOverwriteLocked(lockedInSelection);
     } else if (plan === 'ask-local-changes') {
-      choice = await promptUpdateWithLocalChanges(target, dirtyFilesCount);
+      choice = await promptUpdateWithLocalChanges(target, dirtyFilesCount, updateDatabaseAfterLoad);
     } else {
       return plan;
     }
@@ -138,12 +140,19 @@ interface UpdateChoiceItem extends vscode.QuickPickItem {
  * Импорт после получения перезаписывает файлы проекта из базы, поэтому незагруженные правки иначе
  * пропали бы молча. Вопрос с ответом — запрет №18 его не касается.
  */
-async function promptUpdateWithLocalChanges(target: RepositoryTarget, dirtyFilesCount: number): Promise<UpdateLocalChangesChoice> {
+async function promptUpdateWithLocalChanges(
+  target: RepositoryTarget,
+  dirtyFilesCount: number,
+  updateDatabaseAfterLoad: boolean
+): Promise<UpdateLocalChangesChoice> {
   const items: UpdateChoiceItem[] = [
     {
       id: 'receive-then-load',
       label: '$(sync) Получить, затем загрузить правки в базу',
-      detail: 'Правки должны относиться к захваченным объектам: незахваченный объект платформа загрузить не даст',
+      detail: withLoadModeNote(
+        'Правки должны относиться к захваченным объектам: незахваченный объект платформа загрузить не даст',
+        updateDatabaseAfterLoad
+      ),
     },
     {
       id: 'receive-without-import',

@@ -19,7 +19,12 @@ import {
   type RepositoryLockPlan,
 } from './repositoryLockFlow';
 import { toCliServices } from './repositoryNodeTargets';
-import { importTargetFromDatabase, updateTargetDatabase, type RepositoryChainServices } from './repositoryPostSync';
+import {
+  importTargetFromDatabase,
+  loadTargetChangesIntoDatabase,
+  toDatabaseLagTarget,
+  type RepositoryChainServices,
+} from './repositoryPostSync';
 import {
   describeImportFailureAfterReceive,
   describeLoadFailureAfterReceive,
@@ -54,7 +59,32 @@ const LOAD_BEFORE_LOCK_FAILED =
 const LOAD_BEFORE_COMMIT_FAILED =
   'Загрузка правок проекта в базу не выполнена; помещение не выполнялось. Подробности — в журнале «1С Редактор».';
 
-export interface LockChainResult {
+/**
+ * Поля признака «БД отстаёт» в результатах цепочек: `databaseConfigurationUpdated` — шаг загрузки цепочки
+ * выполнен С обновлением БД; `databaseConfigurationBehind` — признак цели в конце цепочки (оба могут быть
+ * true: UpdateDBCfg до захвата не покрывает версии, полученные захватом позже).
+ */
+export interface DatabaseLagFields {
+  readonly databaseConfigurationUpdated: boolean;
+  readonly databaseConfigurationBehind: boolean;
+}
+
+function databaseLagFields(services: RepositoryChainServices, target: RepositoryTarget, updated: boolean): DatabaseLagFields {
+  return {
+    databaseConfigurationUpdated: updated,
+    databaseConfigurationBehind: services.databaseConfigLag.isBehind(toDatabaseLagTarget(target)),
+  };
+}
+
+/**
+ * Получение версий из хранилища (и очистка ссылок при помещении) меняет ОСНОВНУЮ конфигурацию базы без
+ * UpdateDBCfg — для индикатора это то же отставание, что загрузка без обновления.
+ */
+function markReceivedFromRepository(services: RepositoryChainServices, target: RepositoryTarget): void {
+  services.databaseConfigLag.markBehind(toDatabaseLagTarget(target), 'repository-receive');
+}
+
+export interface LockChainResult extends DatabaseLagFields {
   readonly lockedObjects: string[];
   readonly requestedObjects: string[];
   readonly receivedFromRepository: boolean;
@@ -78,10 +108,14 @@ export async function runLockChain(
 ): Promise<LockChainResult> {
   const requestedObjects = services.repositoryService.buildObjectsSelectionForNode(node, recursive).fullNames;
   // Сбой загрузки (в т.ч. отказ платформы загрузить незахваченный объект) — захвата не было.
-  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
+  if (plan.updateDatabaseFirst
+    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
     throw new RepositoryStepFailedError(LOAD_BEFORE_LOCK_FAILED);
   }
   const outcome = await executeRepositoryLockAction(toCliServices(services), node, recursive, { revised: plan.revised });
+  if (outcome.receivedFromRepository) {
+    markReceivedFromRepository(services, target);
+  }
   const warnings: string[] = [];
   let projectImported = false;
   let projectBehind = false;
@@ -103,10 +137,11 @@ export async function runLockChain(
     projectImported,
     projectBehind,
     warnings,
+    ...databaseLagFields(services, target, plan.updateDatabaseFirst && plan.updateDatabaseOnLoad),
   };
 }
 
-export interface UpdateChainResult {
+export interface UpdateChainResult extends DatabaseLagFields {
   readonly receivedFromRepository: boolean;
   readonly changesLoadedAfter: boolean;
   readonly projectImported: boolean;
@@ -124,7 +159,11 @@ export async function runUpdateChain(
 ): Promise<UpdateChainResult> {
   const outcome = await executeRepositoryUpdateAction(toCliServices(services), node, request);
   const received = outcome.receivedFromRepository;
-  if (plan.loadChangesAfterReceive && !await updateTargetDatabase(target, services)) {
+  if (received) {
+    markReceivedFromRepository(services, target);
+  }
+  if (plan.loadChangesAfterReceive
+    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
     // Импорт перезаписал бы незагруженные правки проекта — не выполняется; получение уже успешно.
     return {
       receivedFromRepository: received,
@@ -132,6 +171,7 @@ export async function runUpdateChain(
       projectImported: false,
       projectBehind: received,
       warnings: [describeLoadFailureAfterReceive(target.displayName)],
+      ...databaseLagFields(services, target, false),
     };
   }
   const warnings: string[] = [];
@@ -153,10 +193,11 @@ export async function runUpdateChain(
     projectImported,
     projectBehind,
     warnings,
+    ...databaseLagFields(services, target, plan.loadChangesAfterReceive && plan.updateDatabaseOnLoad),
   };
 }
 
-export interface CommitChainResult {
+export interface CommitChainResult extends DatabaseLagFields {
   readonly committedObjects: string[];
   readonly keptLocked: boolean;
   readonly referencesCleaned: boolean;
@@ -173,10 +214,14 @@ export async function runCommitChain(
   request: { readonly recursive: boolean; readonly comment: string; readonly keepLocked: boolean; readonly force: boolean },
   plan: RepositoryCommitPlan
 ): Promise<CommitChainResult> {
-  if (plan.updateDatabaseFirst && !await updateTargetDatabase(target, services)) {
+  if (plan.updateDatabaseFirst
+    && !await loadTargetChangesIntoDatabase(target, services, { updateDatabase: plan.updateDatabaseOnLoad })) {
     throw new RepositoryStepFailedError(LOAD_BEFORE_COMMIT_FAILED);
   }
   const outcome = await executeRepositoryCommitAction(toCliServices(services), node, request);
+  if (outcome.referencesCleaned) {
+    markReceivedFromRepository(services, target);
+  }
   const warnings: string[] = [];
   let projectImported = false;
   if (shouldImportAfterCommit(outcome)) {
@@ -195,6 +240,7 @@ export async function runCommitChain(
     databaseLoadedBefore: plan.updateDatabaseFirst,
     projectImported,
     warnings,
+    ...databaseLagFields(services, target, plan.updateDatabaseFirst && plan.updateDatabaseOnLoad),
   };
 }
 

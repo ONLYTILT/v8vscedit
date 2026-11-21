@@ -136,7 +136,7 @@
       {
         "command": "v8vscedit.updateChangedConfigurations",
         "title": "Обновить изменённые конфигурации",
-        "enablement": "v8vscedit.hasChangedConfigurations && !v8vscedit.isUpdatingConfigurations",
+        "enablement": "(v8vscedit.hasChangedConfigurations || (v8vscedit.databaseConfigurationBehind && config.v8vscedit.configuration.updateDatabaseAfterLoad)) && !v8vscedit.isUpdatingConfigurations",
         "icon": {
           "light": "./src/icons/light/externalDataSource.svg",
           "dark": "./src/icons/dark/externalDataSource.svg"
@@ -408,6 +408,23 @@
         "command": "v8vscedit.updateConfigurationInDb",
         "title": "Обновить в базе",
         "icon": "$(sync)"
+      },
+      {
+        "command": "v8vscedit.loadConfigurationChangesInDb",
+        "title": "Загрузить в базу без обновления БД",
+        "enablement": "!v8vscedit.isUpdatingConfigurations",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "v8vscedit.updateDatabaseConfiguration",
+        "title": "Обновить конфигурацию БД",
+        "enablement": "!v8vscedit.isUpdatingConfigurations",
+        "icon": "$(database)"
+      },
+      {
+        "command": "v8vscedit.databaseLag.showActions",
+        "title": "1С: конфигурация БД не обновлена",
+        "enablement": "!v8vscedit.isUpdatingConfigurations"
       },
       {
         "command": "v8vscedit.decompileExtensionSources",
@@ -830,6 +847,11 @@
           ],
           "default": "batch",
           "description": "Режим выполнения операций с конфигурацией. По умолчанию используется пакетный режим из версии 0.3.5; агентский режим доступен как дополнительный."
+        },
+        "v8vscedit.configuration.updateDatabaseAfterLoad": {
+          "type": "boolean",
+          "default": true,
+          "description": "Обновлять конфигурацию базы данных (реструктуризация) после загрузки изменений командой «Обновить изменённые конфигурации» и в цепочках хранилища. false — изменения загружаются только в основную конфигурацию (для помещения в хранилище этого достаточно), конфигурация БД обновляется отдельно командой «Обновить конфигурацию БД». Явные команды узла от настройки не зависят."
         },
         "v8vscedit.agent.location": {
           "type": "string",

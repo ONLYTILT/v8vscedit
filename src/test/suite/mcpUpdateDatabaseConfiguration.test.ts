@@ -26,7 +26,7 @@ interface Tool {
 }
 
 const NOTE =
-  '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_execute_command v8vscedit.updateChangedConfigurations';
+  '/UpdateDBCfg не загружает файлы проекта: правки применятся только после v8vscedit_load_configuration_changes';
 
 suite('v8vscedit_update_database_configuration', function () {
   this.timeout(60_000);
@@ -82,6 +82,7 @@ suite('v8vscedit_update_database_configuration', function () {
     const result = JSON.parse(text(await run({ path: 'Конфигурация' }))) as Record<string, unknown>;
     assert.deepStrictEqual(result, {
       path: 'Конфигурация', kind: 'cf', name: 'Основная конфигурация', databaseConfigurationUpdated: true, unloadedChangedFilesCount: 0,
+      databaseConfigurationBehind: false,
     });
     assert.deepStrictEqual(p.events, ['apply:cf']);
     assert.strictEqual(p.lockHeldAt['apply:cf'], true);
@@ -110,7 +111,28 @@ suite('v8vscedit_update_database_configuration', function () {
     ];
     const result = JSON.parse(text(await run({ path: 'Конфигурация' }))) as Record<string, unknown>;
     assert.strictEqual(result.unloadedChangedFilesCount, 4);
+    // note отсылает к явному инструменту, а не к execute_command: тот следует настройке updateDatabaseAfterLoad.
     assert.strictEqual(result.note, NOTE);
+  });
+
+  test('lag уходит в раннер применения: успех снимает отметку отставания, ответ databaseConfigurationBehind=false', async () => {
+    p.lag.markBehind({ kind: 'cf', name: 'Основная конфигурация', rootPath: p.cfRoot }, 'load-without-update');
+
+    const result = JSON.parse(text(await run({ path: 'Конфигурация' }))) as Record<string, unknown>;
+
+    assert.strictEqual(p.applyCalls[0][3], p.lag, 'четвёртый аргумент раннера — services.databaseConfigLag');
+    assert.strictEqual(p.lag.isBehind({ kind: 'cf', name: 'Основная конфигурация', rootPath: p.cfRoot }), false);
+    assert.strictEqual(result.databaseConfigurationBehind, false);
+  });
+
+  test('отказ применения: отметка остаётся, инструмент возвращает ошибку', async () => {
+    p.lag.markBehind({ kind: 'cf', name: 'Основная конфигурация', rootPath: p.cfRoot }, 'load-without-update');
+    p.applyResult = false;
+
+    const result = await run({ path: 'Конфигурация' });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(p.lag.isBehind({ kind: 'cf', name: 'Основная конфигурация', rootPath: p.cfRoot }), true);
   });
 
   test('платформа вернула неуспех: isError с точным текстом, замок освобождён', async () => {

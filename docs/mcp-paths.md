@@ -648,6 +648,7 @@ MCP-инструменты принимают только канон. Люба�
 | `v8vscedit_repository_commit` | Помещение в хранилище; обязательны `comment` и `confirm: true`. | как `repository_status` |
 | `v8vscedit_repository_unlock` | Отмена захвата (чужой захват не снимается). | как `repository_status` |
 | `v8vscedit_update_database_configuration` | `/UpdateDBCfg`: применяет конфигурацию к БД; файлы проекта не загружает. | `Конфигурация` / `Расширение` (только корень) |
+| `v8vscedit_load_configuration_changes` | Загружает изменённые файлы проекта корня в базу; обязательный `updateDatabase` - обновлять ли конфигурацию БД. | `Конфигурация` / `Расширение` (только корень) |
 | `v8vscedit_execute_command` | Allowlist команд расширения: `refresh`, `importConfigurations`, `updateChangedConfigurations`. | — |
 
 Несколько инструментов (`create_epf`/`create_erf`/`validate_external_object`/
@@ -655,6 +656,14 @@ MCP-инструменты принимают только канон. Люба�
 файловому пути, потому что объект ещё не зарегистрирован в дереве
 конфигурации. Для них канон путей метаданных неприменим, аргументы остаются
 файловыми (`objectPath`, `extensionPath`, `outputDir`).
+
+**Загрузка без обновления БД.** `v8vscedit_load_configuration_changes` принимает `path` корня и обязательный
+`updateDatabase` (без значения по умолчанию), берёт общий замок операций, работает без тостов (silent) и
+возвращает `warnings` и фактическое `databaseConfigurationUpdated`. У `v8vscedit_repository_lock|update|commit`
+есть необязательный `updateDatabase`; `repository_status` и результаты операций содержат поле
+`databaseConfigurationBehind` (признак «БД не обновлена», см.
+[architecture.md](./architecture.md#отставание-конфигурации-бд-infradatabasedatabaseconfiglag)).
+`updateChangedConfigurations` через `v8vscedit_execute_command` следует настройке `updateDatabaseAfterLoad`.
 
 ### 6.2. Инструменты обмена CF/CFE через пакетный Конфигуратор
 

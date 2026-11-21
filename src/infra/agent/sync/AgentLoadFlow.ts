@@ -129,6 +129,7 @@ async function loadWithPlan(context: SyncOperationContext, mode: AgentLoadMode):
   // На частичной загрузке `--update-config-dump-info` передавать нельзя: конфигуратор
   // перезаписывает файл версий «срезом» только из списка и на следующей частичной загрузке
   // уходит во внутреннее UnknownError с пустым телом.
+  context.hooks?.onConfigurationLoadStarting?.();
   await context.exec.execute(buildLoadConfigFromFilesCommand(mirror, {
     extensionName: context.extensionName,
     listFile,
@@ -162,6 +163,7 @@ async function loadFullFromMirror(context: SyncOperationContext): Promise<SyncMi
   await mirrorProjectToAgent(context);
   throwIfCancelled(context);
   context.hooks?.onMessage?.('Полная загрузка конфигурации из файлов.');
+  context.hooks?.onConfigurationLoadStarting?.();
   await context.exec.execute(buildLoadConfigFromFilesCommand(context.workspace.targetAgentDir, {
     extensionName: context.extensionName,
     updateConfigDumpInfo: true,
@@ -190,6 +192,7 @@ async function loadFullByArchive(context: SyncOperationContext): Promise<SyncMir
   });
   throwIfCancelled(context);
   context.hooks?.onMessage?.('Полная загрузка конфигурации из архива.');
+  context.hooks?.onConfigurationLoadStarting?.();
   await context.exec.execute(buildLoadConfigFromFilesCommand(exchangeDir, {
     extensionName: context.extensionName,
     archive: EXCHANGE_ARCHIVE,

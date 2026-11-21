@@ -28,6 +28,17 @@ import { promptMirrorSeed } from './agent/mirrorSeedPrompt';
 import { promptOrphanRemoval } from './agent/orphanFilesPrompt';
 import { releaseAgentInfoBaseForBatch } from './agent/AgentServiceRegistry';
 import { decideLocalDesignerInRemote, readInfoBaseConnectionKind } from './agent/remoteLocalDesigner';
+import { describeAgentLoadTexts, runAgentChangedLoad, runAgentFullLoad } from './agent/agentDatabaseLoad';
+import { runBatchDatabaseLoad, type BatchLoadStepKind } from './batchDatabaseLoad';
+import { hasPendingHashChanges } from '../../../infra/cache/HashScanner';
+import {
+  buildBatchLoadSteps,
+  decideLagAfterLoad,
+  describeLoadWithoutUpdateSuccess,
+  settleDatabaseLag,
+  type DatabaseLoadOptions,
+} from './databaseLoadPlan';
+import type { DatabaseConfigLagRecorder, DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
 
 // Прежний публичный API модуля сохраняется реэкспортом: потребители (Container, команды, тесты)
 // импортируют из ExtensionCommandRunner, а реализация живёт в соседних модулях (Э2).
@@ -187,21 +198,38 @@ export async function runApplyDatabaseConfiguration(
   target: ApplyDatabaseTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
+  lag: DatabaseConfigLagRecorder,
   showSuccessMessage = false
 ): Promise<boolean> {
-  return (await runApplyDatabaseConfigurationWithOutcome(target, workspaceFolder, outputChannel, showSuccessMessage)).success;
+  return (await runApplyDatabaseConfigurationWithOutcome(target, workspaceFolder, outputChannel, lag, showSuccessMessage)).success;
 }
 
 /**
  * То же применение с исходом: MCP отдаёт предупреждения сверки агенту (`silentWarnings` — без уведомлений),
- * UI показывает их уведомлением.
+ * UI показывает их уведомлением. Успешное UpdateDBCfg снимает признак «БД отстаёт» цели; признак —
+ * обязательный параметр, чтобы ни один путь применения не забыл его снять.
  */
 export async function runApplyDatabaseConfigurationWithOutcome(
   target: ApplyDatabaseTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
+  lag: DatabaseConfigLagRecorder,
   showSuccessMessage = false,
   silentWarnings = false
+): Promise<ApplyDatabaseOutcome> {
+  const outcome = await applyDatabaseConfiguration(target, workspaceFolder, outputChannel, showSuccessMessage, silentWarnings);
+  if (outcome.success) {
+    lag.markCurrent(target);
+  }
+  return outcome;
+}
+
+async function applyDatabaseConfiguration(
+  target: ApplyDatabaseTarget,
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  showSuccessMessage: boolean,
+  silentWarnings: boolean
 ): Promise<ApplyDatabaseOutcome> {
   if (getAgentExecutionMode() === 'batch') {
     return { success: await runBatchApplyDatabaseConfiguration(target, workspaceFolder, outputChannel, showSuccessMessage), warnings: [] };
@@ -227,99 +255,91 @@ export async function runApplyDatabaseConfigurationWithOutcome(
   return outcome.ok ? { success: true, warnings: notifyAgentWarnings(outcome.value, silentWarnings) } : { success: false, warnings: [] };
 }
 
+/** «Полное обновление расширения»: полная загрузка и UpdateDBCfg; признак ставится до применения. */
 export async function runCompileExtension(
   extensionName: string,
   extensionRoot: string,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  showSuccessMessage = true
+  showSuccessMessage: boolean,
+  lag: DatabaseConfigLagRecorder
 ): Promise<boolean> {
+  const target: DatabaseLagTarget = { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName };
+  /* c8 ignore next 3 -- пакетная ветка запускает настоящий 1cv8; порядок шагов и признак — в batchDatabaseLoad (под тестом) */
   if (getAgentExecutionMode() === 'batch') {
-    return runBatchCompileExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, showSuccessMessage);
+    return runBatchFullLoad(target, workspaceFolder, outputChannel, showSuccessMessage, lag);
   }
-
-  return runAgentConfigurationOperation(
-    {
+  return runAgentFullLoad({
+    target,
+    texts: {
       progressTitle: `Полное обновление расширения ${extensionName} в БД`,
       progressStartMessage: 'Загрузка исходников через агент, применение изменений...',
       successMessage: `Полное обновление расширения "${extensionName}" успешно завершено.`,
       errorTitle: `Ошибка загрузки или применения расширения "${extensionName}" в БД.`,
-      showSuccessMessage,
-      workspaceFolder,
-      outputChannel,
-      rootPath: extensionRoot,
     },
-    async (service, operationHooks) => {
-      notifyAgentWarnings(await service.loadFullAndUpdate({ kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName }, operationHooks));
-    }
-  );
+    workspaceFolder,
+    outputChannel,
+    showSuccessMessage,
+    options: { updateDatabase: true, lag },
+  });
 }
 
+/**
+ * Загрузка изменений расширения в базу; `options.updateDatabase` — обновлять ли конфигурацию БД. Параметр
+ * обязательный: молчаливого умолчания нет, компилятор показывает каждый вызов.
+ */
 export async function runUpdateExtension(
   extensionName: string,
   extensionRoot: string,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  showSuccessMessage = true,
-  hooks?: ConfigurationProgressHooks
+  showSuccessMessage: boolean,
+  hooks: ConfigurationProgressHooks | undefined,
+  options: DatabaseLoadOptions
 ): Promise<boolean> {
-  if (getAgentExecutionMode() === 'batch') {
-    return runBatchUpdateExtension(extensionName, extensionRoot, workspaceFolder, outputChannel, showSuccessMessage, hooks);
-  }
-
-  return runAgentConfigurationOperation(
-    {
-      progressTitle: `Обновление расширения ${extensionName} в БД`,
-      progressStartMessage: 'Поиск и загрузка изменённых файлов через агент...',
-      successMessage: `Обновление расширения "${extensionName}" в БД успешно завершено.`,
-      errorTitle: `Ошибка обновления расширения "${extensionName}" в БД.`,
-      showSuccessMessage,
-      onProgressMessage: hooks?.onProgressMessage,
-      workspaceFolder,
-      outputChannel,
-      rootPath: extensionRoot,
-      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя.
-      confirmFullDump: promptFullDump,
-    },
-    async (service, operationHooks) => {
-      notifyAgentWarnings(await service.loadChangedAndUpdate({ kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName }, operationHooks));
-    }
+  return runChangedLoad(
+    { kind: 'cfe', name: extensionName, rootPath: extensionRoot, extensionName },
+    workspaceFolder, outputChannel, showSuccessMessage, hooks, options
   );
 }
 
+/** Загрузка изменений основной конфигурации в базу; `options` — как у {@link runUpdateExtension}. */
 export async function runUpdateMainConfiguration(
   configName: string,
   configRoot: string,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  showSuccessMessage = true,
-  hooks?: ConfigurationProgressHooks
+  showSuccessMessage: boolean,
+  hooks: ConfigurationProgressHooks | undefined,
+  options: DatabaseLoadOptions
 ): Promise<boolean> {
-  if (getAgentExecutionMode() === 'batch') {
-    return runBatchUpdateMainConfiguration(configName, configRoot, workspaceFolder, outputChannel, showSuccessMessage, hooks);
-  }
-
-  return runAgentConfigurationOperation(
-    {
-      progressTitle: `Обновление конфигурации ${configName} в БД`,
-      progressStartMessage: 'Поиск и загрузка изменённых файлов через агент...',
-      successMessage: `Обновление конфигурации "${configName}" в БД успешно завершено.`,
-      errorTitle: `Ошибка обновления конфигурации "${configName}" в БД.`,
-      showSuccessMessage,
-      onProgressMessage: hooks?.onProgressMessage,
-      workspaceFolder,
-      outputChannel,
-      rootPath: configRoot,
-      // Пустое зеркало агента на загрузке требует полной выгрузки на сервере — с согласия пользователя.
-      confirmFullDump: promptFullDump,
-    },
-    async (service, operationHooks) => {
-      await service.loadChangedAndUpdate(
-        { kind: 'cf', name: configName, rootPath: configRoot },
-        operationHooks
-      );
-    }
+  return runChangedLoad(
+    { kind: 'cf', name: configName, rootPath: configRoot },
+    workspaceFolder, outputChannel, showSuccessMessage, hooks, options
   );
+}
+
+function runChangedLoad(
+  target: DatabaseLagTarget,
+  workspaceFolder: vscode.WorkspaceFolder,
+  outputChannel: vscode.OutputChannel,
+  showSuccessMessage: boolean,
+  hooks: ConfigurationProgressHooks | undefined,
+  options: DatabaseLoadOptions
+): Promise<boolean> {
+  /* c8 ignore next 3 -- пакетная ветка запускает настоящий 1cv8; порядок шагов и признак — в batchDatabaseLoad (под тестом) */
+  if (getAgentExecutionMode() === 'batch') {
+    return runBatchChangedLoad(target, workspaceFolder, outputChannel, showSuccessMessage, hooks, options);
+  }
+  return runAgentChangedLoad({
+    target,
+    texts: describeAgentLoadTexts(target.kind, target.name, options.updateDatabase),
+    workspaceFolder,
+    outputChannel,
+    showSuccessMessage,
+    hooks,
+    options,
+  });
 }
 
 async function runBatchDecompileExtension(
@@ -486,6 +506,8 @@ export function createWorkspaceTempDir(workspaceRoot: string, prefix: string): s
 
 const FULL_SYNC_CONFIRM_BUTTON = 'Выполнить полную загрузку';
 
+/* c8 ignore start -- пакетный адаптер: запускает внутренний CLI с настоящим 1cv8 и модальный диалог; векторы шагов
+   (buildBatchLoadSteps) и их порядок с правилами признака отставания (runBatchDatabaseLoad) покрыты unit-тестами */
 function isConfigurationIdMismatchReason(reason: string): boolean {
   return /идентификатор[\s\S]*загружаемой конфигурации[\s\S]*отличается[\s\S]*сохраненной/i.test(reason)
     || /ошибка частичной загрузки/i.test(reason);
@@ -494,12 +516,16 @@ function isConfigurationIdMismatchReason(reason: string): boolean {
 async function confirmFullSyncFallback(
   targetLabel: string,
   failureReason: string,
+  updateDatabase: boolean,
   outputChannel: vscode.OutputChannel
 ): Promise<boolean> {
   const isMismatch = isConfigurationIdMismatchReason(failureReason);
+  const overwrite = updateDatabase
+    ? `Полная загрузка перезапишет конфигурацию базы исходниками из ${targetLabel}.`
+    : `Полная загрузка перезапишет основную конфигурацию базы исходниками из ${targetLabel}; конфигурация БД не обновляется.`;
   const detail = isMismatch
-    ? `Идентификатор конфигурации в файлах не совпадает с идентификатором базы — частичная загрузка платформой запрещена. Это типично для первой синхронизации с базой или после её пересоздания.\n\nПолная загрузка перезапишет конфигурацию базы исходниками из ${targetLabel}.`
-    : `Причина:\n${failureReason}\n\nПолная загрузка перезапишет конфигурацию базы исходниками из ${targetLabel}.`;
+    ? `Идентификатор конфигурации в файлах не совпадает с идентификатором базы — частичная загрузка платформой запрещена. Это типично для первой синхронизации с базой или после её пересоздания.\n\n${overwrite}`
+    : `Причина:\n${failureReason}\n\n${overwrite}`;
 
   const choice = await vscode.window.showWarningMessage(
     `Не удалось выполнить быструю загрузку изменений ${targetLabel}. Выполнить полную загрузку?`,
@@ -518,34 +544,29 @@ async function confirmFullSyncFallback(
   return choice === FULL_SYNC_CONFIRM_BUTTON;
 }
 
-async function runBatchCompileExtension(
-  extensionName: string,
-  extensionRoot: string,
+async function runBatchFullLoad(
+  target: DatabaseLagTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
-  showSuccessMessage: boolean
+  showSuccessMessage: boolean,
+  lag: DatabaseConfigLagRecorder
 ): Promise<boolean> {
-  const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath, extensionRoot);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const cliArgs = [
-    'sync-configuration-full',
-    '-ProjectRoot',
-    workspaceFolder.uri.fsPath,
-    '-Target',
-    'cfe',
-    '-ConfigDir',
-    extensionRoot,
-    '-Extension',
-    extensionName,
-    ...buildConnectionCliArgs(connection),
-  ];
-  return runInternalCliCommand(
+  const connection = await resolveConnectionFromSettings(resolveSettingsPath(workspaceFolder.uri.fsPath, target.rootPath));
+  const steps = buildBatchLoadSteps({
+    projectRoot: workspaceFolder.uri.fsPath,
+    kind: target.kind,
+    configDir: target.rootPath,
+    extensionName: target.extensionName,
+    connectionArgs: buildConnectionCliArgs(connection),
+    updateDatabase: true,
+  });
+  const ok = await runInternalCliCommand(
     {
-      cliArgs,
-      progressTitle: `Полное обновление расширения ${extensionName} в БД`,
+      cliArgs: steps.fallback,
+      progressTitle: `Полное обновление расширения ${target.name} в БД`,
       progressStartMessage: 'Загрузка исходников, применение изменений...',
-      successMessage: `Полное обновление расширения "${extensionName}" успешно завершено.`,
-      errorTitle: `Ошибка загрузки или применения расширения "${extensionName}" в БД.`,
+      successMessage: `Полное обновление расширения "${target.name}" успешно завершено.`,
+      errorTitle: `Ошибка загрузки или применения расширения "${target.name}" в БД.`,
       failureOperation: 'полном обновлении расширения',
       logPrefix: 'sync-configuration-full',
       showSuccessMessage,
@@ -553,211 +574,102 @@ async function runBatchCompileExtension(
     workspaceFolder,
     outputChannel
   );
+  settleDatabaseLag(lag, target, decideLagAfterLoad({
+    loaded: ok, updateRequested: true, updateSucceeded: ok, ambiguousFailure: !ok,
+  }), 'update-failed');
+  return ok;
 }
 
-async function runBatchUpdateExtension(
-  extensionName: string,
-  extensionRoot: string,
+async function runBatchChangedLoad(
+  target: DatabaseLagTarget,
   workspaceFolder: vscode.WorkspaceFolder,
   outputChannel: vscode.OutputChannel,
   showSuccessMessage: boolean,
-  hooks?: ConfigurationProgressHooks
+  hooks: ConfigurationProgressHooks | undefined,
+  options: DatabaseLoadOptions
 ): Promise<boolean> {
-  const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath, extensionRoot);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const importChangedFilesArgs = [
-    'import-git-changes',
-    '-ProjectRoot',
-    workspaceFolder.uri.fsPath,
-    '-Target',
-    'cfe',
-    '-ConfigDir',
-    extensionRoot,
-    '-Extension',
-    extensionName,
-    ...buildConnectionCliArgs(connection),
-  ];
-  let importFailureReason = '';
-  const imported = await runInternalCliCommand(
-    {
-      cliArgs: importChangedFilesArgs,
-      progressTitle: `Подготовка обновления ${extensionName}`,
-      progressStartMessage: 'Поиск и загрузка изменённых файлов XML/BSL по хеш-кэшу...',
-      successMessage: `Изменённые файлы расширения "${extensionName}" загружены по хеш-кэшу.`,
-      errorTitle: `Ошибка загрузки изменённых файлов расширения "${extensionName}" по хеш-кэшу.`,
-      failureOperation: 'быстрой загрузке изменённых файлов',
-      logPrefix: 'import-git-changes',
-      showSuccessMessage: false,
-      showErrorMessage: false,
-      onFailureReason: (reason) => { importFailureReason = reason; },
-      onProgressMessage: hooks?.onProgressMessage,
-    },
-    workspaceFolder,
-    outputChannel
-  );
-  if (!imported) {
-    outputChannel.appendLine(
-      '[update-configuration] Частичная загрузка по хеш-кэшу недоступна, запрашиваю подтверждение полной загрузки.'
-    );
-    const confirmed = await confirmFullSyncFallback(
-      `расширения "${extensionName}"`,
-      importFailureReason,
-      outputChannel
-    );
-    if (!confirmed) {
-      outputChannel.appendLine('[update-configuration] Полная загрузка отклонена пользователем.');
-      return false;
+  const connection = await resolveConnectionFromSettings(resolveSettingsPath(workspaceFolder.uri.fsPath, target.rootPath));
+  const steps = buildBatchLoadSteps({
+    projectRoot: workspaceFolder.uri.fsPath,
+    kind: target.kind,
+    configDir: target.rootPath,
+    extensionName: target.extensionName,
+    connectionArgs: buildConnectionCliArgs(connection),
+    updateDatabase: options.updateDatabase,
+  });
+  const what = target.kind === 'cfe' ? 'расширения' : 'конфигурации';
+  const label = `${what} "${target.name}"`;
+  const onProgressMessage = hooks?.onProgressMessage;
+  const stepOptions = (kind: BatchLoadStepKind): Omit<RunCliOptions, 'cliArgs'> => {
+    switch (kind) {
+      case 'partial':
+        return {
+          progressTitle: `Подготовка обновления ${target.name}`,
+          progressStartMessage: 'Поиск и загрузка изменённых файлов XML/BSL по хеш-кэшу...',
+          successMessage: options.updateDatabase
+            ? `Изменённые файлы ${label} загружены по хеш-кэшу.`
+            : describeLoadWithoutUpdateSuccess(target.name),
+          errorTitle: `Ошибка загрузки изменённых файлов ${label} по хеш-кэшу.`,
+          failureOperation: 'быстрой загрузке изменённых файлов',
+          logPrefix: 'import-git-changes',
+          // Без шага применения частичная загрузка — итог операции: её успех и показывается пользователю.
+          showSuccessMessage: !options.updateDatabase && showSuccessMessage,
+          showErrorMessage: false,
+          onProgressMessage,
+        };
+      case 'update':
+        return {
+          progressTitle: `Обновление ${what} ${target.name} в БД`,
+          progressStartMessage: 'Применение загруженных изменений в базе...',
+          successMessage: `Обновление ${label} в БД успешно завершено.`,
+          errorTitle: `Ошибка обновления ${label} в БД.`,
+          failureOperation: `обновлении ${what}`,
+          logPrefix: 'update-configuration',
+          showSuccessMessage,
+          showErrorMessage: options.silent !== true,
+          onProgressMessage,
+        };
+      case 'fallback':
+        return {
+          progressTitle: `Обновление ${what} ${target.name} (полная загрузка)`,
+          progressStartMessage: options.updateDatabase
+            ? 'Выполняется полная синхронизация исходников и применение в базе...'
+            : 'Выполняется полная загрузка исходников в основную конфигурацию...',
+          successMessage: options.updateDatabase
+            ? `Обновление ${label} завершено через полную загрузку.`
+            : describeLoadWithoutUpdateSuccess(target.name),
+          errorTitle: `Ошибка полной загрузки ${label}.`,
+          failureOperation: `полной загрузке ${what}`,
+          logPrefix: options.updateDatabase ? 'sync-configuration-full' : 'import-configuration',
+          showSuccessMessage,
+          showErrorMessage: options.silent !== true,
+          onProgressMessage,
+        };
     }
-    const fallbackArgs = [
-      'sync-configuration-full',
-      '-ProjectRoot',
-      workspaceFolder.uri.fsPath,
-      '-Target',
-      'cfe',
-      '-ConfigDir',
-      extensionRoot,
-      '-Extension',
-      extensionName,
-      ...buildConnectionCliArgs(connection),
-    ];
-    return runInternalCliCommand(
-      {
-        cliArgs: fallbackArgs,
-        progressTitle: `Обновление расширения ${extensionName} (полная загрузка)`,
-        progressStartMessage: 'Выполняется полная синхронизация исходников и применение в базе...',
-        successMessage: `Обновление расширения "${extensionName}" завершено через полную загрузку.`,
-        errorTitle: `Ошибка полной загрузки расширения "${extensionName}".`,
-        failureOperation: 'полной загрузке расширения',
-        logPrefix: 'sync-configuration-full',
-        showSuccessMessage,
-        onProgressMessage: hooks?.onProgressMessage,
-      },
-      workspaceFolder,
-      outputChannel
-    );
+  };
+  const outcome = await runBatchDatabaseLoad(steps, target, options, {
+    hasChanges: () => hasPendingHashChanges(workspaceFolder.uri.fsPath, target.kind, target.rootPath, target.extensionName),
+    runStep: async (kind, cliArgs) => {
+      let failureReason = '';
+      const ok = await runInternalCliCommand(
+        { ...stepOptions(kind), cliArgs, onFailureReason: (reason) => { failureReason = reason; } },
+        workspaceFolder,
+        outputChannel
+      );
+      return { ok, failureReason };
+    },
+    confirmFallback: (failureReason) => confirmFullSyncFallback(label, failureReason, options.updateDatabase, outputChannel),
+    log: (line) => { outputChannel.appendLine(line); },
+  });
+  if (outcome.ok) {
+    options.onOutcome?.({ databaseUpdated: outcome.databaseUpdated, warnings: [] });
   }
-
-  const updateArgs = [
-    'update-configuration',
-    '-Extension',
-    extensionName,
-    ...buildConnectionCliArgs(connection),
-  ];
-  return runInternalCliCommand(
-    {
-      cliArgs: updateArgs,
-      progressTitle: `Обновление расширения ${extensionName} в БД`,
-      progressStartMessage: 'Применение загруженных изменений в базе...',
-      successMessage: `Обновление расширения "${extensionName}" в БД успешно завершено.`,
-      errorTitle: `Ошибка обновления расширения "${extensionName}" в БД.`,
-      failureOperation: 'обновлении расширения',
-      logPrefix: 'update-configuration',
-      showSuccessMessage,
-      onProgressMessage: hooks?.onProgressMessage,
-    },
-    workspaceFolder,
-    outputChannel
-  );
-}
-
-async function runBatchUpdateMainConfiguration(
-  configName: string,
-  configRoot: string,
-  workspaceFolder: vscode.WorkspaceFolder,
-  outputChannel: vscode.OutputChannel,
-  showSuccessMessage: boolean,
-  hooks?: ConfigurationProgressHooks
-): Promise<boolean> {
-  const settingsPath = resolveSettingsPath(workspaceFolder.uri.fsPath, configRoot);
-  const connection = await resolveConnectionFromSettings(settingsPath);
-  const importChangedFilesArgs = [
-    'import-git-changes',
-    '-ProjectRoot',
-    workspaceFolder.uri.fsPath,
-    '-Target',
-    'cf',
-    '-ConfigDir',
-    configRoot,
-    ...buildConnectionCliArgs(connection),
-  ];
-  let importFailureReason = '';
-  const imported = await runInternalCliCommand(
-    {
-      cliArgs: importChangedFilesArgs,
-      progressTitle: `Подготовка обновления ${configName}`,
-      progressStartMessage: 'Поиск и загрузка изменённых файлов XML/BSL по хеш-кэшу...',
-      successMessage: `Изменённые файлы конфигурации "${configName}" загружены по хеш-кэшу.`,
-      errorTitle: `Ошибка загрузки изменённых файлов конфигурации "${configName}" по хеш-кэшу.`,
-      failureOperation: 'быстрой загрузке изменённых файлов',
-      logPrefix: 'import-git-changes',
-      showSuccessMessage: false,
-      showErrorMessage: false,
-      onFailureReason: (reason) => { importFailureReason = reason; },
-      onProgressMessage: hooks?.onProgressMessage,
-    },
-    workspaceFolder,
-    outputChannel
-  );
-  if (!imported) {
-    outputChannel.appendLine(
-      '[update-configuration] Частичная загрузка основной конфигурации недоступна, запрашиваю подтверждение полной загрузки.'
-    );
-    const confirmed = await confirmFullSyncFallback(
-      `конфигурации "${configName}"`,
-      importFailureReason,
-      outputChannel
-    );
-    if (!confirmed) {
-      outputChannel.appendLine('[update-configuration] Полная загрузка отклонена пользователем.');
-      return false;
-    }
-    const fallbackArgs = [
-      'sync-configuration-full',
-      '-ProjectRoot',
-      workspaceFolder.uri.fsPath,
-      '-Target',
-      'cf',
-      '-ConfigDir',
-      configRoot,
-      ...buildConnectionCliArgs(connection),
-    ];
-    return runInternalCliCommand(
-      {
-        cliArgs: fallbackArgs,
-        progressTitle: `Обновление конфигурации ${configName} (полная загрузка)`,
-        progressStartMessage: 'Выполняется полная синхронизация исходников и применение в базе...',
-        successMessage: `Обновление конфигурации "${configName}" завершено через полную загрузку.`,
-        errorTitle: `Ошибка полной загрузки конфигурации "${configName}".`,
-        failureOperation: 'полной загрузке конфигурации',
-        logPrefix: 'sync-configuration-full',
-        showSuccessMessage,
-        onProgressMessage: hooks?.onProgressMessage,
-      },
-      workspaceFolder,
-      outputChannel
-    );
+  if (outcome.unchanged && !steps.update && showSuccessMessage && options.silent !== true) {
+    void vscode.window.showInformationMessage(`Изменений "${target.name}" для загрузки в базу нет.`);
   }
-
-  const updateArgs = [
-    'update-configuration',
-    ...buildConnectionCliArgs(connection),
-  ];
-  return runInternalCliCommand(
-    {
-      cliArgs: updateArgs,
-      progressTitle: `Обновление конфигурации ${configName} в БД`,
-      progressStartMessage: 'Применение загруженных изменений в базе...',
-      successMessage: `Обновление конфигурации "${configName}" в БД успешно завершено.`,
-      errorTitle: `Ошибка обновления конфигурации "${configName}" в БД.`,
-      failureOperation: 'обновлении конфигурации',
-      logPrefix: 'update-configuration',
-      showSuccessMessage,
-      onProgressMessage: hooks?.onProgressMessage,
-    },
-    workspaceFolder,
-    outputChannel
-  );
+  return outcome.ok;
 }
+/* c8 ignore stop */
 
 export async function runInternalCliCommand(
   options: RunCliOptions,

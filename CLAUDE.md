@@ -196,6 +196,8 @@ src/
 │   │                                  # GitGraphLayout, GitCommitChangesReader — см.
 │   │                                  # docs/git-history-graph.md; граф — сворачиваемый блок панели
 │   │                                  # «Изменения метаданных», отдельного webview/вкладки нет)
+│   ├── database/                     # DatabaseConfigLag: признак «конфигурация БД не обновлена» на цель
+│   │                                  # (.v8vscedit/database-config/lag.json), docs/architecture.md, «Отставание конфигурации БД»
 │   ├── environment/                  # bsl-analyzer.toml, окружение проекта, реестр баз
 │   ├── cfFile/                       # CfFileArgs (вектор аргументов /DumpCfg,/LoadCfg),
 │   │                                  # CfFileValidation (guard'ы: суффикс, staging-путь,
@@ -276,6 +278,7 @@ src/
 │   │   └── subsystem|search|repository|environment|standalone|…
 │   ├── support/                      # supportPresentation (единая таблица представления режимов
 │   │                                  # поддержки, чистая), SupportWatcher (сброс кэша по bin)
+│   ├── database/                     # DatabaseLagStatusBar, databaseLagPresentation (индикатор отставания БД)
 │   ├── commands/                     # CommandRegistry.registerAll + подпапки по доменам
 │   ├── git/                          # OnecGitContentProvider — схема onec-git для diff HEAD/индекс
 │   ├── mcp/                          # V8McpServer (тонкий HTTP-фасад: транспорт MCP, служебные
@@ -559,6 +562,13 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   должно. Граница гарантии — обрыв процесса, не потеря питания (`fsync` нет); временный путь не оканчивается
   на `.xml` (watcher `src/**/*.xml`). Почему это не та же механика, что staging-выгрузка CF — в
   [architecture.md](./docs/architecture.md#атомарная-запись-файлов-выгрузки-infrafsatomicfilewriterts).
+- **Операция, меняющая основную конфигурацию базы без `UpdateDBCfg`** (загрузка без обновления, CF/CFE-файл,
+  получение версий из хранилища и т.п.): обязана ставить признак через `DatabaseConfigLag`
+  (`markBehind`; успешный `UpdateDBCfg` цели - `markCurrent`), иначе индикатор врёт «БД актуальна». Признак
+  локальный: `generation-id` агента для него не годится (замер Э32). Код - `ui/commands/ext/`
+  (`DatabaseConfigCommands`, `databaseLoadPlan`, `batchDatabaseLoad`, `databaseSettings`,
+  `agent/agentDatabaseLoad`); решения - чистые функции `databaseLoadPlan`. Сбой записи признака операцию не
+  роняет. См. [architecture.md](./docs/architecture.md#отставание-конфигурации-бд-infradatabasedatabaseconfiglag).
 - **Новый режим/состояние поддержки** (см. [metadata-navigator.md](./docs/metadata-navigator.md#поддержка-поставщика-parentconfigurationsbin)):
   значение в `infra/support/SupportMode.ts` → код в таблице `CODE_TO_MODE` (+ `STRICTNESS`) парсера
   `ParentConfigurationsParser.ts` → запись в `SUPPORT_PRESENTATION` (`ui/support/supportPresentation.ts`) →

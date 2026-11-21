@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import type { ChangedConfiguration } from '../../infra/fs/ConfigurationChangeDetector';
 import type { CommandServices } from '../../ui/commands/_shared';
 import { confirmUpdateBeforeThinClient } from '../../ui/commands/db/DbCommands';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 
 /**
  * Вопрос «обновить перед запуском тонкого клиента» опирается на `getChangedConfigurations`, который
@@ -13,7 +14,8 @@ suite('DbCommands: подтверждение обновления перед т
   const changed: ChangedConfiguration = { kind: 'cf', rootPath: 'c:/x', name: 'Конф', changedFilesCount: 1 };
 
   function services(list: ChangedConfiguration[]): CommandServices {
-    return { getChangedConfigurations: () => Promise.resolve(list) } as unknown as CommandServices;
+    // Вопрос учитывает и отстающие цели (признак «БД отстаёт»): здесь их нет.
+    return { getChangedConfigurations: () => Promise.resolve(list), databaseConfigLag: new FakeLagRecorder() } as unknown as CommandServices;
   }
 
   async function withQuickPick<T>(answer: { id: string } | undefined, action: () => Promise<T>): Promise<{ result: T; asked: number }> {

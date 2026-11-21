@@ -24,7 +24,10 @@ import * as extensionRunner from '../../../ui/commands/ext/ExtensionCommandRunne
 import { endConfigurationOperation, isConfigurationOperationRunning } from '../../../ui/commands/ext/configurationOperationLock';
 import { disposeRepositoryCommandStatusBar } from '../../../ui/commands/repository/RepositoryCommandRunner';
 import { MetadataNode } from '../../../ui/tree/TreeNode';
+import { FakeLagRecorder } from './databaseLagFakes';
 import { removeTreeSync } from './tempTree';
+import type { DatabaseConfigLagRecorder, DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
+import type { DatabaseLoadOptions } from '../../../ui/commands/ext/databaseLoadPlan';
 
 export const BEGIN = '---- Начало операции с хранилищем конфигурации ----';
 export const END = '---- Операция с хранилищем конфигурации завершена ----';
@@ -100,9 +103,19 @@ export interface RepoProject {
   disposedExecutors: number;
   importCalls: unknown[][];
   applyCalls: unknown[][];
+  /** Аргументы `runUpdateMainConfiguration`/`runUpdateExtension` (последний — `{ updateDatabase, lag }`). */
+  updateCalls: unknown[][];
+  /** Признак «БД отстаёт» — в памяти; тот же объект лежит в `services.databaseConfigLag`. */
+  readonly lag: FakeLagRecorder;
+  /** Опции раннера загрузки по порядку вызовов. */
+  updateOptions(index?: number): { updateDatabase: boolean; lag: DatabaseConfigLagRecorder };
   /** Результат исполнителя для ЛЮБОЙ операции хранилища. */
   result: DesignerBatchResult;
   updateResult: boolean;
+  /** Предупреждения сверки, которые заглушка раннера загрузки сообщает в исходе (E11). */
+  loadWarnings: string[];
+  /** Фактическое `databaseUpdated` исхода; без значения — равно запрошенному `updateDatabase`. */
+  loadDatabaseUpdated?: boolean;
   importResult: boolean;
   applyResult: boolean;
   toasts: { readonly kind: string; readonly message: string }[];
@@ -192,9 +205,10 @@ export async function createRepoProject(): Promise<RepoProject> {
     },
     runs: [], events: [], lockHeldAt: {}, changed: [], cleaned: [],
     reloads: 0, refreshes: 0, actionViewRefreshes: 0, suppressCalls: [], markChangedCalls: [],
-    disposedExecutors: 0, importCalls: [], applyCalls: [],
+    disposedExecutors: 0, importCalls: [], applyCalls: [], updateCalls: [], lag: new FakeLagRecorder(),
+    updateOptions(index = 0) { return project.updateCalls[index][6] as { updateDatabase: boolean; lag: DatabaseConfigLagRecorder }; },
     result: { exitCode: 0, log: '', outputs: new Map() },
-    updateResult: true, importResult: true, applyResult: true,
+    updateResult: true, importResult: true, applyResult: true, loadWarnings: [],
     toasts: [],
     setResult(log, exitCode = 0, extra = {}) {
       project.result = { exitCode, log, outputs: new Map(), ...extra };
@@ -261,10 +275,29 @@ export async function createRepoProject(): Promise<RepoProject> {
   w.showQuickPick = () => { throw new Error('неожиданный showQuickPick'); };
 
   const held = (event: string): void => { project.lockHeldAt[event] = isConfigurationOperationRunning(); };
-  runnerRef.runUpdateMainConfiguration = () => { project.events.push('update:cf'); held('update:cf'); return Promise.resolve(project.updateResult); };
+  // Заглушка повторяет контракт настоящего раннера по признаку отставания: успех «с обновлением» снимает его,
+  // «без обновления» — ставит (загрузка прошла, UpdateDBCfg не выполнялся).
+  const settleLag = (target: DatabaseLagTarget, options: DatabaseLoadOptions): void => {
+    if (!project.updateResult) {
+      return;
+    }
+    // Исход успешной загрузки для MCP (фактическое обновление БД, предупреждения сверки).
+    options.onOutcome?.({ databaseUpdated: project.loadDatabaseUpdated ?? options.updateDatabase, warnings: project.loadWarnings });
+    if (options.updateDatabase) {
+      options.lag.markCurrent(target);
+    } else {
+      options.lag.markBehind(target, 'load-without-update');
+    }
+  };
+  runnerRef.runUpdateMainConfiguration = (...args: unknown[]) => {
+    project.events.push('update:cf'); held('update:cf'); project.updateCalls.push(args);
+    settleLag({ kind: 'cf', name: String(args[0]), rootPath: String(args[1]) }, args[6] as never);
+    return Promise.resolve(project.updateResult);
+  };
   runnerRef.runUpdateExtension = (...args: unknown[]) => {
     const event = `update:cfe:${String(args[0])}`;
-    project.events.push(event); held(event);
+    project.events.push(event); held(event); project.updateCalls.push(args);
+    settleLag({ kind: 'cfe', name: String(args[0]), rootPath: String(args[1]), extensionName: String(args[0]) }, args[6] as never);
     return Promise.resolve(project.updateResult);
   };
   runnerRef.runDecompileMainConfiguration = (...args: unknown[]) => {
@@ -280,6 +313,9 @@ export async function createRepoProject(): Promise<RepoProject> {
     const target = args[0] as { kind: string; extensionName?: string };
     const event = target.kind === 'cfe' ? `apply:cfe:${String(target.extensionName)}` : 'apply:cf';
     project.events.push(event); held(event); project.applyCalls.push(args);
+    if (project.applyResult) {
+      (args[3] as DatabaseConfigLagRecorder).markCurrent(target as DatabaseLagTarget);
+    }
     return Promise.resolve(project.applyResult);
   };
   // MCP `update_database_configuration` берёт исход применения (предупреждения сверки): та же запись событий.
@@ -301,6 +337,7 @@ export async function createRepoProject(): Promise<RepoProject> {
     suppressConfigurationReloadForFiles: (files: string[]) => { project.suppressCalls.push(files); },
     markChangedConfigurationByFiles: (files: string[]) => { project.markChangedCalls.push(files); },
     createDesignerExecutor: () => executor,
+    databaseConfigLag: project.lag,
   } as unknown as CommandServices;
 
   return project;

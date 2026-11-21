@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
+import { readUpdateDatabaseAfterLoad, withLoadModeNote } from '../ext/databaseSettings';
 import { describeRepositoryActionSuccess } from './RepositoryCommandRunner';
 import { runLockChain } from './repositoryChains';
 import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
@@ -60,15 +61,16 @@ export function readRevisedOnLockSetting(): boolean {
 /** Вопрос задаётся ДО замка: ожидание ответа пользователя не должно держать базу занятой. */
 async function resolveLockPlan(services: CommandServices, target: RepositoryTarget): Promise<RepositoryLockPlan | 'cancel'> {
   const revisedSetting = readRevisedOnLockSetting();
+  const updateDatabaseAfterLoad = readUpdateDatabaseAfterLoad();
   const dirtyFilesCount = (await findChangedConfiguration(services, target))?.changedFilesCount ?? 0;
   let choice: LockLocalChangesChoice | undefined;
   // Таблица решения одна: после ответа она сама скажет, что делать (при ответе 'ask' не возвращается).
   for (;;) {
-    const plan = planRepositoryLock({ revisedSetting, dirtyFilesCount, choice });
+    const plan = planRepositoryLock({ revisedSetting, dirtyFilesCount, choice, updateDatabaseAfterLoad });
     if (plan !== 'ask') {
       return plan;
     }
-    choice = await promptLockWithLocalChanges(target, dirtyFilesCount);
+    choice = await promptLockWithLocalChanges(target, dirtyFilesCount, updateDatabaseAfterLoad);
   }
 }
 
@@ -80,12 +82,19 @@ interface LockChoiceItem extends vscode.QuickPickItem {
  * Импорт после захвата перезаписывает файлы проекта из базы, поэтому незагруженные правки иначе
  * пропали бы молча. Вопрос с ответом — запрет №18 его не касается.
  */
-async function promptLockWithLocalChanges(target: RepositoryTarget, dirtyFilesCount: number): Promise<LockLocalChangesChoice> {
+async function promptLockWithLocalChanges(
+  target: RepositoryTarget,
+  dirtyFilesCount: number,
+  updateDatabaseAfterLoad: boolean
+): Promise<LockLocalChangesChoice> {
   const items: LockChoiceItem[] = [
     {
       id: 'update-then-lock',
       label: '$(sync) Загрузить правки в базу, затем захватить',
-      detail: 'Правки должны относиться к уже захваченным объектам: незахваченный объект платформа загрузить не даст',
+      detail: withLoadModeNote(
+        'Правки должны относиться к уже захваченным объектам: незахваченный объект платформа загрузить не даст',
+        updateDatabaseAfterLoad
+      ),
     },
     {
       id: 'lock-without-import',

@@ -9,39 +9,40 @@ import {
   type UpdateLocalChangesChoice,
 } from '../../ui/commands/repository/repositoryUpdateFlow';
 
-suite('repositoryUpdateFlow: решение команды «Получить из хранилища»', () => {
+for (const updateDatabaseAfterLoad of [true, false]) {
+suite(`repositoryUpdateFlow: решение команды «Получить из хранилища» [updateDatabaseAfterLoad=${String(updateDatabaseAfterLoad)}]`, () => {
   suite('planRepositoryUpdate: незагруженные правки проекта', () => {
     for (const dirtyFilesCount of [0, -1]) {
       for (const choice of [undefined, 'receive-then-load', 'receive-without-import', 'cancel'] as (UpdateLocalChangesChoice | undefined)[]) {
         test(`нет незагруженных правок (${String(dirtyFilesCount)}), choice=${String(choice)}: только получение и импорт, вопроса нет`, () => {
           assert.deepStrictEqual(
-            planRepositoryUpdate({ dirtyFilesCount, lockedInSelection: [], choice }),
-            { loadChangesAfterReceive: false, importAfterReceive: true }
+            planRepositoryUpdate({ dirtyFilesCount, lockedInSelection: [], choice, updateDatabaseAfterLoad }),
+            { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: true }
           );
         });
       }
     }
 
     test('правки есть, ответа нет: ask-local-changes', () => {
-      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [] }), 'ask-local-changes');
+      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], updateDatabaseAfterLoad }), 'ask-local-changes');
     });
 
     test('правки есть, receive-then-load: загрузка правок ПОСЛЕ получения (Э24: получение затёрло бы загруженное до него), импорт разрешён', () => {
       assert.deepStrictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'receive-then-load' }),
-        { loadChangesAfterReceive: true, importAfterReceive: true }
+        planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'receive-then-load', updateDatabaseAfterLoad }),
+        { loadChangesAfterReceive: true, updateDatabaseOnLoad: updateDatabaseAfterLoad, importAfterReceive: true }
       );
     });
 
     test('правки есть, receive-without-import: без загрузки и без импорта', () => {
       assert.deepStrictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'receive-without-import' }),
-        { loadChangesAfterReceive: false, importAfterReceive: false }
+        planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'receive-without-import', updateDatabaseAfterLoad }),
+        { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: false }
       );
     });
 
     test('правки есть, cancel: cancel', () => {
-      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'cancel' }), 'cancel');
+      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: [], choice: 'cancel', updateDatabaseAfterLoad }), 'cancel');
     });
   });
 
@@ -49,38 +50,38 @@ suite('repositoryUpdateFlow: решение команды «Получить и
     const locked = ['Справочник.Товары'];
 
     test('захват в выборке, подтверждения нет: ask-locked-overwrite (даже при чистом проекте)', () => {
-      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked }), 'ask-locked-overwrite');
+      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked, updateDatabaseAfterLoad }), 'ask-locked-overwrite');
     });
 
     test('вопрос о захвате задаётся РАНЬШЕ вопроса о правках проекта', () => {
-      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: locked }), 'ask-locked-overwrite');
+      assert.strictEqual(planRepositoryUpdate({ dirtyFilesCount: 3, lockedInSelection: locked, updateDatabaseAfterLoad }), 'ask-locked-overwrite');
     });
 
     test('отказ от перезаписи захваченных: cancel', () => {
       assert.strictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked, lockedOverwriteConfirmed: false }),
+        planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked, lockedOverwriteConfirmed: false, updateDatabaseAfterLoad }),
         'cancel'
       );
     });
 
     test('подтверждено, проект чист: получение и импорт', () => {
       assert.deepStrictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked, lockedOverwriteConfirmed: true }),
-        { loadChangesAfterReceive: false, importAfterReceive: true }
+        planRepositoryUpdate({ dirtyFilesCount: 0, lockedInSelection: locked, lockedOverwriteConfirmed: true, updateDatabaseAfterLoad }),
+        { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: true }
       );
     });
 
     test('подтверждено, правки есть: дальше вопрос о правках', () => {
       assert.strictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 2, lockedInSelection: locked, lockedOverwriteConfirmed: true }),
+        planRepositoryUpdate({ dirtyFilesCount: 2, lockedInSelection: locked, lockedOverwriteConfirmed: true, updateDatabaseAfterLoad }),
         'ask-local-changes'
       );
     });
 
     test('подтверждено, правки есть, receive-then-load: загрузка после получения', () => {
       assert.deepStrictEqual(
-        planRepositoryUpdate({ dirtyFilesCount: 2, lockedInSelection: locked, lockedOverwriteConfirmed: true, choice: 'receive-then-load' }),
-        { loadChangesAfterReceive: true, importAfterReceive: true }
+        planRepositoryUpdate({ dirtyFilesCount: 2, lockedInSelection: locked, lockedOverwriteConfirmed: true, choice: 'receive-then-load', updateDatabaseAfterLoad }),
+        { loadChangesAfterReceive: true, updateDatabaseOnLoad: updateDatabaseAfterLoad, importAfterReceive: true }
       );
     });
   });
@@ -90,7 +91,7 @@ suite('repositoryUpdateFlow: решение команды «Получить и
       for (const receivedFromRepository of [true, false]) {
         test(`importAfterReceive=${String(importAfterReceive)}, received=${String(receivedFromRepository)}: ${String(importAfterReceive && receivedFromRepository)}`, () => {
           assert.strictEqual(
-            shouldImportAfterReceive({ loadChangesAfterReceive: false, importAfterReceive }, { receivedFromRepository }),
+            shouldImportAfterReceive({ loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive }, { receivedFromRepository }),
             importAfterReceive && receivedFromRepository
           );
         });
@@ -139,3 +140,4 @@ suite('repositoryUpdateFlow: решение команды «Получить и
     });
   });
 });
+}

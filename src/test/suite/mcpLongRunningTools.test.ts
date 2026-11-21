@@ -388,13 +388,14 @@ suite('Долгие MCP-инструменты: wrapLongRunning, MCP-текст 
     readonly name: string;
     readonly args: () => Record<string, unknown>;
   }
-  /** Все десять инструментов контракта 1.5. `confirm: true` — у load-ов и commit. */
+  /** Все инструменты контракта 1.5 и v8vscedit_load_configuration_changes (одиннадцатый, долгий). `confirm: true` — у load-ов и commit. */
   const CASES: readonly ToolCase[] = [
     { name: 'v8vscedit_repository_lock', args: () => ({ path: 'Справочники.Товары' }) },
     { name: 'v8vscedit_repository_update', args: () => ({ path: 'Справочники.Товары' }) },
     { name: 'v8vscedit_repository_commit', args: () => ({ path: 'Справочники.Товары', comment: 'Правка', confirm: true }) },
     { name: 'v8vscedit_repository_unlock', args: () => ({ path: 'Справочники.Товары' }) },
     { name: 'v8vscedit_update_database_configuration', args: () => ({ path: 'Конфигурация' }) },
+    { name: 'v8vscedit_load_configuration_changes', args: () => ({ path: 'Конфигурация', updateDatabase: false }) },
     { name: 'v8vscedit_dump_cf', args: () => ({ outputFile: path.join(p.root, 'out.cf') }) },
     { name: 'v8vscedit_load_cf', args: () => ({ inputFile: path.join(p.root, 'in.cf'), confirm: true }) },
     { name: 'v8vscedit_dump_all_cfe', args: () => ({ outputDir: p.root }) },

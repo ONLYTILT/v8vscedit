@@ -37,30 +37,30 @@ suite('McpRepositoryDecisions: resolveMcpLockPlan', () => {
     for (const localChanges of CHOICES) {
       test(`dirty=0, revised=${String(revisedSetting)}, localChanges=${String(localChanges)}: ответ не нужен, значение игнорируется`, () => {
         assert.deepStrictEqual(
-          resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 0, localChanges }),
-          { revised: revisedSetting, updateDatabaseFirst: false, importAfterLock: true }
+          resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 0, localChanges, updateDatabaseAfterLoad: true }),
+          { revised: revisedSetting, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: true }
         );
       });
     }
 
     test(`dirty=3, revised=${String(revisedSetting)}, loadFirst → update-then-lock`, () => {
       assert.deepStrictEqual(
-        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'loadFirst' }),
-        { revised: revisedSetting, updateDatabaseFirst: true, importAfterLock: true }
+        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'loadFirst', updateDatabaseAfterLoad: true }),
+        { revised: revisedSetting, updateDatabaseFirst: true, updateDatabaseOnLoad: true, importAfterLock: true }
       );
     });
 
     test(`dirty=3, revised=${String(revisedSetting)}, keepProjectBehind → lock-without-import (-revised отключается)`, () => {
       assert.deepStrictEqual(
-        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'keepProjectBehind' }),
-        { revised: false, updateDatabaseFirst: false, importAfterLock: false }
+        resolveMcpLockPlan({ revisedSetting, dirtyFilesCount: 3, localChanges: 'keepProjectBehind', updateDatabaseAfterLoad: true }),
+        { revised: false, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: false }
       );
     });
   }
 
   test('dirty=3, localChanges не задан → ошибка с числом файлов и перечнем вариантов', () => {
     assert.throws(
-      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3 }),
+      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3, updateDatabaseAfterLoad: true }),
       (error: Error) => error.message.includes('3')
         && ['loadFirst', 'keepProjectBehind', 'abort'].every((option) => error.message.includes(option))
         && error.message.includes('localChanges')
@@ -69,7 +69,7 @@ suite('McpRepositoryDecisions: resolveMcpLockPlan', () => {
 
   test('dirty=3, abort → «Захват не выполнен: …»', () => {
     assert.throws(
-      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3, localChanges: 'abort' }),
+      () => resolveMcpLockPlan({ revisedSetting: true, dirtyFilesCount: 3, localChanges: 'abort', updateDatabaseAfterLoad: true }),
       (error: Error) => error.message.startsWith('Захват не выполнен:')
     );
   });
@@ -87,9 +87,7 @@ suite('McpRepositoryDecisions: resolveMcpUpdatePlan', () => {
         for (const localChanges of CHOICES) {
           const title = `dirty=${String(dirtyFilesCount)}, locked=${String(lockedInSelection.length)}, overwriteLocked=${String(overwriteLocked)}, localChanges=${String(localChanges)}`;
           test(title, () => {
-            const run = (): unknown => resolveMcpUpdatePlan({
-              dirtyFilesCount, lockedInSelection, overwriteLocked, localChanges,
-            });
+            const run = (): unknown => resolveMcpUpdatePlan({ dirtyFilesCount, lockedInSelection, overwriteLocked, localChanges, updateDatabaseAfterLoad: true });
             // Оракул — порядок вопросов планировщика: сначала захваченные, потом правки проекта.
             if (lockedInSelection.length > 0 && overwriteLocked === undefined) {
               assert.throws(run, (error: Error) => error.message === `${describeLockedOverwrite(lockedInSelection)}${OVERWRITE_HINT}`);
@@ -100,7 +98,7 @@ suite('McpRepositoryDecisions: resolveMcpUpdatePlan', () => {
               return;
             }
             if (dirtyFilesCount === 0) {
-              assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, importAfterReceive: true });
+              assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: true });
               return;
             }
             switch (localChanges) {
@@ -109,10 +107,10 @@ suite('McpRepositoryDecisions: resolveMcpUpdatePlan', () => {
                   && ['loadAfter', 'keepProjectBehind', 'abort'].every((option) => error.message.includes(option)));
                 return;
               case 'loadAfter':
-                assert.deepStrictEqual(run(), { loadChangesAfterReceive: true, importAfterReceive: true });
+                assert.deepStrictEqual(run(), { loadChangesAfterReceive: true, updateDatabaseOnLoad: true, importAfterReceive: true });
                 return;
               case 'keepProjectBehind':
-                assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, importAfterReceive: false });
+                assert.deepStrictEqual(run(), { loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: false });
                 return;
               case 'abort':
                 assert.throws(run, (error: Error) => error.message.startsWith('Получение не выполнено:'));
@@ -125,7 +123,7 @@ suite('McpRepositoryDecisions: resolveMcpUpdatePlan', () => {
 
   test('описание захваченных: 7 объектов → пять имён и «и ещё 2» (текст формирует describeLockedOverwrite)', () => {
     assert.throws(
-      () => resolveMcpUpdatePlan({ dirtyFilesCount: 0, lockedInSelection: names(7) }),
+      () => resolveMcpUpdatePlan({ dirtyFilesCount: 0, lockedInSelection: names(7), updateDatabaseAfterLoad: true }),
       (error: Error) => error.message.includes('и ещё 2') && error.message.endsWith(OVERWRITE_HINT)
     );
   });
@@ -137,22 +135,22 @@ suite('McpRepositoryDecisions: resolveMcpCommitPlan', () => {
   for (const localChanges of CHOICES) {
     test(`dirty=0, localChanges=${String(localChanges)}: помещать без загрузки можно`, () => {
       assert.deepStrictEqual(
-        resolveMcpCommitPlan({ dirtyFilesCount: 0, localChanges }),
-        { updateDatabaseFirst: false }
+        resolveMcpCommitPlan({ dirtyFilesCount: 0, localChanges, updateDatabaseAfterLoad: true }),
+        { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
       );
     });
   }
 
   test('dirty=3, loadFirst → загрузка перед помещением', () => {
     assert.deepStrictEqual(
-      resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'loadFirst' }),
-      { updateDatabaseFirst: true }
+      resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'loadFirst', updateDatabaseAfterLoad: true }),
+      { updateDatabaseFirst: true, updateDatabaseOnLoad: true }
     );
   });
 
   test('dirty=3 без localChanges → точный текст с числом файлов и подсказкой loadFirst', () => {
     assert.throws(
-      () => resolveMcpCommitPlan({ dirtyFilesCount: 3 }),
+      () => resolveMcpCommitPlan({ dirtyFilesCount: 3, updateDatabaseAfterLoad: true }),
       (error: Error) => error.message.startsWith(
         'В проекте 3 незагруженных изменённых файлов; помещение без предварительной загрузки запрещено. Передайте localChanges: \'loadFirst\''
       )
@@ -161,7 +159,7 @@ suite('McpRepositoryDecisions: resolveMcpCommitPlan', () => {
 
   test('dirty=3, abort → «Помещение не выполнено: …»', () => {
     assert.throws(
-      () => resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'abort' }),
+      () => resolveMcpCommitPlan({ dirtyFilesCount: 3, localChanges: 'abort', updateDatabaseAfterLoad: true }),
       (error: Error) => error.message.startsWith('Помещение не выполнено:')
     );
   });
@@ -237,4 +235,86 @@ suite('McpRepositoryDecisions: assertCommitArgs, захват корня, ада
     assert.strictEqual(ref.xmlPath, undefined);
     assert.strictEqual(ref.metaContext, undefined);
   });
+});
+
+/**
+ * `updateDatabase` (необязательный параметр инструментов lock/update/commit): режим шага загрузки, а не
+ * вопрос диалога, поэтому значение по умолчанию допустимо — им служит настройка `updateDatabaseAfterLoad`.
+ * Явное значение побеждает настройку в обе стороны; без шага загрузки `updateDatabaseOnLoad=false` всегда.
+ */
+suite('McpRepositoryDecisions: updateDatabase (undefined → настройка) для lock/update/commit', () => {
+  const MATRIX: readonly { updateDatabase: boolean | undefined; setting: boolean; effective: boolean }[] = [
+    { updateDatabase: undefined, setting: true, effective: true },
+    { updateDatabase: undefined, setting: false, effective: false },
+    { updateDatabase: true, setting: false, effective: true },
+    { updateDatabase: true, setting: true, effective: true },
+    { updateDatabase: false, setting: true, effective: false },
+    { updateDatabase: false, setting: false, effective: false },
+  ];
+
+  for (const row of MATRIX) {
+    const tag = `updateDatabase=${String(row.updateDatabase)}, настройка=${String(row.setting)} → ${String(row.effective)}`;
+
+    test(`lock, шаг загрузки есть (loadFirst): ${tag}`, () => {
+      const plan = resolveMcpLockPlan({
+        revisedSetting: true, dirtyFilesCount: 2, localChanges: 'loadFirst',
+        updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+      });
+      assert.deepStrictEqual(plan, { revised: true, updateDatabaseFirst: true, updateDatabaseOnLoad: row.effective, importAfterLock: true });
+    });
+
+    test(`lock, шага загрузки нет (чистый проект и keepProjectBehind): ${tag} → updateDatabaseOnLoad=false`, () => {
+      assert.strictEqual(
+        resolveMcpLockPlan({
+          revisedSetting: true, dirtyFilesCount: 0, updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+        }).updateDatabaseOnLoad,
+        false
+      );
+      assert.strictEqual(
+        resolveMcpLockPlan({
+          revisedSetting: true, dirtyFilesCount: 2, localChanges: 'keepProjectBehind',
+          updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+        }).updateDatabaseOnLoad,
+        false
+      );
+    });
+
+    test(`update, шаг загрузки есть (loadAfter): ${tag}`, () => {
+      const plan = resolveMcpUpdatePlan({
+        dirtyFilesCount: 2, lockedInSelection: [], localChanges: 'loadAfter',
+        updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+      });
+      assert.deepStrictEqual(plan, { loadChangesAfterReceive: true, updateDatabaseOnLoad: row.effective, importAfterReceive: true });
+    });
+
+    test(`update, шага загрузки нет (чистый проект и keepProjectBehind): ${tag} → updateDatabaseOnLoad=false`, () => {
+      assert.strictEqual(
+        resolveMcpUpdatePlan({
+          dirtyFilesCount: 0, lockedInSelection: [], updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+        }).updateDatabaseOnLoad,
+        false
+      );
+      assert.strictEqual(
+        resolveMcpUpdatePlan({
+          dirtyFilesCount: 2, lockedInSelection: [], localChanges: 'keepProjectBehind',
+          updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+        }).updateDatabaseOnLoad,
+        false
+      );
+    });
+
+    test(`commit, шаг загрузки есть (loadFirst): ${tag}`, () => {
+      const plan = resolveMcpCommitPlan({
+        dirtyFilesCount: 2, localChanges: 'loadFirst', updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting,
+      });
+      assert.deepStrictEqual(plan, { updateDatabaseFirst: true, updateDatabaseOnLoad: row.effective });
+    });
+
+    test(`commit, шага загрузки нет (чистый проект): ${tag} → updateDatabaseOnLoad=false`, () => {
+      assert.deepStrictEqual(
+        resolveMcpCommitPlan({ dirtyFilesCount: 0, updateDatabase: row.updateDatabase, updateDatabaseAfterLoad: row.setting }),
+        { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
+      );
+    });
+  }
 });

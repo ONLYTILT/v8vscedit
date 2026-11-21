@@ -122,7 +122,7 @@ suite('AgentOperationService: Э5, файлы рабочей области че
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>Изменён</Catalog>', 'utf-8');
 
     const factory = new ScriptedFactory();
-    await newService(tempRoot, factory).loadChangedAndUpdate(cf());
+    await newService(tempRoot, factory).loadChanged(cf(), { updateDatabase: true });
 
     const lists = fs.readdirSync(path.join(userRootOf(tempRoot), 'lists'));
     assert.strictEqual(lists.length, 1);
@@ -147,14 +147,14 @@ suite('AgentOperationService: Э5, файлы рабочей области че
     fs.writeFileSync(path.join(mirror, 'Configuration.xml'), '<Старая/>', 'utf-8');
     fs.writeFileSync(path.join(mirror, 'Stray.xml'), '<stray/>', 'utf-8');
 
-    await newService(tempRoot, new ScriptedFactory()).loadChangedAndUpdate(cf());
+    await newService(tempRoot, new ScriptedFactory()).loadChanged(cf(), { updateDatabase: true });
     assert.ok(fs.existsSync(path.join(mirror, 'Stray.xml')), 'каркас уже есть — полное зеркалирование не нужно');
     assert.strictEqual(fs.readFileSync(path.join(mirror, 'Configuration.xml'), 'utf-8'), '<Старая/>');
 
     fs.rmSync(path.join(mirror, 'Configuration.xml'));
     saveHashCache(tempRoot, buildHashSnapshot(buildScopeKey('cf', configRoot), configRoot));
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>v3</Catalog>', 'utf-8');
-    await newService(tempRoot, new ScriptedFactory()).loadChangedAndUpdate(cf());
+    await newService(tempRoot, new ScriptedFactory()).loadChanged(cf(), { updateDatabase: true });
     assert.ok(!fs.existsSync(path.join(mirror, 'Stray.xml')), 'без Configuration.xml зеркало пересоздаётся целиком');
     assert.strictEqual(fs.readFileSync(path.join(mirror, 'Configuration.xml'), 'utf-8'), '<MetaDataObject/>');
   });

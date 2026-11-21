@@ -25,6 +25,7 @@ import {
   describeLoadFailureAfterReceive,
   describeProjectBehindAfterReceive,
 } from '../../ui/commands/repository/repositoryUpdateFlow';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import { removeTreeSync } from './support/tempTree';
 
 /**
@@ -97,7 +98,12 @@ suite('v8vscedit.repository.update: получение, импорт по лог
   const pickLabel = (label: string): PickAnswer => (items) => items.find((item) => item.label === label);
   const pickById = (id: string): PickAnswer => (items) => items.find((item) => (item as { id?: string }).id === id);
   const PICK_ESC: PickAnswer = () => undefined;
+  let updateCalls: unknown[][];
   const RECURSIVE = pickLabel('Рекурсивно');
+
+  async function setUpdateDatabaseSetting(value: boolean | undefined): Promise<void> {
+    await vscode.workspace.getConfiguration('v8vscedit.configuration').update('updateDatabaseAfterLoad', value, vscode.ConfigurationTarget.Global);
+  }
   const NO_FORCE = pickLabel('Без force');
   const WITH_FORCE = pickLabel('С force');
 
@@ -120,6 +126,7 @@ suite('v8vscedit.repository.update: получение, импорт по лог
   }
 
   setup(async () => {
+    updateCalls = [];
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-update-cmd-')));
     const v8Path = path.join(root, process.platform === 'win32' ? '1cv8.exe' : '1cv8');
     fs.writeFileSync(v8Path, '');
@@ -186,12 +193,14 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       assert.ok(answer, 'неожиданный showQuickPick');
       return Promise.resolve(answer(items));
     };
-    runnerRef.runUpdateMainConfiguration = () => {
+    runnerRef.runUpdateMainConfiguration = (...args: unknown[]) => {
+      updateCalls.push(args);
       events.push('update:cf');
       lockHeldAt['update:cf'] = isConfigurationOperationRunning();
       return Promise.resolve(updateResult);
     };
     runnerRef.runUpdateExtension = (...args: unknown[]) => {
+      updateCalls.push(args);
       events.push(`update:cfe:${String(args[0])}`);
       lockHeldAt['update:cfe'] = isConfigurationOperationRunning();
       return Promise.resolve(updateResult);
@@ -220,6 +229,7 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       markConfigurationsClean: (roots: string[]) => { cleaned.push(roots); },
       reloadEntries: () => { reloads += 1; return Promise.resolve(); },
       createDesignerExecutor: () => executor,
+      databaseConfigLag: new FakeLagRecorder(),
     } as unknown as CommandServices;
 
     handlers = new Map();
@@ -236,6 +246,7 @@ suite('v8vscedit.repository.update: получение, импорт по лог
   });
 
   teardown(async () => {
+    await setUpdateDatabaseSetting(undefined);
     await endConfigurationOperation();
     for (const key of WINDOW_FUNCTIONS) {
       w[key] = saved[key];
@@ -387,6 +398,33 @@ suite('v8vscedit.repository.update: получение, импорт по лог
       assert.ok(items[1].label.startsWith('$(cloud-download) Получить, проект не обновлять'), items[1].label);
       assert.deepStrictEqual(events, []);
     });
+
+    const SETTING_NOTE = 'конфигурация БД не обновляется';
+    for (const setting of [true, false]) {
+      test(`настройка updateDatabaseAfterLoad=${String(setting)}: в detail пункта загрузки ${setting ? 'нет' : 'есть'} пояснения про настройку; пунктов по-прежнему три`, async () => {
+        await setUpdateDatabaseSetting(setting);
+        dirty();
+        answerRequest([PICK_ESC]);
+
+        await update();
+
+        const items = pickItems[2];
+        assert.strictEqual(items.length, 3);
+        const detail = items[0].detail ?? '';
+        assert.strictEqual(detail.includes(SETTING_NOTE) && detail.includes('updateDatabaseAfterLoad'), !setting, detail);
+      });
+
+      test(`receive-then-load при updateDatabaseAfterLoad=${String(setting)}: раннер загрузки получает updateDatabase=${String(setting)}`, async () => {
+        await setUpdateDatabaseSetting(setting);
+        dirty();
+        answerRequest([pickById('receive-then-load')]);
+
+        await update();
+
+        assert.strictEqual(updateCalls.length, 1);
+        assert.strictEqual((updateCalls[0][6] as { updateDatabase: boolean }).updateDatabase, setting);
+      });
+    }
 
     test('Esc в вопросе: ничего не запущено', async () => {
       dirty();

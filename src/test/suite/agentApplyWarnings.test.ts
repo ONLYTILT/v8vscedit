@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import { runLoadConfigurationFromCf } from '../../ui/commands/ext/CfFileCommandRunner';
 import { cfeFile } from './support/agentExtensionsEmulator';
 import { RemoteHarness } from './support/agentRemoteHarness';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 
 suite('Агентское применение расширения: исход с предупреждениями', function () {
   this.timeout(120_000);
@@ -26,7 +27,8 @@ suite('Агентское применение расширения: исход 
     const outcome = await runApplyDatabaseConfigurationWithOutcome(
       { kind: 'cfe', name: 'Нет', extensionName: 'Нет', rootPath: path.join(h.root, 'src', 'cfe', 'Нет') },
       h.folder,
-      h.channel
+      h.channel,
+      new FakeLagRecorder()
     );
 
     assert.deepStrictEqual(outcome, { success: false, warnings: [] });
@@ -39,7 +41,8 @@ suite('Агентское применение расширения: исход 
     const outcome = await runApplyDatabaseConfigurationWithOutcome(
       { kind: 'cfe', name: 'Расш', extensionName: 'Расш', rootPath: path.join(h.root, 'src', 'cfe', 'Расш') },
       h.folder,
-      h.channel
+      h.channel,
+      new FakeLagRecorder()
     );
     assert.deepStrictEqual(outcome, { success: true, warnings: [] });
   });
@@ -52,20 +55,20 @@ suite('Агентское применение расширения: исход 
     assert.strictEqual(loaded.success, true, loaded.failureReason);
 
     const target = { kind: 'cfe' as const, name: 'Расш', extensionName: 'Расш', rootPath: path.join(h.root, 'src', 'cfe', 'Расш') };
-    const outcome = await runApplyDatabaseConfigurationWithOutcome(target, h.folder, h.channel);
+    const outcome = await runApplyDatabaseConfigurationWithOutcome(target, h.folder, h.channel, new FakeLagRecorder());
 
     assert.strictEqual(outcome.success, true);
     assert.ok(outcome.warnings.some((warning) => warning.includes('«Другое»') && warning.includes('«Расш»')), outcome.warnings.join('|'));
     assert.ok(h.warnings.some((warning) => warning.includes('«Другое»')), 'UI показывает E11 уведомлением');
   });
 
-  const updates: [string, typeof runCompileExtension][] = [
-    ['runCompileExtension (полная загрузка)', runCompileExtension],
-    ['runUpdateExtension (изменённые файлы)', runUpdateExtension],
+  const updates: [string, (root: string) => Promise<boolean>][] = [
+    ['runCompileExtension (полная загрузка)', (root) => runCompileExtension('Расш', root, h.folder, h.channel, false, new FakeLagRecorder())],
+    ['runUpdateExtension (изменённые файлы)', (root) => runUpdateExtension('Расш', root, h.folder, h.channel, false, undefined, { updateDatabase: true, lag: new FakeLagRecorder() })],
   ];
   for (const [title, run] of updates) {
     test(`${title}: агентская операция исполняется (каталога расширения нет → отказ с тостом, без исключения)`, async () => {
-      const ok = await run('Расш', path.join(h.root, 'src', 'cfe', 'Расш'), h.folder, h.channel, false);
+      const ok = await run(path.join(h.root, 'src', 'cfe', 'Расш'));
       assert.strictEqual(ok, false);
       assert.ok(h.errors.length > 0, 'отказ показан пользователю');
     });

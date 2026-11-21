@@ -1,4 +1,5 @@
 import type * as vscode from 'vscode';
+import type { DatabaseConfigLagRecorder } from '../../infra/database/DatabaseConfigLag';
 import type { ChangedConfiguration } from '../../infra/fs/ConfigurationChangeDetector';
 import type { CfeBorrowService } from '../../infra/cfe/CfeBorrowService';
 import type { CfeDiffService } from '../../infra/cfe/CfeDiffService';
@@ -98,4 +99,6 @@ export interface CommandServices {
   setTreeMessage: (message: string | undefined) => void;
   setTreeProcessingState: (state: UniversalPanelProcessingState) => void;
   refreshActionsView: () => void;
+  /** Признак «конфигурация БД отстаёт» (локальный учёт расширения): ставят загрузки без UpdateDBCfg, снимает UpdateDBCfg. */
+  databaseConfigLag: DatabaseConfigLagRecorder;
 }

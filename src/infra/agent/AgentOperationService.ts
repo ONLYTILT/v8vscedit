@@ -1,5 +1,6 @@
 import {
   buildUpdateDbCfgCommand,
+  hasExtension,
   type AgentExtensionInfo,
   type AgentMessage,
 } from '../../domain/agent';
@@ -108,13 +109,41 @@ export interface AgentOperationHooks {
   readonly confirmFullDump?: (request: AgentFullDumpRequest) => Promise<AgentFullDumpDecision>;
   /** Удалить «осиротевшие» файлы выгрузки проекта. Нет хука — не удалять, только сообщение. */
   readonly confirmOrphanRemoval?: (request: AgentOrphanFilesRequest) => Promise<boolean>;
+  /**
+   * Основная конфигурация цели изменена загрузкой (не skipped), `update-db-cfg` ещё не отправлен. Вызывается
+   * ДО обновления БД сознательно: обрыв или ошибка на реструктуризации оставляют признак «БД отстаёт»
+   * выставленным, и раннеру UI не нужно угадывать, на каком шаге оборвалась операция.
+   */
+  readonly onConfigurationLoaded?: () => void;
+  /**
+   * Команда загрузки из файлов (`load-config-from-files`) сейчас уйдёт агенту — вызывается движком прямо перед
+   * ней, после подготовки зеркала и передачи файлов. Сбой ПОСЛЕ этой точки раннер трактует консервативно
+   * (основная конфигурация могла измениться: атомарность частичной загрузки не замерена), сбой ДО неё
+   * (подключение, guard наличия расширения, обрыв SFTP при передаче) признак отставания не трогает.
+   */
+  readonly onConfigurationLoadStarting?: () => void;
 }
+
+/** Режим загрузки изменений: с обновлением конфигурации БД или только в основную конфигурацию. */
+export interface AgentLoadOptions {
+  readonly updateDatabase: boolean;
+  /**
+   * Изменений нет, но цель отмечена отстающей: при `updateDatabase` выполнить одно `update-db-cfg`,
+   * иначе «Обновить в базе» молча закончилась бы «изменений нет», а отставание осталось бы.
+   */
+  readonly updateWhenUnchanged?: boolean;
+}
+
+/** Журнал загрузки без обновления: пользователь видит, что реструктуризации не было намеренно. */
+export const AGENT_LOAD_WITHOUT_UPDATE_MESSAGE = 'Конфигурация БД не обновлялась (загрузка без обновления).';
 
 export interface AgentOperationResult {
   readonly changedProjectFiles: string[];
   readonly skipped?: boolean;
   /** Предупреждения сверки после применения расширения (E11: имя в базе взято из файла). Нет — поля нет. */
   readonly warnings?: readonly string[];
+  /** Выполнено ли `update-db-cfg` (только у `loadChanged`). */
+  readonly databaseUpdated?: boolean;
 }
 
 /**
@@ -149,11 +178,17 @@ export interface DesignerAgentInfoBaseSession {
   reconnectInfoBase(hooks?: AgentOperationHooks): Promise<void>;
 }
 
+/** Имя расширения цели: без явного `extensionName` — имя цели (узел дерева расширения). */
+function extensionNameOf(target: AgentConfigurationOperationTarget): string {
+  return target.extensionName ?? target.name;
+}
+
 /**
  * Фасад агентских операций над конфигурацией. Жизненный цикл подключения ИБ (ленивый
  * `connect-ib`, удержание между операциями, release, idle) — в {@link AgentInfoBaseSession};
  * здесь только алгоритмы выгрузки/загрузки поверх исполнителя команд сессии.
  */
+
 export class AgentOperationService implements DesignerAgentInfoBaseSession {
   private readonly session: AgentInfoBaseSession;
   private readonly clock: () => number;
@@ -217,23 +252,70 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
       const { engine } = await this.getFiles(filesOptions);
+      await this.guardExtensionBeforeFileLoad(target, exec, true);
       await engine.loadTarget(target, 'full', exec, hooks);
+      hooks?.onConfigurationLoaded?.();
       return this.updateDatabaseConfigurationConnected(target, exec, hooks);
     }, hooks);
   }
 
-  async loadChangedAndUpdate(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
+  /**
+   * Загрузка изменённых файлов в основную конфигурацию; `update-db-cfg` — только при `options.updateDatabase`.
+   * Для cfe наличие расширения проверяется ДО загрузки в обоих режимах (ФАКТ Э32): загрузка из файлов в
+   * отсутствующее имя отвечает успехом и оставляет неприменённую заглушку.
+   */
+  async loadChanged(
+    target: AgentConfigurationOperationTarget,
+    options: AgentLoadOptions,
+    hooks?: AgentOperationHooks
+  ): Promise<AgentOperationResult> {
     const filesOptions = this.requireFilesOptions();
     return this.session.run(async (exec) => {
       const { engine } = await this.getFiles(filesOptions);
+      await this.guardExtensionBeforeFileLoad(target, exec, options.updateDatabase);
       const loaded = await engine.loadTarget(target, 'changed', exec, hooks);
       if (loaded.skipped) {
         hooks?.onMessage?.('изменений для загрузки нет');
+        if (options.updateDatabase && options.updateWhenUnchanged === true) {
+          const updated = await this.updateDatabaseConfigurationConnected(target, exec, hooks);
+          return { ...updated, databaseUpdated: true };
+        }
         return { changedProjectFiles: [], skipped: true };
       }
+      hooks?.onConfigurationLoaded?.();
+      if (!options.updateDatabase) {
+        hooks?.onMessage?.(AGENT_LOAD_WITHOUT_UPDATE_MESSAGE);
+        return { changedProjectFiles: [], databaseUpdated: false };
+      }
       // Предупреждения сверки (E11) не теряются: их показывает UI и отдаёт MCP.
-      return this.updateDatabaseConfigurationConnected(target, exec, hooks);
+      const updated = await this.updateDatabaseConfigurationConnected(target, exec, hooks);
+      return { ...updated, databaseUpdated: true };
     }, hooks);
+  }
+
+  /**
+   * Guard Э32 до загрузки из файлов. Текст отказа зависит от режима: без обновления E6 иначе не прозвучал бы
+   * вовсе, а «применять нечего» вводило бы в заблуждение — применять никто и не собирался.
+   */
+  private async guardExtensionBeforeFileLoad(
+    target: AgentConfigurationOperationTarget,
+    exec: AgentCommandExecutor,
+    updateDatabase: boolean
+  ): Promise<void> {
+    if (target.kind !== 'cfe') {
+      return;
+    }
+    const extensionName = extensionNameOf(target);
+    if (updateDatabase) {
+      await requireExtensionInDatabase(exec, extensionName);
+      return;
+    }
+    if (!hasExtension(await listDatabaseExtensions(exec), extensionName)) {
+      throw new Error(
+        `Расширения "${extensionName}" нет в базе. Загрузка без обновления конфигурации БД оставила бы ` +
+        'неприменённую заглушку — выполните «Обновить в базе».'
+      );
+    }
   }
 
   async updateDatabaseConfiguration(target: AgentConfigurationOperationTarget, hooks?: AgentOperationHooks): Promise<AgentOperationResult> {
@@ -280,7 +362,7 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
     exec: AgentCommandExecutor,
     hooks?: AgentOperationHooks
   ): Promise<AgentOperationResult> {
-    const extensionName = target.kind === 'cfe' ? target.extensionName ?? target.name : undefined;
+    const extensionName = target.kind === 'cfe' ? extensionNameOf(target) : undefined;
     const before = extensionName === undefined ? undefined : await requireExtensionInDatabase(exec, extensionName);
     hooks?.onMessage?.('Обновление конфигурации базы данных.');
     await exec.execute(buildUpdateDbCfgCommand({ extensionName }));

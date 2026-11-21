@@ -142,11 +142,11 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
     test('схемы входа: путь — path (не objectPath), force/version у update не открыты, force у unlock не открыт, confirm и comment у commit обязательны', () => {
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_status')?.inputSchema), { path: false, configuration: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_lock')?.inputSchema),
-        { path: false, configuration: true, recursive: true, localChanges: true, confirm: true });
+        { path: false, configuration: true, recursive: true, localChanges: true, confirm: true, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_update')?.inputSchema),
-        { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true });
+        { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_commit')?.inputSchema),
-        { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false });
+        { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_unlock')?.inputSchema),
         { path: false, configuration: true, recursive: true });
     });
@@ -451,6 +451,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
         assert.deepStrictEqual(result, {
           path: 'Справочники.Товары', lockedObjects: [T], requestedObjects: [T], receivedFromRepository: true,
           databaseLoadedBefore: false, projectImported: true, projectBehind: false, warnings: [],
+          databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
         });
         assert.deepStrictEqual(p.events, ['repo:lock', 'import:cf']);
         assert.deepStrictEqual(p.lockHeldAt, { 'repo:lock': true, 'import:cf': true });
@@ -577,6 +578,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
       assert.deepStrictEqual(result, {
         path: 'Справочники.Товары', receivedFromRepository: true, changesLoadedAfter: false,
         projectImported: true, projectBehind: false, lockedOverwritten: [], warnings: [],
+        databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
       });
       assert.deepStrictEqual(p.events, ['repo:update', 'import:cf']);
       assert.deepStrictEqual(p.lockHeldAt, { 'repo:update': true, 'import:cf': true });
@@ -642,6 +644,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
       assert.deepStrictEqual(result, {
         path: 'Справочники.Товары', committedObjects: [T], keptLocked: false, referencesCleaned: false,
         databaseLoadedBefore: false, projectImported: false, warnings: [],
+        databaseConfigurationUpdated: false, databaseConfigurationBehind: false,
       });
       assert.strictEqual(p.service.isLocked(p.cfTarget, T), false);
       assert.deepStrictEqual(p.lockHeldAt, { 'repo:commit': true });

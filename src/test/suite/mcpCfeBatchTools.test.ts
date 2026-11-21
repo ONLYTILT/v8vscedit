@@ -28,6 +28,7 @@ import { planCfeDumpFiles } from '../../infra/cfFile/CfeBatchNaming';
 import { serializeCfeManifest } from '../../infra/cfFile/CfeBatchManifest';
 import { registerConfigLifecycleTools } from '../../ui/mcp/registration/McpConfigLifecycleTools';
 import { McpMutationGate } from '../../ui/mcp/registration/McpMutationGate';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import type { McpRegistrationDeps } from '../../ui/mcp/registration/McpRegistrationDeps';
 import {
   endConfigurationOperation,
@@ -124,7 +125,7 @@ function createDepsWithWorkspace(ws: BatchWorkspace): McpRegistrationDeps {
   const workspaceFolder: vscode.WorkspaceFolder = { uri: vscode.Uri.file(ws.root), name: 'mcp-cfe-batch-test', index: 0 };
   const outputChannel = { appendLine: () => undefined } as unknown as vscode.OutputChannel;
   return {
-    services: { workspaceFolder, outputChannel },
+    services: { workspaceFolder, outputChannel, databaseConfigLag: new FakeLagRecorder() },
     xmlEditor: {},
     paths: {},
     properties: {},

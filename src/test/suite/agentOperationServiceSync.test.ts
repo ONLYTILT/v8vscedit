@@ -46,9 +46,9 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     const service = newService(tempRoot, new ScriptedFactory());
     await service.loadFullAndUpdate(cf());
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>v2</Catalog>', 'utf-8');
-    await service.loadChangedAndUpdate(cf());
+    await service.loadChanged(cf(), { updateDatabase: true });
     assert.deepStrictEqual(loadSyncManifest(tempRoot, scope()).files, await buildSyncManifestFiles(configRoot));
-    const again = await service.loadChangedAndUpdate(cf());
+    const again = await service.loadChanged(cf(), { updateDatabase: true });
     assert.strictEqual(again.skipped, true);
   });
 
@@ -71,7 +71,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     saveHashCache(tempRoot, buildHashSnapshot(scope(), configRoot));
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>v2</Catalog>', 'utf-8');
     const factory = new ScriptedFactory();
-    await newService(tempRoot, factory).loadChangedAndUpdate(cf());
+    await newService(tempRoot, factory).loadChanged(cf(), { updateDatabase: true });
     const load = factory.log.find((c) => c.startsWith('config load-config-from-files')) ?? '';
     assert.ok(load.includes('--partial'), load);
   });
@@ -85,7 +85,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
       files: await buildSyncManifestFiles(configRoot),
     });
     const factory = new ScriptedFactory();
-    const result = await newService(tempRoot, factory).loadChangedAndUpdate(cf());
+    const result = await newService(tempRoot, factory).loadChanged(cf(), { updateDatabase: true });
     assert.strictEqual(result.skipped, true);
     assert.ok(!factory.log.some((c) => c.startsWith('config load-config-from-files')));
   });
@@ -117,7 +117,7 @@ suite('AgentOperationService → AgentSyncEngine (Э7)', () => {
     // Импорт привёл P к «базе» без справочников: опустевший Catalogs/ убран вместе с Товары.xml.
     fs.mkdirSync(path.join(configRoot, 'Catalogs'), { recursive: true });
     fs.writeFileSync(path.join(configRoot, 'Catalogs', 'Товары.xml'), '<Catalog>v2</Catalog>', 'utf-8');
-    await service.loadChangedAndUpdate(cf());
+    await service.loadChanged(cf(), { updateDatabase: true });
     await service.loadFullAndUpdate(cf());
     for (const command of factory.log) {
       assert.ok(!command.includes('--get-changes') && !command.includes('--archive'), command);

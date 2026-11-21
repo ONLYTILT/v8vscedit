@@ -31,7 +31,7 @@ const NOT_RECEIVED = opLog(LOCK_DONE, `Объект захвачен для ре
 suite('repositoryChains: runLockChain', () => {
   let p: RepoProject;
   const plan = (overrides: Partial<RepositoryLockPlan> = {}): RepositoryLockPlan =>
-    ({ revised: true, updateDatabaseFirst: false, importAfterLock: true, ...overrides });
+    ({ revised: true, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: true, ...overrides });
 
   setup(async () => { p = await createRepoProject(); });
   teardown(() => p.dispose());
@@ -44,6 +44,7 @@ suite('repositoryChains: runLockChain', () => {
     assert.deepStrictEqual(result, {
       lockedObjects: [T], requestedObjects: [T], receivedFromRepository: true,
       databaseLoadedBefore: false, projectImported: true, projectBehind: false, warnings: [],
+      databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), true);
     assert.deepStrictEqual(p.cleaned, [[p.cfRoot]]);
@@ -82,7 +83,7 @@ suite('repositoryChains: runLockChain', () => {
 
   test('updateDatabaseFirst: загрузка правок → захват → импорт, databaseLoadedBefore=true', async () => {
     p.setResult(RECEIVED);
-    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true }));
+    const result = await runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true }));
     assert.deepStrictEqual(p.events, ['update:cf', 'repo:lock', 'import:cf']);
     assert.strictEqual(result.databaseLoadedBefore, true);
     assert.deepStrictEqual(p.cleaned, [[p.cfRoot], [p.cfRoot]]);
@@ -91,7 +92,7 @@ suite('repositoryChains: runLockChain', () => {
   test('сбой загрузки перед захватом: ошибка с точным текстом, захват не запускался, учёт не тронут', async () => {
     p.updateResult = false;
     await assert.rejects(
-      () => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true })),
+      () => runLockChain(p.services, p.cfTarget, p.refs.catalog, false, plan({ updateDatabaseFirst: true, updateDatabaseOnLoad: true })),
       (error: Error) => error.message === 'Загрузка правок проекта в базу не выполнена; захват не выполнялся. Подробности — в журнале «1С Редактор».'
     );
     assert.deepStrictEqual(p.events, ['update:cf']);
@@ -148,7 +149,7 @@ suite('repositoryChains: runLockChain', () => {
 suite('repositoryChains: runUpdateChain', () => {
   let p: RepoProject;
   const plan = (overrides: Partial<RepositoryUpdatePlan> = {}): RepositoryUpdatePlan =>
-    ({ loadChangesAfterReceive: false, importAfterReceive: true, ...overrides });
+    ({ loadChangesAfterReceive: false, updateDatabaseOnLoad: false, importAfterReceive: true, ...overrides });
   const request = { recursive: false, force: false };
   const GOT = opLog(UPDATE_DONE, `Объект получен из хранилища: ${T}`);
   const NOTHING = opLog(UPDATE_DONE);
@@ -162,6 +163,7 @@ suite('repositoryChains: runUpdateChain', () => {
     assert.deepStrictEqual(p.events, ['repo:update', 'import:cf']);
     assert.deepStrictEqual(result, {
       receivedFromRepository: true, changesLoadedAfter: false, projectImported: true, projectBehind: false, warnings: [],
+      databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
     assert.deepStrictEqual(p.toasts, []);
     const tail = operationTail(p.args());
@@ -179,7 +181,7 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('receive-then-load: получение → загрузка правок → импорт (Э24), changesLoadedAfter=true, всё без тостов', async () => {
     p.setResult(GOT);
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true }));
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cf', 'import:cf']);
     assert.strictEqual(result.changesLoadedAfter, true);
     assert.deepStrictEqual(result.warnings, []);
@@ -188,18 +190,19 @@ suite('repositoryChains: runUpdateChain', () => {
 
   test('receive-then-load, цель cfe', async () => {
     p.setResult(GOT);
-    await runUpdateChain(p.services, p.cfeTarget, p.refs.cfeCatalog, request, plan({ loadChangesAfterReceive: true }));
+    await runUpdateChain(p.services, p.cfeTarget, p.refs.cfeCatalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cfe:Расш', 'import:cfe:Расш']);
   });
 
   test('сбой загрузки правок ПОСЛЕ получения — успех с предупреждением, импорта нет (перезаписал бы правки), projectBehind=true', async () => {
     p.setResult(GOT);
     p.updateResult = false;
-    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true }));
+    const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }));
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cf']);
     assert.deepStrictEqual(result, {
       receivedFromRepository: true, changesLoadedAfter: false, projectImported: false, projectBehind: true,
       warnings: [describeLoadFailureAfterReceive('Основная')],
+      databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
     assert.deepStrictEqual(p.cleaned, []);
   });
@@ -245,7 +248,7 @@ suite('repositoryChains: runUpdateChain', () => {
   test('exit≠0: RepositoryCliError, загрузки и импорта нет', async () => {
     p.setResult('нет доступа', 1);
     await assert.rejects(
-      () => runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true })),
+      () => runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true })),
       RepositoryCliError
     );
     assert.deepStrictEqual(p.events, ['repo:update']);
@@ -263,11 +266,12 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('чистый проект: помещение, учёт снят, результат; импорта нет; вектор -Objects … -comment', async () => {
     p.setResult(COMMITTED);
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
     assert.deepStrictEqual(p.events, ['repo:commit']);
     assert.deepStrictEqual(result, {
       committedObjects: [T], keptLocked: false, referencesCleaned: false,
       databaseLoadedBefore: false, projectImported: false, warnings: [],
+      databaseConfigurationUpdated: false, databaseConfigurationBehind: false,
     });
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), false);
     assert.deepStrictEqual(p.toasts, []);
@@ -278,7 +282,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('updateDatabaseFirst: загрузка → помещение (под одним вызовом), databaseLoadedBefore=true', async () => {
     p.setResult(COMMITTED);
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true });
     assert.deepStrictEqual(p.events, ['update:cf', 'repo:commit']);
     assert.strictEqual(result.databaseLoadedBefore, true);
   });
@@ -286,7 +290,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('сбой загрузки перед помещением: ошибка с точным текстом, помещение не запускалось, захват остаётся', async () => {
     p.updateResult = false;
     await assert.rejects(
-      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true }),
+      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: true, updateDatabaseOnLoad: true }),
       (error: Error) => error.message === 'Загрузка правок проекта в базу не выполнена; помещение не выполнялось. Подробности — в журнале «1С Редактор».'
     );
     assert.strictEqual(p.runs.length, 0);
@@ -296,7 +300,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('keepLocked: захват сохраняется, keptLocked=true, -keepLocked в векторе; -force только при force', async () => {
     p.setResult(COMMITTED);
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, keepLocked: true, force: true }, { updateDatabaseFirst: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, keepLocked: true, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
     );
     assert.strictEqual(result.keptLocked, true);
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), true);
@@ -307,7 +311,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('очистка ссылок (-force, Э25): база помещающего изменена → ОБЯЗАТЕЛЬНЫЙ импорт cf, referencesCleaned=true, projectImported=true', async () => {
     p.setResult(CLEANED);
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
     );
     assert.deepStrictEqual(p.events, ['repo:commit', 'import:cf']);
     assert.strictEqual(result.referencesCleaned, true);
@@ -319,7 +323,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('очистка ссылок, цель cfe: импорт расширения', async () => {
     p.lock([T], p.cfeTarget);
     p.setResult(CLEANED);
-    await runCommitChain(p.services, p.cfeTarget, p.refs.cfeCatalog, { ...request, force: true }, { updateDatabaseFirst: false });
+    await runCommitChain(p.services, p.cfeTarget, p.refs.cfeCatalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
     assert.deepStrictEqual(p.events, ['repo:commit', 'import:cfe:Расш']);
   });
 
@@ -327,7 +331,7 @@ suite('repositoryChains: runCommitChain', () => {
     p.setResult(CLEANED);
     p.importResult = false;
     const result = await runCommitChain(
-      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false }
+      p.services, p.cfTarget, p.refs.catalog, { ...request, force: true }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
     );
     assert.strictEqual(result.projectImported, false);
     assert.deepStrictEqual(result.warnings, [describeImportFailureAfterCommit('Основная')]);
@@ -337,7 +341,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('помещение без правок (все «не был изменен»): успех, committedObjects пуст, предупреждение «нечего помещать»', async () => {
     p.setResult(opLog(COMMIT_DONE, `Объект не был изменен: ${T}`));
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
     assert.deepStrictEqual(result.committedObjects, []);
     assert.strictEqual(result.warnings.length, 1);
     assert.ok(result.warnings[0].includes('нечего помещать'), result.warnings[0]);
@@ -346,7 +350,7 @@ suite('repositoryChains: runCommitChain', () => {
 
   test('лог не распознан: committedObjects — все запрошенные, предупреждения «нечего помещать» нет, импорта нет', async () => {
     p.setResult('');
-    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false });
+    const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false });
     assert.deepStrictEqual(result.committedObjects, [T]);
     assert.deepStrictEqual(result.warnings, []);
     assert.deepStrictEqual(p.events, ['repo:commit']);
@@ -355,7 +359,7 @@ suite('repositoryChains: runCommitChain', () => {
   test('exit≠0: RepositoryCliError, импорта нет, захват остаётся', async () => {
     p.setResult('Объект содержит ссылки на удаленные объекты', 1);
     await assert.rejects(
-      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false }),
+      () => runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }),
       RepositoryCliError
     );
     assert.deepStrictEqual(p.events, ['repo:commit']);

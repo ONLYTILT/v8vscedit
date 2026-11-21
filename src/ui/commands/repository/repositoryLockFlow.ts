@@ -12,6 +12,8 @@ export type LockLocalChangesChoice = 'update-then-lock' | 'lock-without-import' 
 export interface RepositoryLockPlan {
   readonly revised: boolean;
   readonly updateDatabaseFirst: boolean;
+  /** Обновлять ли конфигурацию БД на шаге загрузки (настройка `updateDatabaseAfterLoad`); шага нет — `false`. */
+  readonly updateDatabaseOnLoad: boolean;
   /** Разрешён ли импорт после захвата; выполняется он только если захват что-то получил. */
   readonly importAfterLock: boolean;
 }
@@ -29,17 +31,23 @@ export function planRepositoryLock(input: {
   readonly revisedSetting: boolean;
   readonly dirtyFilesCount: number;
   readonly choice?: LockLocalChangesChoice;
+  readonly updateDatabaseAfterLoad: boolean;
 }): RepositoryLockPlan | 'ask' | 'cancel' {
   if (input.dirtyFilesCount <= 0) {
-    return { revised: input.revisedSetting, updateDatabaseFirst: false, importAfterLock: true };
+    return { revised: input.revisedSetting, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: true };
   }
   switch (input.choice) {
     case undefined:
       return 'ask';
     case 'update-then-lock':
-      return { revised: input.revisedSetting, updateDatabaseFirst: true, importAfterLock: true };
+      return {
+        revised: input.revisedSetting,
+        updateDatabaseFirst: true,
+        updateDatabaseOnLoad: input.updateDatabaseAfterLoad,
+        importAfterLock: true,
+      };
     case 'lock-without-import':
-      return { revised: false, updateDatabaseFirst: false, importAfterLock: false };
+      return { revised: false, updateDatabaseFirst: false, updateDatabaseOnLoad: false, importAfterLock: false };
     case 'cancel':
       return 'cancel';
   }

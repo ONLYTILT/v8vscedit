@@ -12,6 +12,7 @@ import { runDumpConfigurationToCf, runLoadConfigurationFromCf, type CfFileRunOut
 import { buildCfApplyTarget, resolveCfFileTargetFromNode } from './CfFileTarget';
 import { getAgentExecutionMode } from './agent/agentSettings';
 import { runApplyDatabaseConfiguration } from './ExtensionCommandRunner';
+import { settleCfFileLoadLag } from './databaseLoadPlan';
 import { describeExtensionListFailure, listConnectedDatabaseExtensions } from './ExtensionListRunner';
 import {
   endConfigurationOperation,
@@ -131,6 +132,9 @@ async function loadConfigurationFromCf(services: CommandServices, node?: NodeArg
 
   if (loaded?.success === true) {
     await offerPostLoadSteps(services, target.extensionName, loaded);
+  } else {
+    // Сбой /LoadCfg (и исключение) оставляет побочные эффекты: часть изменений могла быть применена.
+    services.databaseConfigLag.markBehind(buildCfApplyTarget(services.workspaceFolder.uri.fsPath, target.extensionName), 'cf-file-load');
   }
   /* c8 ignore stop */
 }
@@ -145,6 +149,9 @@ async function loadConfigurationFromCf(services: CommandServices, node?: NodeArg
  */
 async function offerPostLoadSteps(services: CommandServices, extensionName: string, outcome: CfFileRunOutcome): Promise<void> {
   const plan = planPostLoadPrompts(outcome, extensionName);
+  const applyTarget = buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName);
+  // До вопроса: «Позже» или закрытое окно оставляют основную конфигурацию впереди конфигурации БД.
+  settleCfFileLoadLag(services.databaseConfigLag, applyTarget, outcome.appliedToDatabase === true);
   for (const warning of plan.warnings) {
     void vscode.window.showWarningMessage(warning);
   }
@@ -168,9 +175,10 @@ async function offerPostLoadSteps(services: CommandServices, extensionName: stri
     if (await tryBeginConfigurationOperation()) {
       try {
         await runApplyDatabaseConfiguration(
-          buildCfApplyTarget(services.workspaceFolder.uri.fsPath, extensionName),
+          applyTarget,
           services.workspaceFolder,
           services.outputChannel,
+          services.databaseConfigLag,
           true
         );
       } catch (error) {

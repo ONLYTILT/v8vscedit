@@ -131,6 +131,8 @@ export class AgentExtensionsEmulator {
   /** Подмена поведения падения/зависания (исполнитель без SSH превращает его в `AgentConnectionLostError`). */
   crashHandler: ((mode: CrashMode, rawCommand: string) => Promise<never>) | undefined;
 
+  /** Имена заглушек, созданных `load-config-from-files` (Э32). */
+  readonly stubsCreatedByFileLoad: string[] = [];
   private readonly entries: Entry[] = [];
   private readonly traps: Trap[] = [];
 
@@ -180,6 +182,19 @@ export class AgentExtensionsEmulator {
   pendingOf(name: string): string | undefined {
     const pending = this.find(name)?.pending;
     return pending === '' ? undefined : pending;
+  }
+
+  /**
+   * ФАКТ Э32: `load-config-from-files --extension=N` в ОТСУТСТВУЮЩЕЕ расширение отвечает успехом и создаёт
+   * заглушку N (нулевой хеш), как `load-cfg` по Э28. Существующее расширение запись не меняет: хеш применённого
+   * состояния обновляет только `update-db-cfg`. Журнал имён заглушек — для проверки «загрузка не создала лишнего».
+   */
+  noteLoadFromFiles(extension: string | undefined): void {
+    if (extension === undefined || this.find(extension)) {
+      return;
+    }
+    this.entries.push({ name: extension, pending: '' });
+    this.stubsCreatedByFileLoad.push(extension);
   }
 
   // ── Ловушки ──────────────────────────────────────────────────────────────

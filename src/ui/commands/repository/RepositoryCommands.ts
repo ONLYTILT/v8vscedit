@@ -4,6 +4,7 @@ import type { RepositoryTarget } from '../../../infra/repository/RepositoryServi
 import { REPOSITORY_DUMP_OUTPUT, repositoryReportOutputName } from '../../../infra/repository/RepositoryDesignerArgs';
 import type { CommandServices, NodeArg } from '../_shared';
 import { runWithConfigurationOperationLock } from '../ext/configurationOperationLock';
+import { readUpdateDatabaseAfterLoad, withLoadModeNote } from '../ext/databaseSettings';
 import { describeRepositoryActionSuccess, runRepositoryCliCommand } from './RepositoryCommandRunner';
 import { describeUnlockNotDone, runCommitChain, runUnlockChain } from './repositoryChains';
 import { showRepositoryChainFailure, showRepositoryChainWarnings } from './repositoryChainUi';
@@ -501,24 +502,29 @@ async function resolveCommitPlan(
   const changed = await findChangedConfiguration(services, target);
   const dirtyFilesCount = changed?.changedFilesCount ?? 0;
   const changedName = changed?.name ?? target.displayName;
+  const updateDatabaseAfterLoad = readUpdateDatabaseAfterLoad();
   let choice: CommitLocalChangesChoice | undefined;
   for (;;) {
-    const plan = planRepositoryCommit({ dirtyFilesCount, choice });
+    const plan = planRepositoryCommit({ dirtyFilesCount, choice, updateDatabaseAfterLoad });
     if (plan !== 'ask') {
       return plan;
     }
-    choice = await promptUpdateBeforeCommit(changedName, dirtyFilesCount);
+    choice = await promptUpdateBeforeCommit(changedName, dirtyFilesCount, updateDatabaseAfterLoad);
   }
 }
 
 /** Помещение без предварительной загрузки запрещено: помещается то, что в базе, а не в файлах. */
-async function promptUpdateBeforeCommit(name: string, dirtyFilesCount: number): Promise<CommitLocalChangesChoice> {
+async function promptUpdateBeforeCommit(
+  name: string,
+  dirtyFilesCount: number,
+  updateDatabaseAfterLoad: boolean
+): Promise<CommitLocalChangesChoice> {
   const picked = await vscode.window.showQuickPick([
     {
       id: 'update',
       label: '$(sync) Обновить и продолжить',
       description: 'Сначала загрузить локальные изменения в базу, затем выполнить помещение',
-      detail: `${name}: изменённых файлов ${String(dirtyFilesCount)}`,
+      detail: withLoadModeNote(`${name}: изменённых файлов ${String(dirtyFilesCount)}`, updateDatabaseAfterLoad),
     },
     {
       id: 'cancel',

@@ -13,6 +13,7 @@ import type {
 import { RepositoryService, type RepositoryNodeRef } from '../../infra/repository/RepositoryService';
 import type { CommandServices } from '../../ui/commands/_shared';
 import { registerRepositoryCommands } from '../../ui/commands/repository/RepositoryCommands';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import { disposeRepositoryCommandStatusBar } from '../../ui/commands/repository/RepositoryCommandRunner';
 import {
   endConfigurationOperation,
@@ -191,6 +192,8 @@ suite('RepositoryCommands — обработчики команд', () => {
         show: (...args: unknown[]) => { commitForm.calls.push(args); return Promise.resolve(commitForm.answer); },
       },
       createDesignerExecutor: (v8: string, cwd: string) => { executorCalls.push({ v8Path: v8, cwd }); return fakeExecutor; },
+      // Цепочки хранилища читают и ставят признак «БД отстаёт» (получение версий, итог цепочки).
+      databaseConfigLag: new FakeLagRecorder(),
     } as unknown as CommandServices;
 
     handlers = new Map();

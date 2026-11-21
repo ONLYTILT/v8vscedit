@@ -34,6 +34,7 @@ import {
   type AgentLocation,
 } from '../../ui/commands/ext/agent/agentSettings';
 import { resetAgentSettings, setAgentSetting } from './support/agentRemoteHarness';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -207,11 +208,11 @@ suite('Агент Э8: режим выполнения (location × operationMod
       ['runDecompileMainConfiguration', (f, c) => runner.runDecompileMainConfiguration('Основная', path.join(os.tmpdir(), 'cf'), f, c)],
       ['runDecompileExtension', (f, c) => runner.runDecompileExtension('Расш', path.join(os.tmpdir(), 'cfe'), f, c)],
       ['runApplyDatabaseConfiguration', (f, c) => runner.runApplyDatabaseConfiguration(
-        { kind: 'cf', name: 'Основная', rootPath: path.join(os.tmpdir(), 'cf') }, f, c
+        { kind: 'cf', name: 'Основная', rootPath: path.join(os.tmpdir(), 'cf') }, f, c, new FakeLagRecorder()
       )],
-      ['runCompileExtension', (f, c) => runner.runCompileExtension('Расш', path.join(os.tmpdir(), 'cfe'), f, c)],
-      ['runUpdateExtension', (f, c) => runner.runUpdateExtension('Расш', path.join(os.tmpdir(), 'cfe'), f, c)],
-      ['runUpdateMainConfiguration', (f, c) => runner.runUpdateMainConfiguration('Основная', path.join(os.tmpdir(), 'cf'), f, c)],
+      ['runCompileExtension', (f, c) => runner.runCompileExtension('Расш', path.join(os.tmpdir(), 'cfe'), f, c, true, new FakeLagRecorder())],
+      ['runUpdateExtension', (f, c) => runner.runUpdateExtension('Расш', path.join(os.tmpdir(), 'cfe'), f, c, true, undefined, { updateDatabase: true, lag: new FakeLagRecorder() })],
+      ['runUpdateMainConfiguration', (f, c) => runner.runUpdateMainConfiguration('Основная', path.join(os.tmpdir(), 'cf'), f, c, true, undefined, { updateDatabase: true, lag: new FakeLagRecorder() })],
     ];
     // Обратная сторона: в local + batch все шесть точек уходят в пакетную ветку. Признак — её первый
     // шаг: чтение env.json, которого во временном каталоге нет, отклоняет промис. Агентская ветка
@@ -221,11 +222,11 @@ suite('Агент Э8: режим выполнения (location × operationMod
       ['runDecompileMainConfiguration', (f, c) => runner.runDecompileMainConfiguration('Основная', path.join(batchRoot, 'src', 'cf'), f, c)],
       ['runDecompileExtension', (f, c) => runner.runDecompileExtension('Расш', path.join(batchRoot, 'src', 'cfe', 'Расш'), f, c)],
       ['runApplyDatabaseConfiguration', (f, c) => runner.runApplyDatabaseConfiguration(
-        { kind: 'cf', name: 'Основная', rootPath: path.join(batchRoot, 'src', 'cf') }, f, c
+        { kind: 'cf', name: 'Основная', rootPath: path.join(batchRoot, 'src', 'cf') }, f, c, new FakeLagRecorder()
       )],
-      ['runCompileExtension', (f, c) => runner.runCompileExtension('Расш', path.join(batchRoot, 'src', 'cfe', 'Расш'), f, c)],
-      ['runUpdateExtension', (f, c) => runner.runUpdateExtension('Расш', path.join(batchRoot, 'src', 'cfe', 'Расш'), f, c)],
-      ['runUpdateMainConfiguration', (f, c) => runner.runUpdateMainConfiguration('Основная', path.join(batchRoot, 'src', 'cf'), f, c)],
+      ['runCompileExtension', (f, c) => runner.runCompileExtension('Расш', path.join(batchRoot, 'src', 'cfe', 'Расш'), f, c, true, new FakeLagRecorder())],
+      ['runUpdateExtension', (f, c) => runner.runUpdateExtension('Расш', path.join(batchRoot, 'src', 'cfe', 'Расш'), f, c, true, undefined, { updateDatabase: true, lag: new FakeLagRecorder() })],
+      ['runUpdateMainConfiguration', (f, c) => runner.runUpdateMainConfiguration('Основная', path.join(batchRoot, 'src', 'cf'), f, c, true, undefined, { updateDatabase: true, lag: new FakeLagRecorder() })],
     ];
     for (const [name, run] of batchEntryPoints) {
       test(`local + batch: ${name} идёт в пакетную ветку (первый шаг — env.json), агент не создаётся`, async () => {

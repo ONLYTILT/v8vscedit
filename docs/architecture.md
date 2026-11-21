@@ -1212,6 +1212,39 @@ MCP получает `warnings` в ответе, без тостов (silent).
 (`/F`, `File=`) и клиент-серверная с петлевым адресом сервера — отказ до побочных эффектов (путь указан
 с точки зрения сервера; локальный 1cv8 его не видит или открыл бы другую базу) (Н51).
 
+### Отставание конфигурации БД (`infra/database/DatabaseConfigLag`)
+
+Загрузка изменений в базу и обновление конфигурации БД (`UpdateDBCfg`) - отдельные шаги: можно загрузить
+файлы без реструктуризации. Расширение хранит **локальный** признак «БД не обновлена» на цель (cf и каждое
+cfe): `.v8vscedit/database-config/lag.json` (`DatabaseConfigLagStore`, запись только через
+`writeFileAtomic`, `infra` без `vscode`; UI - `ui/database/DatabaseLagStatusBar`, `databaseLagPresentation`).
+Поколение `config generation-id` агента для признака не годится: замер Э32 - оно несимметрично (у основной
+конфигурации меняется от загрузки из файлов и не меняется от `update-db-cfg`, у расширения наоборот).
+
+**Ставится** (`markBehind(target, source)`, источники `load-without-update`, `update-failed`, `cf-file-load`,
+`repository-receive`): загрузка без обновления; сбой обновления; сбой загрузки (консервативно); загрузка
+CF/CFE-файла без применения или со сбоем; получение версий из хранилища без обновления БД. **Снимается**
+(`markCurrent`) только успешным `UpdateDBCfg` этой цели или вручную. Время первого отставания сохраняется
+поверх новых причин. Отметки `cf-file-load` не стираются при перечитывании конфигураций. Смысл честный:
+«расширение загрузило без обновления» - обновление БД в Конфигураторе вручную расширение не видит. Сбой записи
+файла операцию не роняет. Переживает перезапуск VS Code. Осознанный компромисс: отметка `cf-file-load` не снимается при перечитывании конфигураций, даже если расширение потом удалено из базы; снимается только успешным обновлением БД этой цели или вручную («Отметить как обновлённую»).
+
+**Агент.** `AgentOperationService.loadChanged(target, {updateDatabase, updateWhenUnchanged})`; хук
+`onConfigurationLoadStarting` вызывается прямо перед отправкой `load-config-from-files` (обрыв до отправки
+признак не ставит). Guard наличия расширения (E6) стоит ДО загрузки в обоих режимах: загрузка в отсутствующее
+имя создаёт заглушку с нулевым хешем (Э32). Без изменений при `updateWhenUnchanged` выполняется только
+`update-db-cfg`.
+
+**Batch.** `buildBatchLoadSteps` (`ui/commands/ext/databaseLoadPlan.ts`, исполнение -
+`batchDatabaseLoad.ts`): без обновления шаг `update-configuration` пропускается, запасной путь -
+`import-configuration -Mode Full`; предпроверка `hasPendingHashChanges` - без изменений CLI не запускается.
+
+**Настройка и цепочки.** `v8vscedit.configuration.updateDatabaseAfterLoad` (`databaseSettings.ts`) управляет
+«Обновить изменённые конфигурации» и шагом загрузки в цепочках хранилища; MCP передаёт `updateDatabase`
+явно. Тонкий клиент перед запуском обновляет БД всегда. Команды -
+`ui/commands/ext/DatabaseConfigCommands.ts`; агентская ветка - `agent/agentDatabaseLoad.ts`. В результатах
+MCP (`repository_status`, lock/update/commit) - поле `databaseConfigurationBehind`.
+
 ### Захват объектов хранилища и синхронизация проекта
 
 Платформа при `/ConfigurationRepositoryLock` получает в базу новые версии объектов, изменённых в хранилище

@@ -548,7 +548,7 @@ export const EXTENSION_MCP_TOOLS: readonly AiMcpToolInfo[] = [
   {
     profile: 'extension',
     name: 'v8vscedit_execute_command',
-    description: 'Безопасный мост к разрешённым командам refresh, importConfigurations, updateChangedConfigurations.',
+    description: 'Безопасный мост к разрешённым командам refresh, importConfigurations, updateChangedConfigurations; updateChangedConfigurations следует настройке updateDatabaseAfterLoad, явный выбор обновления БД — v8vscedit_load_configuration_changes.',
     requirement: 'Команда должна быть в allowlist расширения',
   },
   {
@@ -584,8 +584,14 @@ export const EXTENSION_MCP_TOOLS: readonly AiMcpToolInfo[] = [
   {
     profile: 'extension',
     name: 'v8vscedit_update_database_configuration',
-    description: 'Обновление конфигурации БД (/UpdateDBCfg) для корня конфигурации или расширения; возможна реструктуризация данных.',
+    description: 'Обновление конфигурации БД (/UpdateDBCfg) для корня конфигурации или расширения; возможна реструктуризация данных. Файлы проекта загружает v8vscedit_load_configuration_changes.',
     requirement: 'Настроенное подключение к базе (env.json), канонический путь корня',
+  },
+  {
+    profile: 'extension',
+    name: 'v8vscedit_load_configuration_changes',
+    description: 'Загрузка изменённых файлов проекта корня в основную конфигурацию базы; updateDatabase (обязателен) — обновлять ли конфигурацию БД (возможна реструктуризация данных), иначе БД отмечается как не обновлённая.',
+    requirement: 'Настроенное подключение к базе (env.json), канонический путь корня, явный updateDatabase',
   },
 ];
 

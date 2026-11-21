@@ -200,7 +200,7 @@ suite('Агент Э8: удалённый агент через реестр (н
     const loadsAfterFull = h.emulator.loads.length;
 
     fs.writeFileSync(path.join(h.cfRoot, 'Catalogs', 'Клиенты.xml'), '<Catalog>Клиенты v2</Catalog>');
-    await service.loadChangedAndUpdate(target());
+    await service.loadChanged(target(), { updateDatabase: true });
 
     assert.deepStrictEqual(h.emulator.loads.slice(loadsAfterFull).map((load) => load.mode), ['partial'], 'второго архива нет');
     assert.strictEqual(h.emulator.updateDbCalls, 2);
@@ -220,7 +220,7 @@ suite('Агент Э8: удалённый агент через реестр (н
     assert.strictEqual(h.emulator.updateDbCalls, 1);
 
     fs.writeFileSync(path.join(h.cfRoot, 'Catalogs', 'Клиенты.xml'), '<Catalog>Клиенты v2</Catalog>');
-    await service.loadChangedAndUpdate(target());
+    await service.loadChanged(target(), { updateDatabase: true });
     assert.strictEqual(h.emulator.loads.at(-1)?.mode, 'partial');
     assert.strictEqual(h.emulator.updateDbCalls, 2);
 

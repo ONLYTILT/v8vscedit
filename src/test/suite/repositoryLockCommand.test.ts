@@ -20,7 +20,8 @@ import {
 } from '../../ui/commands/ext/configurationOperationLock';
 import { disposeRepositoryCommandStatusBar } from '../../ui/commands/repository/RepositoryCommandRunner';
 import { registerRepositoryCommands } from '../../ui/commands/repository/RepositoryCommands';
-import { importTargetFromDatabase, runPostRepositorySync, updateTargetDatabase } from '../../ui/commands/repository/repositoryPostSync';
+import { importTargetFromDatabase, loadTargetChangesIntoDatabase, runPostRepositorySync } from '../../ui/commands/repository/repositoryPostSync';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import { describeImportFailureAfterLock, describeProjectBehindAfterLock } from '../../ui/commands/repository/repositoryLockFlow';
 
 /**
@@ -99,6 +100,10 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
 
   async function setRevisedSetting(value: boolean | undefined): Promise<void> {
     await vscode.workspace.getConfiguration('v8vscedit.repository').update('getRevisedOnLock', value, vscode.ConfigurationTarget.Global);
+  }
+
+  async function setUpdateDatabaseSetting(value: boolean | undefined): Promise<void> {
+    await vscode.workspace.getConfiguration('v8vscedit.configuration').update('updateDatabaseAfterLoad', value, vscode.ConfigurationTarget.Global);
   }
 
   async function lock(node: RepositoryNodeRef = catalogNode): Promise<void> {
@@ -212,6 +217,7 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
       markConfigurationsClean: (roots: string[]) => { cleaned.push(roots); },
       reloadEntries: () => { reloads += 1; return Promise.resolve(); },
       createDesignerExecutor: () => executor,
+      databaseConfigLag: new FakeLagRecorder(),
     } as unknown as CommandServices;
 
     handlers = new Map();
@@ -237,6 +243,7 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
       runnerRef[key] = saved[key];
     }
     await setRevisedSetting(undefined);
+    await setUpdateDatabaseSetting(undefined);
     disposeRepositoryCommandStatusBar();
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -438,6 +445,35 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
       assert.deepStrictEqual(warnings, []);
     });
 
+    const SETTING_NOTE = 'конфигурация БД не обновляется';
+    for (const setting of [true, false]) {
+      test(`настройка updateDatabaseAfterLoad=${String(setting)}: в detail пункта загрузки ${setting ? 'нет' : 'есть'} пояснения «${SETTING_NOTE} — настройка updateDatabaseAfterLoad»; пунктов по-прежнему три`, async () => {
+        await setUpdateDatabaseSetting(setting);
+        dirty();
+        picks.push(RECURSIVE, PICK_ESC);
+
+        await lock();
+
+        const items = pickItems[1];
+        assert.strictEqual(items.length, 3, 'пунктов не добавлено');
+        const detail = items[0].detail ?? '';
+        assert.strictEqual(detail.includes(SETTING_NOTE) && detail.includes('updateDatabaseAfterLoad'), !setting, detail);
+      });
+
+      test(`update-then-lock при updateDatabaseAfterLoad=${String(setting)}: раннер загрузки получает updateDatabase=${String(setting)} и признак отставания из services`, async () => {
+        await setUpdateDatabaseSetting(setting);
+        dirty();
+        picks.push(RECURSIVE, pickById('update-then-lock'));
+
+        await lock();
+
+        assert.deepStrictEqual(events.slice(0, 2), ['update:cf', 'lock']);
+        const options = importCalls[0][6] as { updateDatabase: boolean; lag: unknown };
+        assert.strictEqual(options.updateDatabase, setting);
+        assert.ok(options.lag instanceof FakeLagRecorder, 'передан services.databaseConfigLag');
+      });
+    }
+
     test('Esc в вопросе: ничего не запущено', async () => {
       dirty();
       picks.push(RECURSIVE, PICK_ESC);
@@ -580,9 +616,10 @@ suite('v8vscedit.repository.lock: захват, импорт по логу, во
       const services = {
         workspaceFolder: { uri: vscode.Uri.file(root), name: 'lock-cmd', index: 0 },
         outputChannel: { appendLine: () => undefined },
+        databaseConfigLag: new FakeLagRecorder(),
       } as unknown as CommandServices;
 
-      assert.strictEqual(await updateTargetDatabase(bare, services), false);
+      assert.strictEqual(await loadTargetChangesIntoDatabase(bare, services, { updateDatabase: true }), false);
       assert.strictEqual(await importTargetFromDatabase(bare, services), false);
 
       assert.deepStrictEqual(events, ['update:cfe:ПоИмени', 'import:cfe:ПоИмени']);

@@ -12,7 +12,7 @@
  * провалить именно этот тест.
  *
  * Зафиксировано:
- *  1) Полный каталог из 67 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
+ *  1) Полный каталог из 68 tool, регистрируемых НЕПОСРЕДСТВЕННО телом
  *     `registerTools` (`server.registerTool(...)` прямо в V8McpServer.ts).
  *     Для каждого — имя, title, description (построчно, дословно) и набор
  *     ключей inputSchema с их опциональностью. Было 59 на момент снятия эталона;
@@ -58,6 +58,7 @@ import { SubsystemXmlService } from '../../infra/xml/SubsystemXmlService';
 import { FormToolsService } from '../../infra/xml/form/FormToolsService';
 import { RoleRightsService } from '../../infra/role';
 import { MetadataNode } from '../../ui/tree/TreeNode';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import type { MetadataTreeProvider } from '../../ui/tree/MetadataTreeProvider';
 import type { CommandServices } from '../../ui/commands/_shared';
 
@@ -162,6 +163,7 @@ function createBaselineServices(overrides: Partial<CommandServices> = {}): Comma
     setTreeMessage: () => undefined,
     setTreeProcessingState: () => undefined,
     refreshActionsView: () => undefined,
+    databaseConfigLag: new FakeLagRecorder(),
   };
   return { ...base, ...overrides };
 }
@@ -606,32 +608,32 @@ const EXPECTED_TOOLS: readonly ExpectedTool[] = [
   {
     name: 'v8vscedit_execute_command',
     title: 'Выполнить команду расширения',
-    description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations.',
+    description: 'Безопасный мост только для явно разрешённых команд расширения: refresh, importConfigurations, updateChangedConfigurations. updateChangedConfigurations следует настройке updateDatabaseAfterLoad (обновлять ли конфигурацию БД после загрузки); для явного выбора используйте v8vscedit_load_configuration_changes.',
     schemaKeys: { command: false },
   },
   {
     name: 'v8vscedit_repository_status',
     title: 'Состояние хранилища конфигурации',
-    description: 'Показывает подключение узла к хранилищу конфигурации: привязку (без пароля), подключено ли оно, захваченные вами объекты по локальному учёту и число незагруженных изменённых файлов проекта. Также показывает состояние общей операции с конфигурацией: operationRunning — идёт ли сейчас операция; currentOperation — время её начала, длительность и текущий этап (null, если операции нет); lastOperation — исход последней завершённой долгой операции MCP (null, если их не было): по нему можно узнать результат, если соединение оборвалось. Платформу не вызывает. Принимает канонический путь объекта или корня конфигурации/расширения (Справочники.Товары, Конфигурация, Расширение).',
+    description: 'Показывает подключение узла к хранилищу конфигурации: привязку (без пароля), подключено ли оно, захваченные вами объекты по локальному учёту и число незагруженных изменённых файлов проекта. databaseConfigurationBehind — признак «конфигурация БД не обновлена» по данным расширения ({ since, source } или null). Также показывает состояние общей операции с конфигурацией: operationRunning — идёт ли сейчас операция; currentOperation — время её начала, длительность и текущий этап (null, если операции нет); lastOperation — исход последней завершённой долгой операции MCP (null, если их не было): по нему можно узнать результат, если соединение оборвалось. Платформу не вызывает. Принимает канонический путь объекта или корня конфигурации/расширения (Справочники.Товары, Конфигурация, Расширение).',
     schemaKeys: { path: false, configuration: true },
   },
   {
     name: 'v8vscedit_repository_lock',
     title: 'Захватить объекты в хранилище',
-    description: 'Захватывает объект в хранилище конфигурации для редактирования через пакетный Конфигуратор; после захвата, если из хранилища получены новые версии, импортирует их в файлы проекта. Рекурсивный захват корня требует confirm: true. При незагруженных правках проекта обязателен localChanges: loadFirst (загрузить правки в базу перед захватом), keepProjectBehind (захватить, проект не обновлять) или abort. Принимает канонический путь объекта или корня; дочерний элемент захватывает владельца.',
-    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, confirm: true },
+    description: 'Захватывает объект в хранилище конфигурации для редактирования через пакетный Конфигуратор; после захвата, если из хранилища получены новые версии, импортирует их в файлы проекта. Рекурсивный захват корня требует confirm: true. При незагруженных правках проекта обязателен localChanges: loadFirst (загрузить правки в базу перед захватом), keepProjectBehind (захватить, проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня; дочерний элемент захватывает владельца.',
+    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, confirm: true, updateDatabase: true },
   },
   {
     name: 'v8vscedit_repository_update',
     title: 'Получить объекты из хранилища',
-    description: 'Получает объект из хранилища конфигурации в базу и импортирует изменившиеся объекты в файлы проекта. Получение возвращает захваченные вами объекты к версии хранилища: правки, загруженные в базу и не помещённые, будут потеряны — для таких объектов нужен overwriteLocked: true. При незагруженных правках проекта обязателен localChanges: loadAfter (загрузить правки после получения), keepProjectBehind (проект не обновлять) или abort. Принимает канонический путь объекта или корня.',
-    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true },
+    description: 'Получает объект из хранилища конфигурации в базу и импортирует изменившиеся объекты в файлы проекта. Получение возвращает захваченные вами объекты к версии хранилища: правки, загруженные в базу и не помещённые, будут потеряны — для таких объектов нужен overwriteLocked: true. При незагруженных правках проекта обязателен localChanges: loadAfter (загрузить правки после получения), keepProjectBehind (проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня.',
+    schemaKeys: { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true, updateDatabase: true },
   },
   {
     name: 'v8vscedit_repository_commit',
     title: 'Поместить объекты в хранилище',
-    description: 'Помещает изменения объекта в хранилище конфигурации через пакетный Конфигуратор. Операция необратима и требует confirm: true и непустого comment. Помещение без предварительной загрузки правок проекта запрещено: при незагруженных правках передайте localChanges: loadFirst. keepLocked оставляет объект захваченным. force: платформа сама удалит из объекта ссылки на удалённые объекты (молчаливая правка объекта в базе и в хранилище), захват не обходит; после такой очистки проект импортируется заново. Принимает канонический путь объекта или корня.',
-    schemaKeys: { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false },
+    description: 'Помещает изменения объекта в хранилище конфигурации через пакетный Конфигуратор. Операция необратима и требует confirm: true и непустого comment. Помещение без предварительной загрузки правок проекта запрещено: при незагруженных правках передайте localChanges: loadFirst. keepLocked оставляет объект захваченным. force: платформа сама удалит из объекта ссылки на удалённые объекты (молчаливая правка объекта в базе и в хранилище), захват не обходит; после такой очистки проект импортируется заново. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня.',
+    schemaKeys: { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false, updateDatabase: true },
   },
   {
     name: 'v8vscedit_repository_unlock',
@@ -642,27 +644,33 @@ const EXPECTED_TOOLS: readonly ExpectedTool[] = [
   {
     name: 'v8vscedit_update_database_configuration',
     title: 'Обновить конфигурацию БД',
-    description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_execute_command с updateChangedConfigurations. Принимает канонический путь корня: Конфигурация или Расширение.',
+    description: 'Применяет основную конфигурацию базы к её структуре (/UpdateDBCfg) через пакетный Конфигуратор; может вызвать реструктуризацию данных базы и занять продолжительное время. Снимает признак «конфигурация БД не обновлена» (databaseConfigurationBehind). Файлы проекта в базу НЕ загружаются — для этого используйте v8vscedit_load_configuration_changes. Принимает канонический путь корня: Конфигурация или Расширение.',
     schemaKeys: { path: false, configuration: true },
+  },
+  {
+    name: 'v8vscedit_load_configuration_changes',
+    title: 'Загрузить изменения в базу',
+    description: 'Загружает изменённые файлы проекта корня конфигурации или расширения в основную конфигурацию базы (тот же путь, что команды «Обновить в базе» и «Загрузить в базу без обновления БД»). updateDatabase обязателен: true — после загрузки обновить конфигурацию БД (/UpdateDBCfg, возможна долгая реструктуризация данных); false — только основная конфигурация (для помещения в хранилище этого достаточно), конфигурация БД отмечается как не обновлённая (databaseConfigurationBehind) до v8vscedit_update_database_configuration. Если изменений нет, а конфигурация БД отстаёт, при updateDatabase: true выполняется только обновление БД. Принимает канонический путь корня: Конфигурация или Расширение.',
+    schemaKeys: { path: false, configuration: true, updateDatabase: false },
   },
 ];
 
 suite('V8McpServer.registerTools — golden-каталог перед декомпозицией (характеризационный)', () => {
-  test('регистрирует ровно 67 прямых tool (без учёта registerAllAddTools)', () => {
+  test('регистрирует ровно 68 прямых tool (без учёта registerAllAddTools)', () => {
     const { tools } = registerAllTools(createBaselineServices());
     // registerAllAddTools добавляет ещё 45 root + 11 child = 56 tool-ов поверх
-    // этих 67 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
+    // этих 68 — их каталог отдельно застрахован mcpAddTools.test.ts. Здесь
     // фиксируем именно прямые регистрации, чтобы дробление не потеряло и не
     // задвоило ни одну из них.
     assert.strictEqual(tools.size, EXPECTED_TOOLS.length + 56,
-      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (67 прямых + 56 add-tools)`);
+      `фактический размер каталога (${String(tools.size)}) разошёлся с ожидаемым (68 прямых + 56 add-tools)`);
     for (const expected of EXPECTED_TOOLS) {
       assert.ok(tools.has(expected.name), `должен быть зарегистрирован tool "${expected.name}"`);
     }
   });
 
-  test('ровно 67 прямых tool описаны в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
-    assert.strictEqual(EXPECTED_TOOLS.length, 67);
+  test('ровно 68 прямых tool описаны в эталоне EXPECTED_TOOLS (защита от рассинхронизации самого теста)', () => {
+    assert.strictEqual(EXPECTED_TOOLS.length, 68);
     const uniqueNames = new Set(EXPECTED_TOOLS.map((tool) => tool.name));
     assert.strictEqual(uniqueNames.size, EXPECTED_TOOLS.length, 'имена tools в эталоне не должны повторяться');
   });

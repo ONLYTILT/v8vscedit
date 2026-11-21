@@ -56,7 +56,7 @@ suite('repositoryChains: узел без подписи', () => {
     p.setResult(opLog(COMMIT_DONE, `Объект не был изменен: ${T}`));
     const node = { nodeKind: 'Catalog', xmlPath: p.refs.catalog.xmlPath };
     const result = await runCommitChain(
-      p.services, p.cfTarget, node, { recursive: false, comment: 'к', keepLocked: false, force: false }, { updateDatabaseFirst: false }
+      p.services, p.cfTarget, node, { recursive: false, comment: 'к', keepLocked: false, force: false }, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }
     );
     assert.strictEqual(result.warnings.length, 1);
     assert.ok(result.warnings[0].includes(p.cfTarget.displayName), result.warnings[0]);

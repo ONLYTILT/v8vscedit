@@ -1,4 +1,5 @@
 import * as path from 'path';
+import type { DatabaseLagTarget } from '../../../infra/database/DatabaseConfigLag';
 import type { ChangedConfiguration } from '../../../infra/fs/ConfigurationChangeDetector';
 import type { RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import type { CommandServices } from '../_shared';
@@ -33,7 +34,20 @@ export type RepositoryChainServices = Pick<
   | 'getChangedConfigurations'
   | 'markConfigurationsClean'
   | 'reloadEntries'
+  | 'databaseConfigLag'
 >;
+
+/** Имя расширения цели хранилища: без явного `extensionName` — отображаемое имя. */
+function extensionNameOf(target: RepositoryTarget): string {
+  return target.extensionName ?? target.displayName;
+}
+
+/** Цель признака «БД отстаёт» по цели хранилища: ключ тот же, что у раннеров загрузки. */
+export function toDatabaseLagTarget(target: RepositoryTarget): DatabaseLagTarget {
+  return target.configKind === 'cfe'
+    ? { kind: 'cfe', name: target.displayName, rootPath: target.configRoot, extensionName: extensionNameOf(target) }
+    : { kind: 'cf', name: target.displayName, rootPath: target.configRoot };
+}
 
 export function refreshRepositoryUi(services: RepositoryChainServices): void {
   services.treeProvider.refresh();
@@ -49,22 +63,35 @@ export async function findChangedConfiguration(
   return (await services.getChangedConfigurations()).find((item) => path.resolve(item.rootPath).toLowerCase() === root);
 }
 
-/** Загрузка правок проекта в базу (`false` — сбой или отмена; ошибку уже показал раннер). */
-export async function updateTargetDatabase(target: RepositoryTarget, services: RepositoryChainServices): Promise<boolean> {
+/**
+ * Загрузка правок проекта в базу (`false` — сбой или отмена; ошибку уже показал раннер). Обновление
+ * конфигурации БД — по `options.updateDatabase` (настройка `updateDatabaseAfterLoad` или параметр MCP);
+ * признак отставания ставит и снимает сам раннер.
+ */
+export async function loadTargetChangesIntoDatabase(
+  target: RepositoryTarget,
+  services: RepositoryChainServices,
+  options: { readonly updateDatabase: boolean }
+): Promise<boolean> {
+  const loadOptions = { updateDatabase: options.updateDatabase, lag: services.databaseConfigLag };
   const updated = target.configKind === 'cfe'
     ? await runUpdateExtension(
-        target.extensionName ?? target.displayName,
+        extensionNameOf(target),
         target.configRoot,
         services.workspaceFolder,
         services.outputChannel,
-        false
+        false,
+        undefined,
+        loadOptions
       )
     : await runUpdateMainConfiguration(
         target.displayName,
         target.configRoot,
         services.workspaceFolder,
         services.outputChannel,
-        false
+        false,
+        undefined,
+        loadOptions
       );
   if (!updated) {
     return false;
@@ -111,7 +138,7 @@ export async function runPostRepositorySync(target: RepositoryTarget, services: 
       name: target.displayName,
       rootPath: target.configRoot,
       extensionName: target.extensionName,
-    }, services.workspaceFolder, services.outputChannel, false);
+    }, services.workspaceFolder, services.outputChannel, services.databaseConfigLag, false);
     if (!updated) {
       return;
     }

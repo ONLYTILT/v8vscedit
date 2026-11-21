@@ -22,6 +22,7 @@ import {
   runDecompileMainConfiguration,
 } from '../../ui/commands/ext/ExtensionCommandRunner';
 import { resetConfigurationOperationStatus } from '../../ui/commands/ext/configurationOperationStatus';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 import { removeTreeSync } from './support/tempTree';
 
 /**
@@ -190,7 +191,7 @@ suite('Агентская операция: уведомление, отмена
       assert.strictEqual(await runDecompileMainConfiguration('Основная', path.join(tmp, 'src', 'cf'), folder, channel), true);
       assert.strictEqual(await runDecompileExtension('Расш', path.join(tmp, 'src', 'cfe', 'Расш'), folder, channel), true);
       const target = { kind: 'cf' as const, name: 'Основная', rootPath: path.join(tmp, 'src', 'cf') };
-      assert.strictEqual(await runApplyDatabaseConfiguration(target, folder, channel), true);
+      assert.strictEqual(await runApplyDatabaseConfiguration(target, folder, channel, new FakeLagRecorder()), true);
 
       assert.strictEqual(rig.optionsSeen.length, 3);
       assert.strictEqual(rig.optionsSeen[0].cancellable, true, 'импорт конфигурации');

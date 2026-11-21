@@ -30,6 +30,7 @@ import { cfFile, cfeFile, emulatedFailure } from './support/agentExtensionsEmula
 import { fakeExtra } from './support/mcpFakeExtra';
 import { REMOTE_DB_PASSWORD, assertNoSecrets } from './support/agentRemoteHarness';
 import { openLocal, openRemote, type UiStand } from './support/agentUiStands';
+import { FakeLagRecorder } from './support/databaseLagFakes';
 
 interface RegisteredTool {
   readonly description: string;
@@ -76,12 +77,14 @@ for (const location of ['remote', 'local'] as const) {
     this.timeout(120_000);
     let ui: UiStand;
     let server: ReturnType<typeof createMockServer>;
+    let lag: FakeLagRecorder;
 
     setup(async () => {
       ui = location === 'remote' ? await openRemote() : await openLocal();
+      lag = new FakeLagRecorder();
       server = createMockServer();
       registerConfigLifecycleTools(server as never, {
-        services: { workspaceFolder: ui.folder, outputChannel: ui.channel },
+        services: { workspaceFolder: ui.folder, outputChannel: ui.channel, databaseConfigLag: lag },
         xmlEditor: {}, paths: {}, properties: {}, mutations: {},
         gate: new McpMutationGate({} as never),
       } as unknown as McpRegistrationDeps);
@@ -183,6 +186,111 @@ for (const location of ['remote', 'local'] as const) {
       const data = parse(await call('v8vscedit_load_cf', { inputFile: file('main.cf', cfFile('м')), confirm: true, applyToDatabase: true }));
       assert.strictEqual(data.databaseConfigurationUpdated, true);
       assert.deepStrictEqual(updates(), ['config update-db-cfg']);
+    });
+
+    // ── признак «БД отстаёт» после загрузки CF/CFE-файла ───────────────────
+
+    const root = (): string => ui.folder.uri.fsPath;
+    const cfeLag = (name: string) => ({ kind: 'cfe' as const, name, rootPath: path.join(root(), 'src', 'cfe', name), extensionName: name });
+    const cfLag = () => ({ kind: 'cf' as const, name: 'Основная конфигурация', rootPath: path.join(root(), 'src', 'cf') });
+
+    test('load_cf существующего расширения БЕЗ applyToDatabase: markBehind(cf-file-load), в ответе databaseConfigurationBehind=true', async () => {
+      ui.emulator.extensions.addExtension('Расш', 'старое');
+
+      const data = parse(await call('v8vscedit_load_cf', { inputFile: file('Расш.cfe', cfeFile('Расш', 'новое')), extensionName: 'Расш', confirm: true }));
+
+      assert.strictEqual(lag.sourceOf(cfeLag('Расш')), 'cf-file-load');
+      assert.strictEqual(data.databaseConfigurationBehind, true);
+      assert.deepStrictEqual(updates(), []);
+    });
+
+    test('load_cf существующего расширения С applyToDatabase: отметка снята (в том числе прежняя), databaseConfigurationBehind=false', async () => {
+      ui.emulator.extensions.addExtension('Расш', 'старое');
+      lag.markBehind(cfeLag('Расш'), 'load-without-update');
+
+      const data = parse(await call('v8vscedit_load_cf', { inputFile: file('Расш.cfe', cfeFile('Расш', 'новое')), extensionName: 'Расш', confirm: true, applyToDatabase: true }));
+
+      assert.strictEqual(lag.isBehind(cfeLag('Расш')), false);
+      assert.strictEqual(data.databaseConfigurationBehind, false);
+    });
+
+    test('load_cf НОВОГО расширения (авто-применение агентом, appliedToDatabase): отметки нет, прежняя снимается', async () => {
+      lag.markBehind(cfeLag('Расш'), 'load-without-update');
+
+      const data = parse(await call('v8vscedit_load_cf', { inputFile: file('Расш.cfe', cfeFile('Расш')), extensionName: 'Расш', confirm: true }));
+
+      assert.strictEqual(data.createdInDatabase, true);
+      assert.strictEqual(lag.isBehind(cfeLag('Расш')), false);
+      assert.strictEqual(data.databaseConfigurationBehind, false);
+    });
+
+    test('load_cf основной конфигурации без applyToDatabase: markBehind(cf-file-load) по цели cf; с applyToDatabase — снято', async () => {
+      const first = parse(await call('v8vscedit_load_cf', { inputFile: file('main.cf', cfFile('м')), confirm: true }));
+      assert.strictEqual(lag.sourceOf(cfLag()), 'cf-file-load');
+      assert.strictEqual(first.databaseConfigurationBehind, true);
+
+      const second = parse(await call('v8vscedit_load_cf', { inputFile: file('main2.cf', cfFile('м2')), confirm: true, applyToDatabase: true }));
+      assert.strictEqual(lag.isBehind(cfLag()), false);
+      assert.strictEqual(second.databaseConfigurationBehind, false);
+    });
+
+    test('load_cf: сбой загрузки — отметка cf-file-load ставится до ошибки (часть изменений могла быть применена)', async () => {
+      ui.emulator.extensions.addExtension('Расш', 'старое');
+      ui.emulator.extensions.emptyUnknownErrorOn((command) => command.command === 'config load-cfg', 'Файл повреждён');
+
+      const result = await call('v8vscedit_load_cf', { inputFile: file('Расш.cfe', cfeFile('Расш', 'новое')), extensionName: 'Расш', confirm: true });
+
+      assert.ok(isError(result));
+      assert.strictEqual(lag.sourceOf(cfeLag('Расш')), 'cf-file-load');
+    });
+
+    test('load_cf: цели cf и cfe независимы — отметка расширения не трогает основную конфигурацию', async () => {
+      ui.emulator.extensions.addExtension('Расш', 'старое');
+      await call('v8vscedit_load_cf', { inputFile: file('Расш.cfe', cfeFile('Расш', 'новое')), extensionName: 'Расш', confirm: true });
+      assert.strictEqual(lag.isBehind(cfeLag('Расш')), true);
+      assert.strictEqual(lag.isBehind(cfLag()), false);
+    });
+
+    test('load_all_cfe БЕЗ applyToDatabase: существующие расширения — cf-file-load, новое (авто-применено) — без отметки; databaseConfigurationBehind=true', async () => {
+      ui.emulator.extensions.addExtension('Старое', 'с');
+      const inputDir = path.join(ui.workDir, 'вход');
+      writeCatalog(inputDir, [{ name: 'Старое', payload: 'н' }, { name: 'Новое' }]);
+
+      const data = parse(await call('v8vscedit_load_all_cfe', { inputDir, confirm: true, createMissing: true }));
+
+      assert.strictEqual(lag.sourceOf(cfeLag('Старое')), 'cf-file-load');
+      assert.strictEqual(lag.isBehind(cfeLag('Новое')), false);
+      assert.strictEqual(data.databaseConfigurationBehind, true);
+    });
+
+    test('load_all_cfe С applyToDatabase: ни одно загруженное расширение не отстаёт; databaseConfigurationBehind=false', async () => {
+      ui.emulator.extensions.addExtension('Старое', 'с');
+      lag.markBehind(cfeLag('Старое'), 'cf-file-load');
+      const inputDir = path.join(ui.workDir, 'вход');
+      writeCatalog(inputDir, [{ name: 'Старое', payload: 'н' }]);
+
+      const data = parse(await call('v8vscedit_load_all_cfe', { inputDir, confirm: true, applyToDatabase: true }));
+
+      assert.strictEqual(lag.isBehind(cfeLag('Старое')), false);
+      assert.strictEqual(data.databaseConfigurationBehind, false);
+    });
+
+    test('update_database_configuration снимает отметку и отдаёт databaseConfigurationBehind=false', async () => {
+      ui.emulator.extensions.addExtension('Расш', 'п');
+      lag.markBehind(cfeLag('Расш'), 'cf-file-load');
+      const node = { nodeKind: 'extension', label: 'Расш', xmlPath: path.join(root(), 'src', 'cfe', 'Расш', 'Configuration.xml') };
+      const updateServer = createMockServer();
+      registerConfigLifecycleTools(updateServer as never, {
+        services: { workspaceFolder: ui.folder, outputChannel: ui.channel, databaseConfigLag: lag, repositoryService: { resolveTargetByConfigRoot: () => undefined } },
+        xmlEditor: {}, properties: {}, mutations: {}, paths: { resolveNode: () => node }, gate: new McpMutationGate({} as never),
+      } as unknown as McpRegistrationDeps);
+      const tool = updateServer.tools.get('v8vscedit_update_database_configuration');
+      assert.ok(tool);
+
+      const data = parse(await Promise.resolve(tool.handler({ path: 'Расширение.Расш' }, fakeExtra())));
+
+      assert.strictEqual(lag.isBehind(cfeLag('Расш')), false);
+      assert.strictEqual(data.databaseConfigurationBehind, false);
     });
 
     // ── dump_cf ─────────────────────────────────────────────────────────
@@ -338,6 +446,7 @@ for (const location of ['remote', 'local'] as const) {
         services: {
           workspaceFolder: ui.folder,
           outputChannel: ui.channel,
+          databaseConfigLag: lag,
           repositoryService: { resolveTargetByConfigRoot: () => undefined },
         },
         xmlEditor: {}, properties: {}, mutations: {},
