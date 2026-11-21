@@ -465,6 +465,42 @@ suite('AgentInfoBaseSession: отказ транспорта не-Error знач
   });
 });
 
+suite('AgentInfoBaseSession: release после ошибки на уже потерянном транспорте', () => {
+  for (const closedAfterOp of [true, false]) {
+    test(`isClosed()=${String(closedAfterOp)} после сбоя: disconnect-ib ${closedAfterOp ? 'не отправляется, строка без «Не удалось»' : 'отправляется'}`, async () => {
+      const sent: string[] = [];
+      let closed = false;
+      let resets = 0;
+      const transport = {
+        execute: (command: string) => {
+          sent.push(command);
+          if (command === 'op') {
+            closed = closedAfterOp;
+            return Promise.reject(new Error('обрыв'));
+          }
+          return Promise.resolve({ messages: [] });
+        },
+        isClosed: () => closed,
+        dispose: () => Promise.resolve(),
+      };
+      const factory = {
+        create: () => Promise.resolve(transport),
+        reset: () => { resets += 1; return Promise.resolve(); },
+      };
+      const session = new AgentInfoBaseSession(factory, { idleDisconnectMs: 0, timers: new FakeTimers(), clock: () => 0 });
+      const messages: string[] = [];
+      await assert.rejects(session.run(sendCommand('op'), { onMessage: (m) => messages.push(m) }), /обрыв/);
+
+      assert.strictEqual(sent.includes(DISCONNECT), !closedAfterOp, sent.join('|'));
+      assert.strictEqual(messages.some((m) => m.startsWith('Соединение с агентом уже потеряно')), closedAfterOp, messages.join('|'));
+      assert.strictEqual(messages.includes('Отключение информационной базы от агента конфигуратора.'), !closedAfterOp);
+      assert.ok(!messages.some((m) => m.includes('Не удалось')), messages.join('|'));
+      assert.strictEqual(resets, 1, 'SSH-сессия сбрасывается в обоих случаях');
+      assert.strictEqual(session.isInfoBaseConnected(), false);
+    });
+  }
+});
+
 suite('AgentInfoBaseSession: Э4-доработка (ревью B1/B2)', () => {
   test('B2: отказ явного disconnect-ib → SSH сброшен, состояние «не подключено», ошибка проброшена; повторный release без команд', async () => {
     let failDisconnect = true;

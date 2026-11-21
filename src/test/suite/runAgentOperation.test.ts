@@ -133,10 +133,10 @@ suite('runAgentOperation: исход агентской операции и то
 
     assert.strictEqual(outcome.ok, false);
     const reason = outcome.reason;
-    assert.ok(reason.includes('Агент конфигуратора аварийно завершился') && reason.includes('«config dump-cfg»'), reason);
-    assert.ok(/перезапустите агента/i.test(reason), reason);
-    assert.ok(errors[0].includes('аварийно завершился'), errors[0]);
-    assert.ok(lines.some((line) => line.startsWith('[agent][error]') && line.includes('аварийно завершился')), lines.join('\n'));
+    assert.ok(reason.includes('Соединение с агентом конфигуратора потеряно') && reason.includes('«config dump-cfg»'), reason);
+    assert.ok(/перезапустите его/i.test(reason), reason);
+    assert.ok(errors[0].includes('Соединение с агентом конфигуратора потеряно'), errors[0]);
+    assert.ok(lines.some((line) => line.startsWith('[agent][error]') && line.includes('Соединение с агентом конфигуратора потеряно')), lines.join('\n'));
   });
 
   test('нет ответа за срок (no-response): текст E2 — не ответил, глагол команды, перезапуск агента', async () => {

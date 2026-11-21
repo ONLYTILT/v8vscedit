@@ -5,7 +5,8 @@
  *  - `AgentCommandError.messages` — ВСЕ сообщения команды (`log`-строки перед `error`): по ним пустой
  *    `UnknownError` получает человеческий текст (`describeAgentCommandFailure`);
  *  - обрыв канала (`close`/`error` посреди команды) — `AgentConnectionLostError('closed'|'error')`, текст
- *    начинается фразой «SSH-соединение с агентом закрыто» (без выдуманного кода) и говорит про аварийное завершение;
+ *    начинается фразой «SSH-соединение с агентом закрыто» (без выдуманного кода) и говорит про неизвестный результат,
+ *    а не про аварию агента: на стенде сервер сбрасывал соединения при живом агенте;
  *  - зависание (процесс жив, ответа и `close` нет — ФАКТ Э29) распознаётся ТОЛЬКО по сроку короткой команды:
  *    `deadlineMs` → `AgentConnectionLostError('no-response')`, транспорт сброшен, следующая операция — на новом
  *    транспорте с `connect-ib`. Срок в тестах — малый, ответ «не приходит» никогда: результат не зависит от гонки.
@@ -66,9 +67,44 @@ suite('describeAgentCommandFailure и agentCommandVerb (чистые)', () => {
     assert.strictEqual(describeAgentCommandFailure(error), 'Расширение с таким именем уже существует!');
   });
 
-  test('потеря связи с подробностью ssh2 → текст E1 сохраняет подробность (ECONNRESET)', () => {
+  test('потеря связи с подробностью ssh2 → текст E1 сохраняет подробность (ECONNRESET), об аварии агента не говорит', () => {
     const text = describeAgentCommandFailure(new AgentConnectionLostError('config dump-cfg', 'error', 'read ECONNRESET'));
-    assert.ok(text.includes('аварийно завершился') && text.includes('read ECONNRESET'), text);
+    assert.strictEqual(
+      text,
+      'Соединение с агентом конфигуратора потеряно во время команды «config dump-cfg» (read ECONNRESET). ' +
+      'Результат команды неизвестен: проверьте состояние базы. Если агент не отвечает — перезапустите его (1cv8 /AgentMode).'
+    );
+  });
+
+  const mutating: [string, boolean][] = [
+    ['config update-db-cfg', true],
+    ['config load-cfg', true],
+    ['config load-config-from-files', true],
+    ['config dump-cfg', false],
+    ['config dump-config-to-files', false],
+    ['common connect-ib', false],
+  ];
+  for (const [verb, changesDb] of mutating) {
+    for (const lossKind of ['closed', 'error'] as const) {
+      test(`обрыв (${lossKind}) на «${verb}»: ${changesDb ? 'явное требование проверить изменения в Конфигураторе' : 'без строки об изменениях'}`, () => {
+        const text = new AgentConnectionLostError(verb, lossKind, lossKind === 'error' ? 'read ECONNRESET' : undefined).operatorText;
+        assert.ok(text.startsWith(`Соединение с агентом конфигуратора потеряно во время команды «${verb}»`), text);
+        assert.strictEqual(text.includes('изменения могли примениться — проверьте их в Конфигураторе'), changesDb, text);
+        assert.strictEqual(text.includes('(read ECONNRESET)'), lossKind === 'error', text);
+        assert.ok(!text.includes('аварийно'), text);
+      });
+    }
+  }
+
+  test('обрыв с предметом операции: состояние предмета в базе; message = текст для человека', () => {
+    const error = new AgentConnectionLostError('config load-cfg', 'closed').withSubject('расширения «X»');
+    assert.ok(error.message.includes('проверьте состояние расширения «X» в базе.'), error.message);
+    assert.strictEqual(error.message, error.operatorText);
+  });
+
+  test('неответ за срок: текст E2 прежний', () => {
+    const text = new AgentConnectionLostError('config extensions properties get', 'no-response', undefined, { deadlineMs: 30_000 }).operatorText;
+    assert.ok(text.startsWith('Агент конфигуратора не ответил за 30 с на команду «config extensions properties get»'), text);
   });
 
   test('обычная ошибка (не AgentCommandError) → её message', () => {
@@ -161,7 +197,7 @@ suite('ProcessDesignerAgentTransport: сообщения команды, обр�
     });
   });
 
-  test('обрыв канала во время команды → AgentConnectionLostError(closed): прежняя фраза, «аварийно», глагол команды', async () => {
+  test('обрыв канала во время команды → AgentConnectionLostError(closed): прежняя фраза, результат неизвестен, глагол команды', async () => {
     server.setShellResponder(() => {
       server.dropClients();
       return neverAnswer();
@@ -174,7 +210,8 @@ suite('ProcessDesignerAgentTransport: сообщения команды, обр�
       assert.strictEqual(error.commandVerb, 'config dump-cfg');
       assert.ok(error.message.startsWith('SSH-соединение с агентом закрыто во время команды'), error.message);
       assert.ok(!error.message.includes('кодом'), `кода закрытия ssh2 не сообщает — числа в тексте нет: ${error.message}`);
-      assert.ok(error.message.includes('аварийно'), error.message);
+      assert.ok(error.message.includes('результат команды неизвестен'), error.message);
+      assert.ok(!error.message.includes('аварийно'), error.message);
       assert.ok(error.message.includes('«config dump-cfg»'), error.message);
       assert.ok(!error.message.includes('exchange/x'), `пути в тексте нет: ${error.message}`);
       return true;
@@ -289,7 +326,8 @@ suite('ProcessDesignerAgentTransport: error клиента посреди ком
       assert.ok(error instanceof AgentConnectionLostError);
       assert.strictEqual(error.lossKind, 'error');
       assert.strictEqual(error.commandVerb, 'config load-cfg');
-      assert.ok(error.message.includes('аварийно'), error.message);
+      assert.ok(error.message.includes('результат команды неизвестен'), error.message);
+      assert.ok(!error.message.includes('аварийно'), error.message);
       assert.ok(error.message.includes('ECONNRESET'), error.message);
       return true;
     });

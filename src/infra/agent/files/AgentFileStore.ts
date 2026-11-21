@@ -70,6 +70,12 @@ export interface AgentFileStore {
    */
   list(relDir: string, options?: { readonly recursive?: boolean }): Promise<AgentFileEntry[]>;
   mkdirp(rel: string): Promise<void>;
+  /**
+   * Пригодно ли хранилище для новой операции. Нет метода — пригодно всегда (локальный диск). SFTP-хранилище
+   * теряет соединение при сбросе со стороны сервера и не реанимируется: владелец по `false` закрывает его и
+   * открывает новое.
+   */
+  isUsable?(): boolean;
   dispose(): Promise<void>;
 }
 

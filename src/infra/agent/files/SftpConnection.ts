@@ -66,6 +66,11 @@ export class SftpConnection {
     sftp.on('error', onLost);
   }
 
+  /** Соединение пригодно для запросов: не закрыто и не потеряно (сервер мог сбросить его между операциями). */
+  isUsable(): boolean {
+    return this.stateError() === undefined;
+  }
+
   /** Отказ, если хранилище закрыто или соединение потеряно: операция не начинается вовсе. */
   assertUsable(): void {
     const error = this.stateError();

@@ -286,7 +286,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
       await assert.rejects(dumpCfFileViaAgent(stand.ctx(), dumpRequest('main.cf')), (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.ok(error.message.includes('аварийно завершился') && error.message.includes('«config dump-cfg»'), error.message);
+        assert.ok(error.message.includes('Соединение с агентом конфигуратора потеряно') && error.message.includes('«config dump-cfg»'), error.message);
         assert.ok(error.message.includes('основной конфигурации'), error.message);
         return true;
       });
@@ -574,7 +574,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
       await assert.rejects(loadCfFileViaAgent(stand.ctx(), loadRequest('X.cfe', cfeFile('X'), 'X')), (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.ok(error.message.includes('аварийно завершился') && error.message.includes('проверьте состояние расширения «X»'), error.message);
+        assert.ok(error.message.includes('Соединение с агентом конфигуратора потеряно') && error.message.includes('проверьте состояние расширения «X»'), error.message);
         return true;
       });
       await assert.rejects(loadCfFileViaAgent(stand.ctx(), loadRequest('main.cf', cfFile('м'))), (error: unknown) => {

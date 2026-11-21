@@ -82,11 +82,11 @@ suite('listConnectedDatabaseExtensions: agent-режим (удалённый а�
     assert.deepStrictEqual(h.errors, [], 'второго тоста нет: текст покажет диалог');
   });
 
-  test('обрыв агента → unavailable с причиной про аварийное завершение', async () => {
+  test('обрыв агента → unavailable с причиной про потерю соединения', async () => {
     h.emulator.extensions.crashOn((command) => command.command === 'config extensions', 'drop');
     const result = await listConnectedDatabaseExtensions(h.folder, h.channel);
     assert.strictEqual(result.kind, 'unavailable');
-    assert.ok(result.reason.includes('аварийно завершился'), JSON.stringify(result));
+    assert.ok(result.reason.includes('Соединение с агентом конфигуратора потеряно'), JSON.stringify(result));
   });
 });
 

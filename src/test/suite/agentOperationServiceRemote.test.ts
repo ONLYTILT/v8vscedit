@@ -20,15 +20,17 @@ import * as path from 'path';
 import type { ClientChannel } from 'ssh2';
 import type { AgentConnectPolicyOptions } from '../../domain/agent';
 import {
+  AgentConnectionLostError,
   AgentOperationService,
   DesignerAgentSessionManager,
   ProcessDesignerAgentTransport,
   ProcessDesignerAgentTransportFactory,
   type DesignerAgentConnectionOptions,
+  describeAgentCommandFailure,
   type DesignerAgentSshClient,
 } from '../../infra/agent';
 import { AgentConfigEmulator } from './support/agentConfigEmulator';
-import { AgentSshTestServer } from './support/agentSshTestServer';
+import { AgentSshTestServer, neverAnswer } from './support/agentSshTestServer';
 import { STANDARD_DB, dbAsText } from './support/agentSyncHarness';
 
 const POLICY: AgentConnectPolicyOptions = { startupTimeoutMs: 5_000, authWarmupMs: 90_000, retryDelayMs: 10 };
@@ -180,6 +182,48 @@ suite('Агент Э8: AgentOperationService поверх SFTP-хранилищ�
     srv.setBehavior({ mode: 'accept' });
     await svc.importFromDatabase(target());
     assert.deepStrictEqual(readTree(cfRoot), dbAsText(emulator.dbFiles()));
+  });
+
+  test('сервер сбросил оба соединения на update-db-cfg: операция падает текстом обрыва, следующая переподключает SFTP сама', async () => {
+    const srv = await startServer();
+    assert.ok(srv.sftp);
+    seedDb();
+    const svc = createService();
+    await svc.importFromDatabase(target());
+    assert.strictEqual(srv.sftp.sessionCount, 1);
+    fs.appendFileSync(path.join(cfRoot, 'Catalogs', 'Товары.xml'), '\n<!-- правка -->');
+
+    let dropped = false;
+    srv.setShellResponder(async (line) => {
+      if (line.startsWith('config update-db-cfg') && !dropped) {
+        dropped = true;
+        // Изменения применены (как на стенде), но ответ не дошёл: сервер закрыл и shell, и SFTP.
+        await emulator.execute(line);
+        srv.dropClients();
+        return neverAnswer();
+      }
+      await emulator.execute(line);
+      return [];
+    });
+
+    const journal: string[] = [];
+    await assert.rejects(svc.loadChangedAndUpdate(target(), { onMessage: (text) => journal.push(text) }), (error: unknown) => {
+      assert.ok(error instanceof AgentConnectionLostError, String(error));
+      const text = describeAgentCommandFailure(error);
+      assert.ok(text.includes('Соединение с агентом конфигуратора потеряно во время команды «config update-db-cfg»'), text);
+      assert.ok(text.includes('Результат команды неизвестен'), text);
+      assert.ok(text.includes('изменения могли примениться'), text);
+      assert.ok(!text.includes('аварийно'), text);
+      return true;
+    });
+    assert.ok(!journal.some((line) => line.includes('Не удалось отключить')), journal.join('\n'));
+    assert.ok(journal.some((line) => line.includes('Соединение с агентом уже потеряно')), journal.join('\n'));
+
+    await srv.whenClientCount(0);
+    fs.appendFileSync(path.join(cfRoot, 'Catalogs', 'Товары.xml'), '\n<!-- ещё правка -->');
+    await svc.loadChangedAndUpdate(target());
+    assert.strictEqual(srv.sftp.sessionCount, 2, 'потерянное SFTP-соединение заменено новым');
+    assert.ok(dbAsText(emulator.dbFiles())['Catalogs/Товары.xml'].includes('ещё правка'), 'вторая загрузка дошла до базы');
   });
 
   const thresholdTable: [number, 'delta' | 'archive'][] = [[1, 'archive'], [2, 'delta'], [300, 'delta']];

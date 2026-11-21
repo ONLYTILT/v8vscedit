@@ -236,7 +236,7 @@ for (const location of ['remote', 'local'] as const) {
       const result = await call('v8vscedit_load_all_cfe', { inputDir, confirm: true, createMissing: true });
 
       assert.ok(isError(result));
-      assert.ok(text(result).includes('аварийно завершился') || text(result).includes('остановлена'), text(result));
+      assert.ok(text(result).includes('Соединение с агентом конфигуратора потеряно') || text(result).includes('остановлена'), text(result));
     });
 
     test('load_all_cfe: verificationWarnings попадают в ответ', async () => {
@@ -324,7 +324,7 @@ for (const location of ['remote', 'local'] as const) {
       const result = await call('v8vscedit_load_all_cfe', { inputDir, confirm: true, createMissing: true });
 
       assert.ok(isError(result));
-      assert.ok(text(result).includes('аварийно завершился'), text(result));
+      assert.ok(text(result).includes('Соединение с агентом конфигуратора потеряно'), text(result));
       assert.ok(text(result).includes('Уже созданы в базе и применены') && text(result).includes('Альфа, Бета'), text(result));
     });
 
@@ -391,7 +391,7 @@ for (const location of ['remote', 'local'] as const) {
       const result = await call('v8vscedit_dump_all_cfe', { outputDir });
 
       assert.ok(isError(result));
-      assert.ok(text(result).includes('аварийно завершился'), text(result));
+      assert.ok(text(result).includes('Соединение с агентом конфигуратора потеряно'), text(result));
     });
 
     // ── замок ───────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ suite('CfeBatchReport: поля агентской ветки', () => {
         { extensionName: 'Старое', fileName: 'Старое.cfe', status: 'ok', appliedToDatabase: false },
       ],
       interrupted: true,
-      abortReason: 'Агент конфигуратора аварийно завершился во время команды «config load-cfg»',
+      abortReason: 'Соединение с агентом конфигуратора потеряно во время команды «config load-cfg»',
       verificationWarnings: ['Расширение загружено под именем из файла: «Z» (запрошено «X»).', 'вторая'],
     };
     assert.deepStrictEqual(parseCfeBatchReport(serializeCfeBatchReport(report)), report);

@@ -262,7 +262,8 @@ export class ProcessDesignerAgentTransport implements DesignerAgentTransport {
           hooks?.onMessage?.({ type: 'log', message: text.trim() });
         }
       };
-      // Обрыв канала посреди команды — признак падения процесса агента (Э28), а не «таймаут».
+      // Обрыв канала посреди команды — потеря соединения с неизвестным результатом команды, а не «таймаут»
+      // и не обязательно падение агента: на стенде сервер сбрасывал соединения у живого агента.
       const onError = (error: Error) => {
         cleanup();
         reject(new AgentConnectionLostError(verb, 'error', error.message));

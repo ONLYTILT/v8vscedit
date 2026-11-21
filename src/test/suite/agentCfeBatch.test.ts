@@ -108,8 +108,8 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
       assert.deepStrictEqual(statuses(report), ['Альфа:ok', 'Бета:failed', 'Гамма:notAttempted']);
       assert.strictEqual(report.interrupted, true);
-      assert.ok(report.abortReason?.includes('аварийно завершился'), report.abortReason);
-      assert.ok(report.items[1].message?.includes('аварийно завершился'), report.items[1].message);
+      assert.ok(report.abortReason?.includes('Соединение с агентом конфигуратора потеряно'), report.abortReason);
+      assert.ok(report.items[1].message?.includes('Соединение с агентом конфигуратора потеряно'), report.items[1].message);
       assert.deepStrictEqual(only(stand.exec.log, DUMP).filter((line) => line.includes('Гамма')), []);
       assert.strictEqual(only(stand.exec.log, DUMP).length, 2);
     });
@@ -286,7 +286,7 @@ for (const kind of ['local', 'sftp'] as HarnessKind[]) {
 
       assert.deepStrictEqual(statuses(report), ['Альфа:ok', 'Бета:failed', 'Гамма:notAttempted']);
       assert.strictEqual(report.failedAt?.extensionName, 'Бета');
-      assert.ok(report.abortReason?.includes('аварийно завершился'), report.abortReason);
+      assert.ok(report.abortReason?.includes('Соединение с агентом конфигуратора потеряно'), report.abortReason);
       assert.strictEqual(only(stand.exec.log, LOAD).length, 2);
       assert.strictEqual(only(stand.exec.log, /properties get/).length, 1, 'после обрыва список не запрашивается повторно');
     });

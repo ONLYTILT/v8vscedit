@@ -32,7 +32,7 @@ suite('buildBatchOutcomeMessage: причина прерывания (abortReaso
     const message = buildBatchOutcomeMessage(
       report({
         interrupted: true,
-        abortReason: 'Агент конфигуратора аварийно завершился во время команды «config dump-cfg»',
+        abortReason: 'Соединение с агентом конфигуратора потеряно во время команды «config dump-cfg»',
         items: [
           { extensionName: 'А', fileName: 'А.cfe', status: 'ok' },
           { extensionName: 'Б', fileName: 'Б.cfe', status: 'failed' },
@@ -44,7 +44,7 @@ suite('buildBatchOutcomeMessage: причина прерывания (abortReaso
     assert.ok(message);
     assert.ok(message.startsWith('Выгружены не все расширения.'), message);
     assert.ok(message.includes('Не удалось: Б.') && message.includes('Операция прервана.') && message.includes('Не обрабатывались: В.'), message);
-    assert.ok(message.includes('аварийно завершился во время команды «config dump-cfg»'), message);
+    assert.ok(message.includes('потеряно во время команды «config dump-cfg»'), message);
   });
 
   test('без abortReason текст прежний (регресс): нет лишних фраз', () => {

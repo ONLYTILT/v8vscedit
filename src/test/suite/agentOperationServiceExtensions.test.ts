@@ -195,7 +195,7 @@ for (const location of ['local', 'remote'] as ServiceLocation[]) {
         stand.service.dumpCfFile({ outputFile: path.join(stand.workDir, 'Расш.cfe'), extensionName: 'Расш', overwrite: false }),
         (error: unknown) => {
           assert.ok(error instanceof Error);
-          assert.ok(error.message.includes('аварийно завершился') && error.message.includes('«config dump-cfg»'), error.message);
+          assert.ok(error.message.includes('Соединение с агентом конфигуратора потеряно') && error.message.includes('«config dump-cfg»'), error.message);
           return true;
         }
       );

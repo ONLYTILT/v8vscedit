@@ -134,11 +134,11 @@ for (const location of ['remote', 'local'] as const) {
       assert.ok(!ui.commandLog().some((line) => line.startsWith('config update-db-cfg')));
     });
 
-    test('обрыв агента: failureReason — E1 (аварийно завершился), outcome без исключения', async () => {
+    test('обрыв агента: failureReason — E1 (соединение потеряно), outcome без исключения', async () => {
       ui.emulator.extensions.crashOn((command) => command.command === 'config dump-cfg', 'drop');
       const outcome = await runDumpConfigurationToCf({ ...common(), outputFile: file('main.cf'), silent: true });
       assert.strictEqual(outcome.success, false);
-      assert.ok(outcome.failureReason?.includes('аварийно завершился'), outcome.failureReason);
+      assert.ok(outcome.failureReason?.includes('Соединение с агентом конфигуратора потеряно'), outcome.failureReason);
     });
 
     test('валидация ПЕРВОЙ: файл существует без overwrite / входной файл отсутствует / неверный суффикс — отказ до агента', async () => {
@@ -196,7 +196,7 @@ for (const location of ['remote', 'local'] as const) {
       ui.emulator.extensions.crashOn((command) => command.command === 'config load-cfg', 'drop');
       const broken = await runLoadAllExtensionsFromCfe({ ...common(), inputDir: second, createMissing: true, silent: true });
       assert.strictEqual(broken.success, false);
-      assert.ok(broken.report?.abortReason?.includes('аварийно завершился'), broken.report?.abortReason);
+      assert.ok(broken.report?.abortReason?.includes('Соединение с агентом конфигуратора потеряно'), broken.report?.abortReason);
       assertNoSecrets(ui.everythingShown(), [REMOTE_DB_PASSWORD]);
     });
   });

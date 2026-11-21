@@ -235,6 +235,11 @@ export class SftpAgentFileStore implements AgentFileStore {
     }
   }
 
+  isUsable(): boolean {
+    return this.connection.isUsable();
+  }
+
+  /** Закрывает только SSH-соединение: файлы обмена на сервере не трогаются (их убирают сами операции). */
   dispose(): Promise<void> {
     this.connection.dispose();
     return Promise.resolve();

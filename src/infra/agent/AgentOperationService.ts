@@ -318,8 +318,18 @@ export class AgentOperationService implements DesignerAgentInfoBaseSession {
    * Хранилище создаётся лениво, внутри операции — уже ПОСЛЕ `connect-ib`: персональный корень
    * агент назначает при первом SSH-входе пользователя, до него индекса может не быть.
    * Неудачная попытка не кэшируется — следующая операция перечитает индекс.
+   *
+   * Потерянное хранилище (сервер сбросил SFTP-соединение, в том числе во время прошлой операции) заменяется
+   * вместе с движком в начале СЛЕДУЮЩЕЙ операции; внутри операции, где соединение упало, повтора нет — она
+   * завершается ошибкой. Закрытие старого только рвёт SSH-соединение и не бросает: файлы обмена на сервере
+   * остаются, их убирают сами операции.
    */
   private async getFiles(options: AgentOperationFilesOptions): Promise<AgentFiles> {
+    if (this.files?.store.isUsable?.() === false) {
+      const lost = this.files;
+      this.files = undefined;
+      await lost.store.dispose();
+    }
     if (!this.files) {
       const store = await this.openStore(options);
       const workspace = new AgentWorkspaceService(store, buildAgentProjectId(this.projectRoot));

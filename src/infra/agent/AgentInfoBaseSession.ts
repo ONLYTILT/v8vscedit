@@ -59,6 +59,8 @@ export const AGENT_CONNECT_IB_COMMAND = 'common connect-ib';
 export const AGENT_DISCONNECT_IB_COMMAND = 'common disconnect-ib';
 const INFO_BASE_LOCK_TEXT = 'ошибка блокировки информационной базы для конфигурирования';
 const DISCONNECT_MESSAGE = 'Отключение информационной базы от агента конфигуратора.';
+const LOST_TRANSPORT_RELEASE_MESSAGE =
+  'Соединение с агентом уже потеряно: отдельное отключение информационной базы не отправляется, SSH-сессия сбрасывается.';
 
 /**
  * Жизненный цикл подключения информационной базы к агенту конфигуратора.
@@ -256,12 +258,18 @@ export class AgentInfoBaseSession implements DesignerAgentInfoBaseSession {
     commandHooks: AgentCommandHooks,
     hooks: AgentOperationHooks | undefined
   ): Promise<void> {
-    hooks?.onMessage?.(DISCONNECT_MESSAGE);
-    try {
-      await transport.execute(AGENT_DISCONNECT_IB_COMMAND, commandHooks);
-    } catch (error) {
-      if (!isInfoBaseNotConnectedError(error)) {
-        hooks?.onMessage?.(`Не удалось отключить информационную базу после ошибки операции: ${describeError(error)}`);
+    // Канал уже потерян (обрыв или неответ): `disconnect-ib` не уйдёт, а «Не удалось отключить» после
+    // известного обрыва — шум. Подключение ИБ не переживает закрытие SSH-сессии — база отпущена и так.
+    if (transport.isClosed?.() === true) {
+      hooks?.onMessage?.(LOST_TRANSPORT_RELEASE_MESSAGE);
+    } else {
+      hooks?.onMessage?.(DISCONNECT_MESSAGE);
+      try {
+        await transport.execute(AGENT_DISCONNECT_IB_COMMAND, commandHooks);
+      } catch (error) {
+        if (!isInfoBaseNotConnectedError(error)) {
+          hooks?.onMessage?.(`Не удалось отключить информационную базу после ошибки операции: ${describeError(error)}`);
+        }
       }
     }
     await this.resetTransport(hooks);
