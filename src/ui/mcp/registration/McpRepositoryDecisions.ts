@@ -4,7 +4,8 @@
  * поэтому там, где UI спросил бы ('ask') или человек отказался ('cancel'), здесь — исключение с
  * текстом, по которому агент знает, какой параметр передать.
  */
-import type { RepositoryNodeRef } from '../../../infra/repository/RepositoryService';
+import * as path from 'path';
+import type { RepositoryNodeRef, RepositoryTarget } from '../../../infra/repository/RepositoryService';
 import {
   planRepositoryCommit,
   type CommitLocalChangesChoice,
@@ -169,6 +170,79 @@ export function assertRootRecursiveLockConfirmed(input: {
   if (isRoot && input.recursive && input.confirm !== true) {
     throw new Error(ROOT_RECURSIVE_LOCK_NOT_CONFIRMED);
   }
+}
+
+/**
+ * Лимит длины `paths`. Технического ограничения на этом масштабе нет (файл `-Objects` — КБ-порядок); это защита
+ * от ошибочной выборки: операция держит общий замок и захватывает объекты для всей команды, а 100 явных объектов —
+ * уже «подсистема», для которой есть `recursive: true`.
+ */
+export const MCP_REPOSITORY_PATHS_LIMIT = 100;
+
+/**
+ * `path` или `paths` → список путей (ДО резолвинга и замка). Взаимоисключение, а не «paths побеждает», как у
+ * `validate_metadata`: операции мутирующие, и двусмысленный вызов агента должен отбиваться, а не угадываться.
+ * Буквальный повтор — ошибка агента; разные пути к одному объекту схлопывает выборка по `fullName`.
+ */
+export function normalizeRepositoryPathsInput(input: { readonly path?: string; readonly paths?: readonly string[] }): string[] {
+  if (input.path !== undefined && input.paths !== undefined) {
+    throw new Error('Передайте либо path (один объект), либо paths (список объектов), но не оба.');
+  }
+  if (input.path !== undefined) {
+    return [input.path];
+  }
+  if (input.paths === undefined) {
+    throw new Error('Укажите path (канонический путь объекта) или paths (список канонических путей).');
+  }
+  if (input.paths.length === 0) {
+    throw new Error('Список paths пуст: передайте хотя бы один канонический путь.');
+  }
+  const paths = input.paths.map((item) => item.trim());
+  const emptyIndex = paths.findIndex((item) => item.length === 0);
+  if (emptyIndex >= 0) {
+    throw new Error(`Пустой элемент в paths (позиция ${String(emptyIndex + 1)}).`);
+  }
+  if (paths.length > MCP_REPOSITORY_PATHS_LIMIT) {
+    throw new Error(
+      `В paths ${String(paths.length)} путей; за один вызов допускается не более ${String(MCP_REPOSITORY_PATHS_LIMIT)}. ` +
+      'Для крупной выборки используйте рекурсивную операцию над подсистемой или корнем (recursive: true) либо разбейте список.'
+    );
+  }
+  const seen = new Set<string>();
+  const repeated = new Map<string, string>();
+  for (const item of paths) {
+    const key = item.toLocaleLowerCase('ru');
+    if (seen.has(key) && !repeated.has(key)) {
+      repeated.set(key, item);
+    }
+    seen.add(key);
+  }
+  if (repeated.size > 0) {
+    throw new Error(`Повторяющиеся пути в paths: ${[...repeated.values()].map((item) => `"${item}"`).join(', ')}.`);
+  }
+  return paths;
+}
+
+/**
+ * Один запуск Конфигуратора работает с одной целью (основной конфигурацией или одним расширением): разные цели
+ * отбиваются до замка, с одним примером пути на цель — по нему агент разобьёт вызов.
+ */
+export function assertSingleRepositoryTarget(items: readonly { readonly path: string; readonly target: RepositoryTarget }[]): RepositoryTarget {
+  const examples = new Map<string, { readonly path: string; readonly target: RepositoryTarget }>();
+  for (const item of items) {
+    const key = path.resolve(item.target.configRoot).toLowerCase();
+    if (!examples.has(key)) {
+      examples.set(key, item);
+    }
+  }
+  if (examples.size > 1) {
+    const listed = [...examples.values()].map((item) => `"${item.target.displayName}" (${item.path})`).join(', ');
+    throw new Error(
+      'Все пути paths должны относиться к одной цели хранилища (основной конфигурации или одному расширению), ' +
+      `а получено несколько: ${listed}. Выполните операцию отдельным вызовом для каждой цели.`
+    );
+  }
+  return items[0].target;
 }
 
 /**

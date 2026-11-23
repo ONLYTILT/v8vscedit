@@ -142,13 +142,13 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
     test('схемы входа: путь — path (не objectPath), force/version у update не открыты, force у unlock не открыт, confirm и comment у commit обязательны', () => {
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_status')?.inputSchema), { path: false, configuration: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_lock')?.inputSchema),
-        { path: false, configuration: true, recursive: true, localChanges: true, confirm: true, updateDatabase: true });
+        { path: true, paths: true, configuration: true, recursive: true, localChanges: true, confirm: true, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_update')?.inputSchema),
-        { path: false, configuration: true, recursive: true, localChanges: true, overwriteLocked: true, updateDatabase: true });
+        { path: true, paths: true, configuration: true, recursive: true, localChanges: true, overwriteLocked: true, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_commit')?.inputSchema),
-        { path: false, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false, updateDatabase: true });
+        { path: true, paths: true, configuration: true, recursive: true, comment: false, keepLocked: true, force: true, localChanges: true, confirm: false, updateDatabase: true });
       assert.deepStrictEqual(shape(tools.get('v8vscedit_repository_unlock')?.inputSchema),
-        { path: false, configuration: true, recursive: true });
+        { path: true, paths: true, configuration: true, recursive: true });
     });
 
     test('description помещения предупреждает: -force молча чистит ссылки на удалённые объекты и не обходит захват', () => {
@@ -449,7 +449,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
         assert.strictEqual(p.args()[0], 'DESIGNER');
         assert.ok(p.args().includes('C:\\repo'));
         assert.deepStrictEqual(result, {
-          path: 'Справочники.Товары', lockedObjects: [T], requestedObjects: [T], receivedFromRepository: true,
+          path: 'Справочники.Товары', lockedObjects: [T], requestedObjects: [T], notLocked: [], lockedByOthers: [], receivedFromRepository: true,
           databaseLoadedBefore: false, projectImported: true, projectBehind: false, warnings: [],
           databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
         });
@@ -592,7 +592,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
       const tail = operationTail(p.args());
       assert.deepStrictEqual([tail[0], tail[1], tail.length], ['/ConfigurationRepositoryUpdateCfg', '-Objects', 3]);
       assert.deepStrictEqual(result, {
-        path: 'Справочники.Товары', receivedFromRepository: true, changesLoadedAfter: false,
+        path: 'Справочники.Товары', requestedObjects: [T], receivedFromRepository: true, changesLoadedAfter: false,
         projectImported: true, projectBehind: false, lockedOverwritten: [], warnings: [],
         databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
       });
@@ -682,7 +682,7 @@ suite('MCP-инструменты хранилища (v8vscedit_repository_*)', 
         '-comment', 'Правка',
       ]);
       assert.deepStrictEqual(result, {
-        path: 'Справочники.Товары', committedObjects: [T], keptLocked: false, referencesCleaned: false,
+        path: 'Справочники.Товары', committedObjects: [T], requestedObjects: [T], notCommitted: [], keptLocked: false, referencesCleaned: false,
         databaseLoadedBefore: false, projectImported: false, warnings: [],
         databaseConfigurationUpdated: false, databaseConfigurationBehind: false,
       });

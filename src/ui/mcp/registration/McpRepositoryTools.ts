@@ -3,10 +3,13 @@
  *
  * Бизнес-логика — общие с UI-командами цепочки (`commands/repository/repositoryChains`) и
  * планировщики `planRepository*` (через `McpRepositoryDecisions`): вопрос диалога UI здесь — явный
- * параметр агента. Порядок каждого инструмента: проверка аргументов без побочных эффектов → узел и
- * подключённая цель → бросающий замок → ПОД ЗАМКОМ число незагруженных файлов и захваты выборки →
+ * параметр агента. Порядок каждого инструмента: проверка аргументов без побочных эффектов → узлы и
+ * одна подключённая цель → бросающий замок → ПОД ЗАМКОМ число незагруженных файлов и захваты выборки →
  * план → цепочка. Пароль хранилища агент не передаёт: он берётся из SecretStorage тем же
  * `resolveBindingForCommand`, что у UI.
+ *
+ * `path` или `paths` (план docs/plans/mcp-repository-paths-plan.md): список одной цели выполняется ОДНИМ
+ * запуском Конфигуратора с единым файлом `-Objects` — та же цепочка, что для одного узла.
  *
  * `gate.afterMutation` НЕ вызывается сознательно (отклонение от общего post-mutation пути, как у
  * `v8vscedit_load_cf`): операции меняют базу и учёт захватов, а файлы проекта меняет только импорт,
@@ -38,7 +41,7 @@ import {
   runUnlockChain,
   runUpdateChain,
 } from '../../commands/repository/repositoryChains';
-import { resolveConnectedTarget } from '../../commands/repository/repositoryNodeTargets';
+import { describeNotConnected } from '../../commands/repository/repositoryNodeTargets';
 import { lagScopeKey } from '../../../infra/database/DatabaseConfigLag';
 import { findChangedConfiguration, refreshRepositoryUi, toDatabaseLagTarget } from '../../commands/repository/repositoryPostSync';
 import {
@@ -47,6 +50,8 @@ import {
   MCP_UPDATE_LOCAL_CHANGES,
   assertCommitArgs,
   assertRootRecursiveLockConfirmed,
+  assertSingleRepositoryTarget,
+  normalizeRepositoryPathsInput,
   resolveMcpCommitPlan,
   resolveMcpLockPlan,
   resolveMcpUpdatePlan,
@@ -61,13 +66,34 @@ const INTERRUPTED_MESSAGE = 'Операция прервана пользова�
  * `updateDatabaseAfterLoad`, поэтому параметр необязателен (в отличие от `localChanges`).
  */
 const UPDATE_DATABASE_SCHEMA = z.boolean().optional();
+/** Взаимоисключение path/paths проверяет `normalizeRepositoryPathsInput`: схема допускает оба, чтобы отказ был понятным. */
+const PATH_SCHEMA = z.string().optional();
+const PATHS_SCHEMA = z.array(z.string()).optional();
 
 const UNLOCK_FAILURE_HINT =
   'Если объект изменён в базе, отменить захват без потери правок нельзя: поместите изменения (v8vscedit_repository_commit).';
 
+/** Общая часть описаний четырёх инструментов: как задаётся выборка. */
+const PATHS_DESCRIPTION =
+  'Принимает канонический путь (path) или список путей одной конфигурации/расширения (paths, до 100) — операция ' +
+  'выполняется одним запуском Конфигуратора; recursive применяется к каждому элементу; дочерний элемент обрабатывает владельца.';
+
 interface ResolvedRepositoryNode {
   readonly ref: RepositoryNodeRef;
   readonly target: RepositoryTarget;
+}
+
+/** Выборка вызова: узлы одной подключённой цели и эхо входа (`path` или нормализованный `paths`). */
+interface ResolvedRepositorySelection {
+  readonly refs: RepositoryNodeRef[];
+  readonly target: RepositoryTarget;
+  readonly echo: { readonly path: string } | { readonly paths: string[] };
+}
+
+interface RepositoryPathsInput {
+  readonly path?: string;
+  readonly paths?: string[];
+  readonly configuration?: string;
 }
 
 export function registerRepositoryTools(server: McpServer, deps: McpRegistrationDeps): void {
@@ -83,18 +109,30 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     return { ref, target };
   };
 
-  const resolveConnected = (path: string, configuration: string | undefined): ResolvedRepositoryNode => {
-    const ref = toRepositoryNodeRef(deps.paths.resolveNode(path, configuration));
-    const resolution = resolveConnectedTarget(services.repositoryService, ref);
-    switch (resolution.kind) {
-      case 'ok':
-        return { ref, target: resolution.target };
-      case 'not-connected':
-        throw new Error(`${resolution.message} (состояние — v8vscedit_repository_status)`);
-      case 'no-xml':
-      case 'no-target':
-        throw new Error(`Не удалось определить конфигурацию для узла "${path}".`);
+  /**
+   * Всё, что проверяется без побочных эффектов и до замка: вход, узлы, одна цель, подключение (один раз) и
+   * полное имя каждого узла — чтобы плохой элемент списка отбился раньше запуска, а не посреди цепочки.
+   */
+  const resolveConnectedSelection = (input: RepositoryPathsInput): ResolvedRepositorySelection => {
+    const paths = normalizeRepositoryPathsInput(input);
+    const items = paths.map((path) => resolveNodeTarget(path, input.configuration));
+    const target = assertSingleRepositoryTarget(items.map((item, index) => ({ path: paths[index], target: item.target })));
+    const repository = services.repositoryService;
+    if (!repository.hasBinding(target) || !repository.isConnected(target)) {
+      throw new Error(`${describeNotConnected(target)} (состояние — v8vscedit_repository_status)`);
     }
+    items.forEach((item, index) => {
+      try {
+        repository.resolveSelectionEntry(item.ref);
+      } catch (error) {
+        throw new Error(`Путь "${paths[index]}": ${(error as Error).message}`, { cause: error });
+      }
+    });
+    return {
+      refs: items.map((item) => item.ref),
+      target,
+      echo: input.path !== undefined ? { path: input.path } : { paths },
+    };
   };
 
   const dirtyFilesCount = async (target: RepositoryTarget): Promise<number> =>
@@ -133,9 +171,10 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     'v8vscedit_repository_lock',
     {
       title: 'Захватить объекты в хранилище',
-      description: 'Захватывает объект в хранилище конфигурации для редактирования через пакетный Конфигуратор; после захвата, если из хранилища получены новые версии, импортирует их в файлы проекта. Рекурсивный захват корня требует confirm: true. При незагруженных правках проекта обязателен localChanges: loadFirst (загрузить правки в базу перед захватом), keepProjectBehind (захватить, проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня; дочерний элемент захватывает владельца.',
+      description: `Захватывает объекты в хранилище конфигурации для редактирования через пакетный Конфигуратор; после захвата, если из хранилища получены новые версии, импортирует их в файлы проекта. Рекурсивный захват корня (корень где угодно в списке) требует confirm: true. При незагруженных правках проекта обязателен localChanges: loadFirst (загрузить правки в базу перед захватом), keepProjectBehind (захватить, проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Частичный захват (часть объектов занята другим пользователем или отсутствует) — успех с предупреждением: в ответе notLocked (не захваченные) и lockedByOthers (кем заняты). ${PATHS_DESCRIPTION}`,
       inputSchema: z.object({
-        path: z.string(),
+        path: PATH_SCHEMA,
+        paths: PATHS_SCHEMA,
         configuration: z.string().optional(),
         recursive: z.boolean().optional(),
         localChanges: z.enum(MCP_LOCK_LOCAL_CHANGES).optional(),
@@ -144,21 +183,23 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       }),
       annotations: { destructiveHint: false },
     },
-    ({ path, configuration, recursive, localChanges, confirm, updateDatabase }, extra) => gate.wrapLongRunning('v8vscedit_repository_lock', extra, () => withRepositoryErrors(async () => {
-      const { ref, target } = resolveConnected(path, configuration);
-      const isRecursive = recursive ?? false;
-      assertRootRecursiveLockConfirmed({ nodeKind: ref.nodeKind, recursive: isRecursive, confirm });
+    (args, extra) => gate.wrapLongRunning('v8vscedit_repository_lock', extra, () => withRepositoryErrors(async () => {
+      const { refs, target, echo } = resolveConnectedSelection(args);
+      const isRecursive = args.recursive ?? false;
+      for (const ref of refs) {
+        assertRootRecursiveLockConfirmed({ nodeKind: ref.nodeKind, recursive: isRecursive, confirm: args.confirm });
+      }
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
         const plan = resolveMcpLockPlan({
           revisedSetting: readRevisedOnLockSetting(),
           dirtyFilesCount: await dirtyFilesCount(target),
-          localChanges,
-          updateDatabase,
+          localChanges: args.localChanges,
+          updateDatabase: args.updateDatabase,
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
-        return runChain(() => runLockChain(services, target, ref, isRecursive, plan, 'unattended'));
+        return runChain(() => runLockChain(services, target, refs, isRecursive, plan, 'unattended'));
       });
-      return { path, ...result };
+      return { ...echo, ...result };
     }))
   );
 
@@ -166,9 +207,10 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     'v8vscedit_repository_update',
     {
       title: 'Получить объекты из хранилища',
-      description: 'Получает объект из хранилища конфигурации в базу и импортирует изменившиеся объекты в файлы проекта. Получение возвращает захваченные вами объекты к версии хранилища: правки, загруженные в базу и не помещённые, будут потеряны — для таких объектов нужен overwriteLocked: true. При незагруженных правках проекта обязателен localChanges: loadAfter (загрузить правки после получения), keepProjectBehind (проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня.',
+      description: `Получает объекты из хранилища конфигурации в базу и импортирует изменившиеся объекты в файлы проекта. Получение возвращает захваченные вами объекты к версии хранилища: правки, загруженные в базу и не помещённые, будут потеряны — если в выборке есть захваченные вами объекты, нужен overwriteLocked: true. В ответе lockedOverwritten — захваченные вами объекты, которые получение реально перезаписало (по журналу платформы; пусто, если ничего не получено). При незагруженных правках проекта обязателен localChanges: loadAfter (загрузить правки после получения), keepProjectBehind (проект не обновлять) или abort. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). ${PATHS_DESCRIPTION}`,
       inputSchema: z.object({
-        path: z.string(),
+        path: PATH_SCHEMA,
+        paths: PATHS_SCHEMA,
         configuration: z.string().optional(),
         recursive: z.boolean().optional(),
         localChanges: z.enum(MCP_UPDATE_LOCAL_CHANGES).optional(),
@@ -178,25 +220,23 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       annotations: { destructiveHint: true },
     },
     // `-force` и версия не открыты: по Э24 различий у `-force` нет, а откат к версии — решение человека.
-    ({ path, configuration, recursive, localChanges, overwriteLocked, updateDatabase }, extra) => gate.wrapLongRunning('v8vscedit_repository_update', extra, () => withRepositoryErrors(async () => {
-      const { ref, target } = resolveConnected(path, configuration);
-      const isRecursive = recursive ?? false;
+    (args, extra) => gate.wrapLongRunning('v8vscedit_repository_update', extra, () => withRepositoryErrors(async () => {
+      const { refs, target, echo } = resolveConnectedSelection(args);
+      const isRecursive = args.recursive ?? false;
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
-        const lockedInSelection = services.repositoryService.findLockedInSelection(ref, isRecursive);
         const plan = resolveMcpUpdatePlan({
           dirtyFilesCount: await dirtyFilesCount(target),
-          lockedInSelection,
-          overwriteLocked,
-          localChanges,
-          updateDatabase,
+          lockedInSelection: services.repositoryService.findLockedInSelectionForNodes(refs, isRecursive),
+          overwriteLocked: args.overwriteLocked,
+          localChanges: args.localChanges,
+          updateDatabase: args.updateDatabase,
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
-        const chain = await runChain(
-          () => runUpdateChain(services, target, ref, { recursive: isRecursive, force: false }, plan, 'unattended')
+        return runChain(
+          () => runUpdateChain(services, target, refs, { recursive: isRecursive, force: false }, plan, 'unattended')
         );
-        return { ...chain, lockedOverwritten: lockedInSelection };
       });
-      return { path, ...result };
+      return { ...echo, ...result };
     }))
   );
 
@@ -204,9 +244,10 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     'v8vscedit_repository_commit',
     {
       title: 'Поместить объекты в хранилище',
-      description: 'Помещает изменения объекта в хранилище конфигурации через пакетный Конфигуратор. Операция необратима и требует confirm: true и непустого comment. Помещение без предварительной загрузки правок проекта запрещено: при незагруженных правках передайте localChanges: loadFirst. keepLocked оставляет объект захваченным. force: платформа сама удалит из объекта ссылки на удалённые объекты (молчаливая правка объекта в базе и в хранилище), захват не обходит; после такой очистки проект импортируется заново. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). Принимает канонический путь объекта или корня.',
+      description: `Помещает изменения объектов в хранилище конфигурации через пакетный Конфигуратор. Операция необратима и требует confirm: true и непустого comment. Помещение без предварительной загрузки правок проекта запрещено: при незагруженных правках передайте localChanges: loadFirst. keepLocked оставляет объекты захваченными. force: платформа сама удалит из объекта ссылки на удалённые объекты (молчаливая правка объекта в базе и в хранилище), захват не обходит; после такой очистки проект импортируется заново. Не захваченные вами объекты платформа пропускает молча — они в ответе в notCommitted с предупреждением. updateDatabase — обновлять ли конфигурацию БД на шаге загрузки правок (по умолчанию — настройка updateDatabaseAfterLoad); в ответе databaseConfigurationUpdated и databaseConfigurationBehind (конфигурация БД отстаёт от основной, например после получения версий). ${PATHS_DESCRIPTION}`,
       inputSchema: z.object({
-        path: z.string(),
+        path: PATH_SCHEMA,
+        paths: PATHS_SCHEMA,
         configuration: z.string().optional(),
         recursive: z.boolean().optional(),
         comment: z.string(),
@@ -219,8 +260,9 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
       annotations: { destructiveHint: true },
     },
     (args, extra) => gate.wrapLongRunning('v8vscedit_repository_commit', extra, () => withRepositoryErrors(async () => {
+      // Необратимость — первой: без согласия ни выборка, ни комментарий не важны.
       assertCommitArgs(args);
-      const { ref, target } = resolveConnected(args.path, args.configuration);
+      const { refs, target, echo } = resolveConnectedSelection(args);
       const request = {
         recursive: args.recursive ?? false,
         comment: args.comment,
@@ -234,9 +276,9 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
           updateDatabase: args.updateDatabase,
           updateDatabaseAfterLoad: readUpdateDatabaseAfterLoad(),
         });
-        return runChain(() => runCommitChain(services, target, ref, request, plan, 'unattended'));
+        return runChain(() => runCommitChain(services, target, refs, request, plan, 'unattended'));
       });
-      return { path: args.path, ...result };
+      return { ...echo, ...result };
     }))
   );
 
@@ -244,26 +286,27 @@ export function registerRepositoryTools(server: McpServer, deps: McpRegistration
     'v8vscedit_repository_unlock',
     {
       title: 'Отменить захват объектов в хранилище',
-      description: 'Отменяет захват объекта в хранилище конфигурации. Успех определяется по журналу платформы: объект, захваченный другим пользователем, не освобождается. Принимает канонический путь объекта или корня; рекурсивно — со всеми подчинёнными объектами. Незагруженные правки проекта по освобождённым объектам после этого загрузить в базу будет нельзя.',
+      description: `Отменяет захват объектов в хранилище конфигурации. Успех определяется по журналу платформы: объект, захваченный другим пользователем, не освобождается. Список освобождается целиком или никак: изменённый в базе объект блокирует освобождение всех — тогда в ошибке названы изменённые объекты. Рекурсивно — со всеми подчинёнными объектами. Незагруженные правки проекта по освобождённым объектам после этого загрузить в базу будет нельзя. ${PATHS_DESCRIPTION}`,
       inputSchema: z.object({
-        path: z.string(),
+        path: PATH_SCHEMA,
+        paths: PATHS_SCHEMA,
         configuration: z.string().optional(),
         recursive: z.boolean().optional(),
       }),
       annotations: { destructiveHint: false },
     },
     // `force` не открыт: по Э24 он отменяет захват ценой правок объекта в базе.
-    ({ path, configuration, recursive }, extra) => gate.wrapLongRunning('v8vscedit_repository_unlock', extra, () => withRepositoryErrors(async () => {
-      const { ref, target } = resolveConnected(path, configuration);
-      const request = { recursive: recursive ?? false, force: false };
+    (args, extra) => gate.wrapLongRunning('v8vscedit_repository_unlock', extra, () => withRepositoryErrors(async () => {
+      const { refs, target, echo } = resolveConnectedSelection(args);
+      const request = { recursive: args.recursive ?? false, force: false };
       const result = await runWithConfigurationOperationLockOrThrow(async () => {
         const dirty = await dirtyFilesCount(target);
-        return runChain(() => runUnlockChain(services, target, ref, request, dirty, 'unattended'));
+        return runChain(() => runUnlockChain(services, target, refs, request, dirty, 'unattended'));
       });
       if (result.unlockedObjects.length === 0 && result.notUnlocked.length > 0) {
         throw new Error(describeUnlockNotDone(result.notUnlocked, result.lockedByOthers));
       }
-      return { path, ...result };
+      return { ...echo, ...result };
     }, UNLOCK_FAILURE_HINT))
   );
 }

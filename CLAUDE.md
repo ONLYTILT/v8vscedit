@@ -186,7 +186,8 @@ src/
 │   │                                  # HashScanner (scanHashSnapshot — быстрый async-проход;
 │   │                                  # hashTrackedFiles — точечное перехеширование известных путей;
 │   │                                  # docs/architecture.md, «Хеш-кэш: базовая линия и stat-мемо»)
-│   ├── repository/                   # хранилище 1С, локальные захваты; RepositoryLockLog — разбор лога захвата
+│   ├── repository/                   # хранилище 1С, локальные захваты; RepositoryLockLog — разбор лога захвата,
+│   │                                  # RepositoryObjectsSelection — единый файл выбора -Objects для узла/списка узлов
 │   ├── git/                          # статус Git для узлов метаданных (GitMetadataStatusService,
 │   │                                  # декорации) + представление «Изменения метаданных»
 │   │                                  # (GitPorcelainReader, MetadataChangeResolver,
@@ -554,6 +555,10 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   импорт, сам помечая чисто); после успеха `refreshRepositoryUi` → регистрация в
   `ui/mcp/registration/McpRepositoryTools.ts` + запись в `EXTENSION_MCP_TOOLS`
   (`infra/ai/AiMcpToolCatalog.ts`).
+  Список объектов (`paths`): выборка — только через `buildObjectsSelectionForNodes`
+  (`infra/repository/RepositoryObjectsSelection.ts`, один файл `-Objects`, одна цель, `RepositoryNodeSelection` в
+  цепочках); итог — по строкам лога и при exit≠0 (захват списка неатомарен, освобождение без `force` атомарно,
+  помещение молча пропускает чужое — Э33, plan §5b п.37).
 - **Новый писатель или читатель файла выгрузки размером с ГБ** (скачивание, сравнение, запись в P, хеш): только
   потоком — `downloadToFile`, `ProjectFileContent.writeTo`, `filesHaveSameContent`, потоковый хеш `HashScanner`;
   `readFile` целиком допустим лишь для файлов ниже `DEFAULT_LARGE_FILE_THRESHOLD_BYTES` (16 МиБ). Файлы

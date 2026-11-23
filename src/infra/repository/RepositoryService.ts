@@ -3,7 +3,16 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { MetaKind } from '../../domain/MetaTypes';
 import type { ProjectSecretStorage } from '../environment/ProjectSecretStorage';
-import { escapeXmlAttribute as escapeXml, parseConfigXml, parseObjectXml } from '../xml';
+import { parseConfigXml, parseObjectXml } from '../xml';
+import {
+  buildObjectsSelectionXml,
+  mergeSelectionEntries,
+  selectLockedInSelection,
+  selectionFullNames,
+  isChildLikeKind,
+  oneCTypeName,
+  type RepositorySelectionEntry,
+} from './RepositoryObjectsSelection';
 
 export interface RepositoryBinding {
   repoPath: string;
@@ -60,89 +69,12 @@ interface CachedTarget {
 }
 
 const REPOSITORY_STATE_VERSION = 2;
-const REPOSITORY_NAMESPACE = 'http://v8.1c.ru/8.3/config/objects';
 const CONFIGURATION_ROOT_LOCK_NAME = '__configuration_root__';
 const EXTENSION_ROOT_LOCK_NAME = '__extension_root__';
 
 /**
- * Внутренние имена типов объектов 1С, используемые для формирования полного имени
- * при захвате/освобождении в хранилище. Это НЕ человекочитаемые метки (label из META_TYPES),
- * а технические идентификаторы платформы 1С (например, «БизнесПроцесс» без дефиса).
- */
-const ONE_C_TYPE_NAMES: Partial<Record<MetaKind, string>> = {
-  Subsystem: 'Подсистема',
-  CommonModule: 'ОбщийМодуль',
-  SessionParameter: 'ПараметрСеанса',
-  CommonAttribute: 'ОбщийРеквизит',
-  Role: 'Роль',
-  CommonForm: 'ОбщаяФорма',
-  CommonCommand: 'ОбщаяКоманда',
-  CommandGroup: 'ГруппаКоманд',
-  CommonPicture: 'ОбщаяКартинка',
-  CommonTemplate: 'ОбщийМакет',
-  XDTOPackage: 'XDTOPackage',
-  StyleItem: 'ЭлементСтиля',
-  DefinedType: 'ОпределяемыйТип',
-  FunctionalOption: 'ФункциональнаяОпция',
-  FunctionalOptionsParameter: 'ПараметрФункциональнойОпции',
-  SettingsStorage: 'ХранилищеНастроек',
-  Style: 'Стиль',
-  WSReference: 'WSСсылка',
-  WebSocketClient: 'WebSocketКлиент',
-  IntegrationService: 'СервисИнтеграции',
-  Bot: 'Бот',
-  Interface: 'Интерфейс',
-  PaletteColor: 'ЦветПалитры',
-  Language: 'Язык',
-  HTTPService: 'HTTPСервис',
-  WebService: 'WebСервис',
-  Constant: 'Константа',
-  Catalog: 'Справочник',
-  Document: 'Документ',
-  DocumentNumerator: 'НумераторДокументов',
-  Enum: 'Перечисление',
-  InformationRegister: 'РегистрСведений',
-  AccumulationRegister: 'РегистрНакопления',
-  AccountingRegister: 'РегистрБухгалтерии',
-  CalculationRegister: 'РегистрРасчета',
-  Report: 'Отчет',
-  DataProcessor: 'Обработка',
-  BusinessProcess: 'БизнесПроцесс',
-  Task: 'Задача',
-  ExchangePlan: 'ПланОбмена',
-  ChartOfCharacteristicTypes: 'ПланВидовХарактеристик',
-  ChartOfAccounts: 'ПланСчетов',
-  ChartOfCalculationTypes: 'ПланВидовРасчета',
-  DocumentJournal: 'ЖурналДокументов',
-  ScheduledJob: 'РегламентноеЗадание',
-  EventSubscription: 'ПодпискаНаСобытие',
-  FilterCriterion: 'КритерийОтбора',
-  Sequence: 'Последовательность',
-  ExternalDataSource: 'ВнешнийИсточникДанных',
-};
-
-/**
- * Виды дочерних узлов (ChildTag + Column), для которых захват идёт
- * через владельца, а не напрямую. Используется только для проверки
- * принадлежности — логика блокировки/разблокировки всегда работает
- * с полным именем корневого объекта-владельца.
- */
-const CHILD_LIKE_KINDS: ReadonlySet<string> = new Set([
-  'Attribute',
-  'AddressingAttribute',
-  'TabularSection',
-  'Form',
-  'Command',
-  'Template',
-  'Dimension',
-  'Resource',
-  'EnumValue',
-  'Column',
-]);
-
-/**
  * Инфраструктурный сервис хранилища: хранит настройки в `env.json`,
- * локальный кэш захваченных объектов и генерирует `Objects.xml`.
+ * локальный кэш захваченных объектов и выборку `Objects.xml` (формат — `RepositoryObjectsSelection`).
  */
 export class RepositoryService {
   private readonly targetCache = new Map<string, CachedTarget>();
@@ -478,25 +410,22 @@ export class RepositoryService {
    * узла. Э24: `/ConfigurationRepositoryUpdateCfg` возвращает захваченный объект к версии
    * хранилища (с `-force` и без), и правки, загруженные в базу, но не помещённые, теряются —
    * по этому списку команда спрашивает подтверждение.
-   *
-   * Состав подсистемы здесь не разрешается, поэтому её рекурсивная выборка считается
-   * покрывающей все захваты цели: лишний вопрос дешевле молча потерянной правки.
    */
   findLockedInSelection(node: RepositoryNodeRef, recursive: boolean): string[] {
-    const target = node.xmlPath ? this.resolveTargetByXmlPath(node.xmlPath) : null;
-    if (!target) {
+    return this.findLockedInSelectionForNodes([node], recursive);
+  }
+
+  /** То же для списка узлов; правило покрытия — `selectLockedInSelection`. */
+  findLockedInSelectionForNodes(nodes: readonly RepositoryNodeRef[], recursive: boolean): string[] {
+    let selection: { entries: RepositorySelectionEntry[]; target: RepositoryTarget };
+    try {
+      selection = this.resolveSelection(nodes);
+    } catch {
+      // Выборку для такого узла всё равно не построить — операция откажет раньше, чем спросит о перезаписи.
       return [];
     }
-    const locked = this.listLockedFullNames(target);
-    if (node.nodeKind === 'configuration' || node.nodeKind === 'extension') {
-      const rootLockName = this.getRootLockName(target);
-      return recursive ? locked : locked.filter((name) => name === rootLockName);
-    }
-    if (node.nodeKind === 'Subsystem' && recursive) {
-      return locked;
-    }
-    const fullName = this.resolveFullName(node);
-    return fullName && locked.includes(fullName) ? [fullName] : [];
+    const { entries, target } = selection;
+    return selectLockedInSelection(this.listLockedFullNames(target), entries, recursive, this.getRootLockName(target));
   }
 
   clearLocks(target: RepositoryTarget): void {
@@ -522,7 +451,7 @@ export class RepositoryService {
       return null;
     }
 
-    if (CHILD_LIKE_KINDS.has(kind)) {
+    if (isChildLikeKind(kind)) {
       const ownerXmlPath = node.metaContext?.ownerObjectXmlPath;
       if (!ownerXmlPath) {
         return null;
@@ -534,12 +463,52 @@ export class RepositoryService {
     return this.buildRootObjectFullName(kind, node.xmlPath, node.label);
   }
 
+  /** Запись выборки для узла; дочерний узел сводится к владельцу (`resolveFullName`). */
+  resolveSelectionEntry(node: RepositoryNodeRef): RepositorySelectionEntry {
+    return this.resolveNodeSelection(node).entry;
+  }
+
   /**
    * XML выбора объектов для `-Objects` строится в памяти: исполнитель сам кладёт его
    * во временный каталог запуска и удаляет после — прежняя запись в
    * `.v8vscedit/repository/objects` копилась без удаления.
    */
   buildObjectsSelectionForNode(node: RepositoryNodeRef, recursive: boolean): { xml: string; fullNames: string[] } {
+    const { xml, fullNames } = this.buildObjectsSelectionForNodes([node], recursive);
+    return { xml, fullNames };
+  }
+
+  /** Один файл выбора на весь список узлов одной цели — список выполняется одним запуском Конфигуратора. */
+  buildObjectsSelectionForNodes(
+    nodes: readonly RepositoryNodeRef[],
+    recursive: boolean
+  ): { xml: string; fullNames: string[]; target: RepositoryTarget } {
+    const { entries, target } = this.resolveSelection(nodes);
+    return {
+      xml: buildObjectsSelectionXml(entries, recursive),
+      fullNames: selectionFullNames(entries, this.getRootLockName(target)),
+      target,
+    };
+  }
+
+  private resolveSelection(nodes: readonly RepositoryNodeRef[]): { entries: RepositorySelectionEntry[]; target: RepositoryTarget } {
+    if (nodes.length === 0) {
+      throw new Error('Выборка объектов хранилища пуста.');
+    }
+    const resolved = nodes.map((node) => this.resolveNodeSelection(node));
+    const target = resolved[0].target;
+    const targetKey = normalizePathKey(target.configRoot);
+    const foreign = resolved.find((item) => normalizePathKey(item.target.configRoot) !== targetKey);
+    // Защита в глубину: MCP проверяет одну цель раньше, но один запуск может работать только с одной ИБ-целью.
+    if (foreign) {
+      throw new Error(
+        `Узлы выборки относятся к разным конфигурациям хранилища: "${target.displayName}", "${foreign.target.displayName}".`
+      );
+    }
+    return { entries: mergeSelectionEntries(resolved.map((item) => item.entry)), target };
+  }
+
+  private resolveNodeSelection(node: RepositoryNodeRef): { entry: RepositorySelectionEntry; target: RepositoryTarget } {
     const target = node.xmlPath ? this.resolveTargetByXmlPath(node.xmlPath) : null;
     if (!target) {
       throw new Error('Не удалось определить корень конфигурации для выбранного узла.');
@@ -551,43 +520,18 @@ export class RepositoryService {
     }
 
     if (kind === 'configuration' || kind === 'extension') {
-      const xml = [
-        `<Objects xmlns="${REPOSITORY_NAMESPACE}" version="1.0">`,
-        `  <Configuration includeChildObjects="${recursive ? 'true' : 'false'}"/>`,
-        `</Objects>`,
-        '',
-      ].join('\n');
-      return {
-        xml,
-        fullNames: [this.getRootLockName(target)],
-      };
+      return { entry: { kind: 'root' }, target };
     }
 
     const fullName = this.resolveFullName(node);
     if (!fullName) {
       throw new Error('Для выбранного узла не удалось сформировать полное имя объекта.');
     }
-
-    const lines = [
-      `<Objects xmlns="${REPOSITORY_NAMESPACE}" version="1.0">`,
-      `  <Object fullName="${escapeXml(fullName)}" includeChildObjects="${recursive ? 'true' : 'false'}">`,
-    ];
-    if (kind === 'Subsystem') {
-      lines.push(
-        `    <Subsystem includeObjectsFromSubordinateSubsystems="${recursive ? 'true' : 'false'}"/>`
-      );
-    }
-    // Завершающий перевод строки — как в прежнем файле: формат принимает платформа.
-    lines.push('  </Object>', '</Objects>', '');
-
-    return {
-      xml: lines.join('\n'),
-      fullNames: [fullName],
-    };
+    return { entry: { kind: 'object', fullName, subsystem: kind === 'Subsystem' }, target };
   }
 
   private buildRootObjectFullName(kind: MetaKind, xmlPath: string | undefined, fallbackLabel: string | undefined): string | null {
-    const rootKindName = ONE_C_TYPE_NAMES[kind];
+    const rootKindName = oneCTypeName(kind);
     if (!rootKindName) {
       return null;
     }
@@ -872,7 +816,8 @@ export class RepositoryService {
     return crypto.createHash('sha1').update(raw).digest('hex');
   }
 
-  private getRootLockName(target: RepositoryTarget): string {
+  /** Служебное имя корня в учёте: в логе платформы его нет, поэтому вызывающим нужно его отличать от объектов. */
+  getRootLockName(target: RepositoryTarget): string {
     return target.configKind === 'cfe' ? EXTENSION_ROOT_LOCK_NAME : CONFIGURATION_ROOT_LOCK_NAME;
   }
 

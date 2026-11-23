@@ -1,11 +1,15 @@
 import type { OperationInteraction } from '../ext/configurationOperationTypes';
-import { formatRepositoryLockName, type RepositoryNodeRef, type RepositoryTarget } from '../../../infra/repository/RepositoryService';
-import type { LockedByOther } from '../../../infra/repository/RepositoryLockLog';
+import { formatRepositoryLockName, type RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import { toSelectionNodes, type RepositoryNodeSelection } from '../../../infra/repository/RepositoryObjectsSelection';
+import { parseRepositoryLockLog, type LockedByOther } from '../../../infra/repository/RepositoryLockLog';
 import {
+  RepositoryCliError,
   executeRepositoryCommitAction,
   executeRepositoryLockAction,
   executeRepositoryUnlockAction,
   executeRepositoryUpdateAction,
+  selectionLabel,
+  type RepositoryUnlockOutcome,
 } from './RepositoryCommandRunner';
 import {
   describeImportFailureAfterCommit,
@@ -108,6 +112,9 @@ function markReceivedFromRepository(services: RepositoryChainServices, target: R
 export interface LockChainResult extends DatabaseLagFields {
   readonly lockedObjects: string[];
   readonly requestedObjects: string[];
+  /** Запрошенные объекты вне `lockedObjects`; служебное имя корня сюда не попадает (в логе его нет). */
+  readonly notLocked: string[];
+  readonly lockedByOthers: LockedByOther[];
   readonly receivedFromRepository: boolean;
   readonly databaseLoadedBefore: boolean;
   readonly projectImported: boolean;
@@ -123,23 +130,31 @@ export interface LockChainResult extends DatabaseLagFields {
 export async function runLockChain(
   services: RepositoryChainServices,
   target: RepositoryTarget,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   plan: RepositoryLockPlan,
   interaction: OperationInteraction
 ): Promise<LockChainResult> {
-  const requestedObjects = services.repositoryService.buildObjectsSelectionForNode(node, recursive).fullNames;
+  const requestedObjects = services.repositoryService.buildObjectsSelectionForNodes(toSelectionNodes(selection), recursive).fullNames;
   const load = chainStep(interaction);
   // Сбой загрузки (в т.ч. отказ платформы загрузить незахваченный объект) — захвата не было.
   if (plan.updateDatabaseFirst
     && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
     throw new RepositoryStepFailedError(load.describe(LOAD_BEFORE_LOCK_FAILED));
   }
-  const outcome = await executeRepositoryLockAction(toCliServices(services, interaction), node, recursive, { revised: plan.revised });
+  const outcome = await executeRepositoryLockAction(toCliServices(services, interaction), selection, recursive, { revised: plan.revised });
   if (outcome.receivedFromRepository) {
     markReceivedFromRepository(services, target);
   }
+  const notLocked = selectNotLocked(requestedObjects, outcome.lockedFullNames, services.repositoryService.getRootLockName(target));
+  // Частичный захват — не ошибка: он мог получить версии, и импорт ниже уже нужен (Э33.1).
   const warnings: string[] = [];
+  if (notLocked.length > 0) {
+    warnings.push(describeLockNotComplete(notLocked, outcome.lockedByOthers));
+  }
+  if (outcome.platformFailure) {
+    warnings.push(outcome.platformFailure);
+  }
   let projectImported = false;
   let projectBehind = false;
   if (shouldImportAfterLock(plan, outcome)) {
@@ -156,6 +171,8 @@ export async function runLockChain(
   return {
     lockedObjects: [...outcome.lockedFullNames],
     requestedObjects,
+    notLocked,
+    lockedByOthers: outcome.lockedByOthers,
     receivedFromRepository: outcome.receivedFromRepository,
     databaseLoadedBefore: plan.updateDatabaseFirst,
     projectImported,
@@ -166,6 +183,9 @@ export async function runLockChain(
 }
 
 export interface UpdateChainResult extends DatabaseLagFields {
+  readonly requestedObjects: string[];
+  /** Захваченные вами объекты выборки, которые получение реально перезаписало (по журналу платформы). */
+  readonly lockedOverwritten: string[];
   readonly receivedFromRepository: boolean;
   readonly changesLoadedAfter: boolean;
   readonly projectImported: boolean;
@@ -177,12 +197,16 @@ export interface UpdateChainResult extends DatabaseLagFields {
 export async function runUpdateChain(
   services: RepositoryChainServices,
   target: RepositoryTarget,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   request: { readonly recursive: boolean; readonly force: boolean; readonly version?: string },
   plan: RepositoryUpdatePlan,
   interaction: OperationInteraction
 ): Promise<UpdateChainResult> {
-  const outcome = await executeRepositoryUpdateAction(toCliServices(services, interaction), node, request);
+  const outcome = await executeRepositoryUpdateAction(toCliServices(services, interaction), selection, request);
+  const objects = {
+    requestedObjects: requestedObjectsOf(services, selection, request.recursive),
+    lockedOverwritten: outcome.lockedOverwritten,
+  };
   const received = outcome.receivedFromRepository;
   if (received) {
     markReceivedFromRepository(services, target);
@@ -192,6 +216,7 @@ export async function runUpdateChain(
     && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
     // Импорт перезаписал бы незагруженные правки проекта — не выполняется; получение уже успешно.
     return {
+      ...objects,
       receivedFromRepository: received,
       changesLoadedAfter: false,
       projectImported: false,
@@ -215,6 +240,7 @@ export async function runUpdateChain(
     warnings.push(describeProjectBehindAfterReceive(target.displayName));
   }
   return {
+    ...objects,
     receivedFromRepository: received,
     changesLoadedAfter: plan.loadChangesAfterReceive,
     projectImported,
@@ -226,6 +252,9 @@ export async function runUpdateChain(
 
 export interface CommitChainResult extends DatabaseLagFields {
   readonly committedObjects: string[];
+  readonly requestedObjects: string[];
+  /** Запрошенные объекты, которые платформа молча пропустила: не захвачены вами или захвачены другим (Э33.4). */
+  readonly notCommitted: string[];
   readonly keptLocked: boolean;
   readonly referencesCleaned: boolean;
   readonly databaseLoadedBefore: boolean;
@@ -237,7 +266,7 @@ export interface CommitChainResult extends DatabaseLagFields {
 export async function runCommitChain(
   services: RepositoryChainServices,
   target: RepositoryTarget,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   request: { readonly recursive: boolean; readonly comment: string; readonly keepLocked: boolean; readonly force: boolean },
   plan: RepositoryCommitPlan,
   interaction: OperationInteraction
@@ -247,7 +276,7 @@ export async function runCommitChain(
     && !await loadTargetChangesIntoDatabase(target, services, { ...load.options, updateDatabase: plan.updateDatabaseOnLoad })) {
     throw new RepositoryStepFailedError(load.describe(LOAD_BEFORE_COMMIT_FAILED));
   }
-  const outcome = await executeRepositoryCommitAction(toCliServices(services, interaction), node, request);
+  const outcome = await executeRepositoryCommitAction(toCliServices(services, interaction), selection, request);
   if (outcome.referencesCleaned) {
     markReceivedFromRepository(services, target);
   }
@@ -260,11 +289,16 @@ export async function runCommitChain(
       warnings.push(step.describe(describeImportFailureAfterCommit(target.displayName)));
     }
   }
-  if (outcome.committedFullNames.length === 0) {
-    warnings.push(describeNothingToCommit(node.label ?? target.displayName));
+  if (outcome.notCommitted.length > 0) {
+    warnings.push(describeNotCommitted(outcome.notCommitted));
+  } else if (outcome.committedFullNames.length === 0) {
+    // «Нечего помещать» — только когда причина не названа выше: пропущенные объекты её уже объясняют.
+    warnings.push(describeNothingToCommit(selectionLabel(toSelectionNodes(selection), target)));
   }
   return {
     committedObjects: [...outcome.committedFullNames],
+    requestedObjects: requestedObjectsOf(services, selection, request.recursive),
+    notCommitted: outcome.notCommitted,
     keptLocked: request.keepLocked,
     referencesCleaned: outcome.referencesCleaned,
     databaseLoadedBefore: plan.updateDatabaseFirst,
@@ -285,15 +319,25 @@ export interface UnlockChainResult {
 export async function runUnlockChain(
   services: RepositoryChainServices,
   target: RepositoryTarget,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   request: { readonly recursive: boolean; readonly force: boolean },
   dirtyFilesCount: number,
   interaction: OperationInteraction
 ): Promise<UnlockChainResult> {
-  const outcome = await executeRepositoryUnlockAction(toCliServices(services, interaction), node, request.recursive, request.force);
-  const warnings = dirtyFilesCount > 0 && outcome.unlocked.length > 0
-    ? [describeUnloadedChangesAfterUnlock(target.displayName, dirtyFilesCount)]
-    : [];
+  let outcome: RepositoryUnlockOutcome;
+  try {
+    outcome = await executeRepositoryUnlockAction(toCliServices(services, interaction), selection, request.recursive, request.force);
+  } catch (error) {
+    throw explainUnlockBlockedByChanges(error, () => requestedObjectsOf(services, selection, request.recursive).length);
+  }
+  const warnings: string[] = [];
+  // Ничего не освобождено — решение вызывающего (MCP делает это ошибкой), а частичное — предупреждение.
+  if (outcome.unlocked.length > 0 && outcome.notUnlocked.length > 0) {
+    warnings.push(describeUnlockNotDone(outcome.notUnlocked, outcome.lockedByOthers));
+  }
+  if (dirtyFilesCount > 0 && outcome.unlocked.length > 0) {
+    warnings.push(describeUnloadedChangesAfterUnlock(target.displayName, dirtyFilesCount));
+  }
   return {
     unlockedObjects: outcome.unlocked,
     lockedByOthers: outcome.lockedByOthers,
@@ -312,4 +356,48 @@ export function describeUnlockNotDone(notUnlocked: readonly string[], lockedByOt
   const names = notUnlocked.map(formatRepositoryLockName).join(', ');
   const foreign = lockedByOthers.map((item) => (item.user ? `${item.name} (${item.user})` : item.name)).join(', ');
   return `Захват не отменён: ${names}${foreign ? `; захвачено другим пользователем: ${foreign}` : ''}`;
+}
+
+/**
+ * Без `-force` платформа освобождает список целиком или никак (Э33.3): один изменённый в базе объект блокирует
+ * все, а в логе остаётся только «Объект '<имя>' был изменен». Текст называет мешающие объекты.
+ */
+export function describeUnlockBlockedByChanges(names: readonly string[], requestedCount: number): string {
+  if (names.length === 1 && requestedCount <= 1) {
+    return `Захват не отменён: объект ${names[0]} изменён в базе.`;
+  }
+  return `Захват не отменён ни у одного объекта: платформа отменяет захват списка целиком, а изменены в базе: ${names.join(', ')}.`;
+}
+
+/** Отказ освобождения из-за изменённых объектов — понятным текстом; заголовок, лог и код платформы сохраняются. */
+function explainUnlockBlockedByChanges(error: unknown, requestedCount: () => number): unknown {
+  if (!(error instanceof RepositoryCliError)) {
+    return error;
+  }
+  const changed = parseRepositoryLockLog(error.log ?? '').changedInDatabase;
+  return changed.length > 0
+    ? new RepositoryCliError(error.title, describeUnlockBlockedByChanges(changed, requestedCount()), error.log, error.exitCode)
+    : error;
+}
+
+/** Частичный захват: что не захвачено и кем занято (то, что лог назвал чужим захватом). */
+export function describeLockNotComplete(notLocked: readonly string[], lockedByOthers: readonly LockedByOther[]): string {
+  const foreign = lockedByOthers.map((item) => (item.user ? `${item.name} (${item.user})` : item.name)).join(', ');
+  return `Захвачены не все объекты: ${notLocked.join(', ')}${foreign ? `; захвачено другим пользователем: ${foreign}` : ''}.`;
+}
+
+function describeNotCommitted(notCommitted: readonly string[]): string {
+  return `Не помещены: ${notCommitted.join(', ')} — не захвачены вами или захвачены другим пользователем ` +
+    '(платформа пропускает такие объекты без ошибки).';
+}
+
+/** Запрошенные объекты в порядке выборки (корень — служебным именем первым). */
+function requestedObjectsOf(services: RepositoryChainServices, selection: RepositoryNodeSelection, recursive: boolean): string[] {
+  return services.repositoryService.buildObjectsSelectionForNodes(toSelectionNodes(selection), recursive).fullNames;
+}
+
+/** Запрошенные `Тип.Имя`, которых нет среди захваченных; служебное имя корня в логе не видно — не считается. */
+function selectNotLocked(requested: readonly string[], locked: readonly string[], rootLockName: string): string[] {
+  const lockedKeys = new Set(locked.map((name) => name.toLocaleLowerCase('ru')));
+  return requested.filter((name) => name !== rootLockName && !lockedKeys.has(name.toLocaleLowerCase('ru')));
 }

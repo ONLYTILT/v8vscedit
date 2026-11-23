@@ -230,7 +230,7 @@ suite('Э9: хранилище конфигурации в удалённом р
 
   suite('запуск на сервере', () => {
     test('захват: объекты уходят на сервер входным файлом, 1cv8 — по пути сервера, отметка о захвате поставлена', async () => {
-      assert.deepStrictEqual(await runRepositoryLockAction(services, catalogNode, false, { revised: false }), { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true });
+      assert.deepStrictEqual(await runRepositoryLockAction(services, catalogNode, false, { revised: false }), { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true, lockedByOthers: [] });
 
       assert.deepStrictEqual(host.ops(), ['mktemp', 'put', 'run', 'rmtemp']);
       const put = host.calls[1].args;

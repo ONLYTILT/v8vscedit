@@ -122,9 +122,12 @@ suite('RepositoryService.findLockedInSelection: захваченные объе�
     );
   });
 
-  test('подсистема не рекурсивно: только сама подсистема', () => {
+  test('подсистема не рекурсивно (Э33.5): элемент Subsystem включает состав и без рекурсии — консервативно все захваты цели', () => {
     service.setLocked(cfTarget, ['Справочник.Склады'], true);
-    assert.deepStrictEqual(service.findLockedInSelection(node(cfRoot, 'Subsystem', 'Subsystems', 'Продажи'), false), []);
+    assert.deepStrictEqual(
+      service.findLockedInSelection(node(cfRoot, 'Subsystem', 'Subsystems', 'Продажи'), false),
+      ['Справочник.Склады']
+    );
   });
 
   test('узел без xmlPath или вне корней: пусто (выборку всё равно не построить)', () => {

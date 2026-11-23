@@ -457,13 +457,13 @@ suite('RepositoryCommandRunner', () => {
       const options = { recursive: false, force: false };
 
       behavior = () => ok({ log: [begin, 'Объект получен из хранилища: Справочник.Товары', end].join('\r\n') });
-      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true });
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true, lockedOverwritten: [] });
 
       behavior = () => ok({ log: [begin, end].join('\r\n') });
-      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: false });
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: false, lockedOverwritten: [] });
 
       behavior = () => ok({ log: '' });
-      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true }, 'лог не распознан — консервативно true');
+      assert.deepStrictEqual(await runRepositoryUpdateAction(services, catalogNode, options), { receivedFromRepository: true, lockedOverwritten: [] }, 'лог не распознан — консервативно true');
 
       behavior = () => ok({ exitCode: 1 });
       assert.strictEqual(await runRepositoryUpdateAction(services, catalogNode, options), undefined);

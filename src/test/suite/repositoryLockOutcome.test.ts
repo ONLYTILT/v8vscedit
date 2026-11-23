@@ -76,6 +76,9 @@ suite('Н10: parseRepositoryLockLog — разбор лога захвата', (
       absent: ['Справочник.Нет1', 'Справочник.Нет2'],
       // Поле чужих захватов добавлено Э24 (освобождение по логу); у лога захвата оно пусто.
       lockedByOthers: [],
+      // Поля освобождения и отказа освобождения (Э33): у лога захвата они пусты.
+      notLockedByYou: [],
+      changedInDatabase: [],
       recognized: true,
     });
   });
@@ -100,7 +103,7 @@ suite('Н10: parseRepositoryLockLog — разбор лога захвата', (
   ];
   for (const [title, log] of unrecognized) {
     test(`не распознан: ${title}`, () => {
-      assert.deepStrictEqual(parseRepositoryLockLog(log), { locked: [], cancelled: [], absent: [], lockedByOthers: [], recognized: false });
+      assert.deepStrictEqual(parseRepositoryLockLog(log), { locked: [], cancelled: [], absent: [], lockedByOthers: [], notLockedByYou: [], changedInDatabase: [], recognized: false });
     });
   }
 });
@@ -230,7 +233,7 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
     result = { ...result, log: LOG_LOCKED_ONLY };
     assert.deepStrictEqual(
       await runRepositoryLockAction(services, catalogNode, false, { revised: false }),
-      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false }
+      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false, lockedByOthers: [] }
     );
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
   });
@@ -238,7 +241,7 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   test('exit 0, но платформа сообщила «отсутствует в обеих конфигурациях»: операция успешна, отметки нет (учёт не врёт)', async () => {
     result = { ...result, log: [BEGIN, 'Объекты, отсутствующие в обеих конфигурациях: Справочник.Товары', END].join('\r\n') };
     const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: false });
-    assert.deepStrictEqual(outcome, { lockedFullNames: [], receivedFromRepository: false });
+    assert.deepStrictEqual(outcome, { lockedFullNames: [], receivedFromRepository: false, lockedByOthers: [] });
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), false);
   });
 
@@ -253,7 +256,7 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   test('лог не распознан (пустой): прежнее поведение — отметка стоит, receivedFromRepository консервативно true', async () => {
     assert.deepStrictEqual(
       await runRepositoryLockAction(services, catalogNode, false, { revised: false }),
-      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true }
+      { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true, lockedByOthers: [] }
     );
     assert.strictEqual(service.isLocked(target, 'Справочник.Товары'), true);
   });
@@ -261,7 +264,7 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   test('revised=true, лог Э14 с «получен»: вектор с -revised после -Objects, receivedFromRepository=true, тост успеха показан', async () => {
     result = { ...result, log: LOG_RECEIVED };
     const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: true });
-    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true });
+    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: true, lockedByOthers: [] });
     const args = requests[0].args;
     assert.ok(args.includes('/ConfigurationRepositoryLock'));
     assert.ok(args.includes('-revised'));
@@ -274,7 +277,7 @@ suite('Н10: runRepositoryLockAction — локальный учёт захва�
   test('revised=true, объект в хранилище не менялся: только «захвачен» → receivedFromRepository=false', async () => {
     result = { ...result, log: LOG_LOCKED_ONLY };
     const outcome = await runRepositoryLockAction(services, catalogNode, false, { revised: true });
-    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false });
+    assert.deepStrictEqual(outcome, { lockedFullNames: ['Справочник.Товары'], receivedFromRepository: false, lockedByOthers: [] });
   });
 
   test('revised=false, но платформа сама получила версию (Э14): receivedFromRepository=true', async () => {

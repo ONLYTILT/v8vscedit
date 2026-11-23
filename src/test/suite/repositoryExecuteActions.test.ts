@@ -148,7 +148,7 @@ suite('execute*Action: учёт захватов по логам платфор�
   test('захват: отмечаются объекты из лога, исход как у run*; exit≠0 — RepositoryCliError, учёт не тронут', async () => {
     p.setResult(opLog(LOCK_DONE, `Объект захвачен для редактирования: ${T}`));
     const outcome = await executeRepositoryLockAction(services(), p.refs.catalog, false, { revised: true });
-    assert.deepStrictEqual(outcome, { lockedFullNames: [T], receivedFromRepository: false });
+    assert.deepStrictEqual(outcome, { lockedFullNames: [T], receivedFromRepository: false, lockedByOthers: [] });
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), true);
     assert.ok(p.args().includes('-revised'));
 
@@ -220,7 +220,7 @@ suite('execute*Action: учёт захватов по логам платфор�
     const outcome = await executeRepositoryCommitAction(
       services(), p.refs.catalog, { recursive: false, comment: 'Правка', keepLocked: false, force: false }
     );
-    assert.deepStrictEqual(outcome, { committedFullNames: [T], referencesCleaned: false });
+    assert.deepStrictEqual(outcome, { committedFullNames: [T], referencesCleaned: false, notCommitted: [] });
     assert.strictEqual(p.service.isLocked(p.cfTarget, T), false);
   });
 
@@ -251,7 +251,7 @@ suite('execute*Action: учёт захватов по логам платфор�
     const outcome = await executeRepositoryCommitAction(
       services(), p.refs.catalog, { recursive: false, comment: 'к', keepLocked: false, force: false }
     );
-    assert.deepStrictEqual(outcome, { committedFullNames: [T], referencesCleaned: false });
+    assert.deepStrictEqual(outcome, { committedFullNames: [T], referencesCleaned: false, notCommitted: [] });
   });
 
   test('помещение: exit≠0 → RepositoryCliError, захват остаётся', async () => {
@@ -268,12 +268,12 @@ suite('execute*Action: учёт захватов по логам платфор�
     p.setResult(opLog(UPDATE_DONE, `Объект получен из хранилища: ${T}`));
     assert.deepStrictEqual(
       await executeRepositoryUpdateAction(services(), p.refs.catalog, { recursive: false, force: false }),
-      { receivedFromRepository: true }
+      { receivedFromRepository: true, lockedOverwritten: [] }
     );
     p.setResult(opLog(UPDATE_DONE));
     assert.deepStrictEqual(
       await executeRepositoryUpdateAction(services(), p.refs.catalog, { recursive: false, force: false }),
-      { receivedFromRepository: false }
+      { receivedFromRepository: false, lockedOverwritten: [] }
     );
     p.setResult('нет доступа', 1);
     await assert.rejects(

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import type { RepositoryBinding, RepositoryNodeRef, RepositoryService, RepositoryTarget } from '../../../infra/repository/RepositoryService';
+import { toSelectionNodes, type RepositoryNodeSelection } from '../../../infra/repository/RepositoryObjectsSelection';
 import { resolveDbPassword, type ProjectSecretStorage } from '../../../infra/environment';
 import {
   formatCommandLineForLog,
@@ -25,6 +26,8 @@ import {
   parseRepositoryLockLog,
   resolveCommittedFullNames,
   resolveLockedFullNames,
+  resolveNotCommittedFullNames,
+  resolveOverwrittenLocked,
   resolveUnlockedFullNames,
   type LockedByOther,
 } from '../../../infra/repository/RepositoryLockLog';
@@ -362,20 +365,67 @@ async function runNodeAction<T>(action: RepositoryNodeAction<T>, services: Repos
   return await runRepositoryCliCommand(action.options, services) ? action.outcome() : undefined;
 }
 
-function nodeLabel(node: RepositoryNodeRef, target: RepositoryTarget): string {
-  return node.label ?? target.displayName;
+/** Выборка действия: цель, единый файл `-Objects` и подпись для заголовков. */
+interface PreparedSelection {
+  readonly target: RepositoryTarget;
+  readonly nodes: readonly RepositoryNodeRef[];
+  readonly objects: { readonly xml: string; readonly fullNames: string[] };
+  readonly label: string;
+}
+
+function prepareSelection(services: RepositoryCliServices, selection: RepositoryNodeSelection, recursive: boolean): PreparedSelection {
+  const nodes = toSelectionNodes(selection);
+  // Прежний текст отказа для узла вне конфигурации — до сборки выборки, у которой свой текст.
+  for (const node of nodes) {
+    requireTarget(services.repositoryService, node);
+  }
+  const { xml, fullNames, target } = services.repositoryService.buildObjectsSelectionForNodes(nodes, recursive);
+  return { target, nodes, objects: { xml, fullNames }, label: selectionLabel(nodes, target) };
+}
+
+/** Один узел — прежняя подпись (тексты UI байт-в-байт), несколько — «<подпись первого> и ещё N». */
+export function selectionLabel(nodes: readonly RepositoryNodeRef[], target: RepositoryTarget): string {
+  const first = nodes[0].label ?? target.displayName;
+  return nodes.length > 1 ? `${first} и ещё ${String(nodes.length - 1)}` : first;
+}
+
+/** Исход захвата раннера: план (`repositoryLockFlow`) не знает о чужих захватах и частичном отказе. */
+export interface RepositoryLockActionOutcome extends RepositoryLockOutcome {
+  readonly lockedByOthers: LockedByOther[];
+  /** Текст отказа платформы, если захват списка завершился exit≠0, но часть объектов захвачена (Э33.1). */
+  readonly platformFailure?: string;
+}
+
+interface RepositoryLockAction extends RepositoryNodeAction<RepositoryLockActionOutcome> {
+  /** Исход по логу отказа, если по нему захвачено что-то новое; иначе `undefined`. */
+  readonly partialOutcome: () => RepositoryLockActionOutcome | undefined;
 }
 
 function lockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   options: { readonly revised: boolean }
-): RepositoryNodeAction<RepositoryLockOutcome> {
-  const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
-  const label = nodeLabel(node, target);
-  let outcome: RepositoryLockOutcome | undefined;
+): RepositoryLockAction {
+  const { target, objects, label } = prepareSelection(services, selection, recursive);
+  const repository = services.repositoryService;
+  // Повторный захват своего объекта строки в логе не даёт (Э33.(а)): нужен учёт до запуска.
+  const alreadyLocked = repository.listLockedFullNames(target);
+  const alreadyKeys = new Set(alreadyLocked.map(toLockKey));
+  let outcome: RepositoryLockActionOutcome | undefined;
+  let partial: RepositoryLockActionOutcome | undefined;
+  const applyLog = (log: string, failed: boolean): RepositoryLockActionOutcome => {
+    const rootLockName = repository.getRootLockName(target);
+    // Корень по логу не виден: при отказе платформы его захват не подтверждён ничем.
+    const lockedFullNames = resolveLockedFullNames(objects.fullNames, log, alreadyLocked)
+      .filter((name) => !failed || name !== rootLockName || alreadyKeys.has(toLockKey(name)));
+    repository.setLocked(target, lockedFullNames, true);
+    return {
+      lockedFullNames,
+      receivedFromRepository: hasReceivedFromRepository(log),
+      lockedByOthers: parseRepositoryLockLog(log).lockedByOthers,
+    };
+  };
   return {
     options: {
       operation: { kind: 'lock', objectsXml: objects.xml, revised: options.revised },
@@ -389,13 +439,24 @@ function lockAction(
       failureOperation: 'захвате объектов хранилища',
       // Частичный захват — успех платформы (Н10): отмечаются только объекты, которые лог называет захваченными.
       afterSuccess: (result) => {
-        const lockedFullNames = resolveLockedFullNames(objects.fullNames, result.log);
-        services.repositoryService.setLocked(target, lockedFullNames, true);
-        outcome = { lockedFullNames, receivedFromRepository: hasReceivedFromRepository(result.log) };
+        outcome = applyLog(result.log, false);
+      },
+      // Захват списка неатомарен (Э33.1): при exit≠0 часть объектов захвачена, и учёт не должен их терять.
+      afterPlatformFailure: (result) => {
+        if (!parseRepositoryLockLog(result.log).recognized) {
+          return;
+        }
+        const failed = applyLog(result.log, true);
+        partial = failed.lockedFullNames.some((name) => !alreadyKeys.has(toLockKey(name))) ? failed : undefined;
       },
     },
     outcome: () => requireOutcome(outcome),
+    partialOutcome: () => partial,
   };
+}
+
+function toLockKey(name: string): string {
+  return name.toLocaleLowerCase('ru');
 }
 
 /**
@@ -404,21 +465,34 @@ function lockAction(
  */
 export async function runRepositoryLockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   options: { readonly revised: boolean }
-): Promise<RepositoryLockOutcome | undefined> {
-  return runNodeAction(lockAction(services, node, recursive, options), services);
+): Promise<RepositoryLockActionOutcome | undefined> {
+  return runNodeAction(lockAction(services, selection, recursive, options), services);
 }
 
-/** Захват без UI-сообщений: сбой — исключение (`RepositoryCliError`/`RepositoryCliInterruptedError`). */
+/**
+ * Захват без UI-сообщений: сбой — исключение (`RepositoryCliError`/`RepositoryCliInterruptedError`). Отказ
+ * платформы, после которого по логу захвачено что-то новое, — частичный исход с `platformFailure`: захват мог
+ * получить версии, и без продолжения цепочки (импорта) проект молча отстал бы от базы.
+ */
 export async function executeRepositoryLockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   options: { readonly revised: boolean }
-): Promise<RepositoryLockOutcome> {
-  return executeNodeAction(lockAction(services, node, recursive, options), services);
+): Promise<RepositoryLockActionOutcome> {
+  const action = lockAction(services, selection, recursive, options);
+  try {
+    return await executeNodeAction(action, services);
+  } catch (error) {
+    const partial = action.partialOutcome();
+    if (partial && error instanceof RepositoryCliError) {
+      return { ...partial, platformFailure: error.message };
+    }
+    throw error;
+  }
 }
 
 export interface RepositoryUnlockOutcome {
@@ -431,23 +505,23 @@ export interface RepositoryUnlockOutcome {
 
 function unlockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   force: boolean
 ): RepositoryNodeAction<RepositoryUnlockOutcome> {
-  const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, recursive);
-  const label = nodeLabel(node, target);
+  const { target, objects, label } = prepareSelection(services, selection, recursive);
   let outcome: RepositoryUnlockOutcome | undefined;
   // Э24: освобождение чужого захвата — exit 0 без снятия, поэтому учёт снимается по строкам лога.
   const applyLog = (log: string): RepositoryUnlockOutcome => {
+    const parsed = parseRepositoryLockLog(log);
     const unlocked = resolveUnlockedFullNames(objects.fullNames, log);
-    services.repositoryService.setLocked(target, unlocked, false);
-    const unlockedKeys = new Set(unlocked.map((name) => name.toLocaleLowerCase('ru')));
+    // «Не захвачен вами» в учёте — устаревшая запись: её снятие верно, но освобождённой она не считается.
+    services.repositoryService.setLocked(target, [...unlocked, ...parsed.notLockedByYou], false);
+    const settled = new Set([...unlocked, ...parsed.notLockedByYou].map(toLockKey));
     return {
       unlocked,
-      lockedByOthers: parseRepositoryLockLog(log).lockedByOthers,
-      notUnlocked: objects.fullNames.filter((name) => !unlockedKeys.has(name.toLocaleLowerCase('ru'))),
+      lockedByOthers: parsed.lockedByOthers,
+      notUnlocked: objects.fullNames.filter((name) => !settled.has(toLockKey(name))),
     };
   };
   return {
@@ -476,20 +550,20 @@ function unlockAction(
 
 export async function runRepositoryUnlockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   force: boolean
 ): Promise<boolean> {
-  return await runNodeAction(unlockAction(services, node, recursive, force), services) !== undefined;
+  return await runNodeAction(unlockAction(services, selection, recursive, force), services) !== undefined;
 }
 
 export async function executeRepositoryUnlockAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   recursive: boolean,
   force: boolean
 ): Promise<RepositoryUnlockOutcome> {
-  return executeNodeAction(unlockAction(services, node, recursive, force), services);
+  return executeNodeAction(unlockAction(services, selection, recursive, force), services);
 }
 
 interface RepositoryCommitRequest {
@@ -499,15 +573,18 @@ interface RepositoryCommitRequest {
   force: boolean;
 }
 
+/** Исход помещения раннера: запрошенные объекты, которые платформа молча пропустила (Э33.4б/в). */
+export interface RepositoryCommitActionOutcome extends RepositoryCommitOutcome {
+  readonly notCommitted: string[];
+}
+
 function commitAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryCommitRequest
-): RepositoryNodeAction<RepositoryCommitOutcome> {
-  const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
-  const label = nodeLabel(node, target);
-  let outcome: RepositoryCommitOutcome | undefined;
+): RepositoryNodeAction<RepositoryCommitActionOutcome> {
+  const { target, objects, label } = prepareSelection(services, selection, options.recursive);
+  let outcome: RepositoryCommitActionOutcome | undefined;
   return {
     options: {
       operation: {
@@ -524,13 +601,15 @@ function commitAction(
       errorTitle: `Ошибка помещения "${label}" в хранилище.`,
       failureOperation: 'помещении изменений в хранилище',
       afterSuccess: (result) => {
-        // Э25: снятие захвата после помещения в лог не пишется — учёт снимается у запрошенных.
+        // Э25: снятие захвата после помещения в лог не пишется — учёт снимается у запрошенных. Незахваченный
+        // или чужой объект в учёте — устаревшая запись, её снятие тоже верно.
         if (!options.keepLocked) {
           services.repositoryService.setLocked(target, objects.fullNames, false);
         }
         outcome = {
           committedFullNames: resolveCommittedFullNames(objects.fullNames, result.log),
           referencesCleaned: hasReferencesCleaned(result.log),
+          notCommitted: resolveNotCommittedFullNames(objects.fullNames, result.log),
         };
       },
     },
@@ -540,18 +619,18 @@ function commitAction(
 
 export async function runRepositoryCommitAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryCommitRequest
 ): Promise<boolean> {
-  return await runNodeAction(commitAction(services, node, options), services) !== undefined;
+  return await runNodeAction(commitAction(services, selection, options), services) !== undefined;
 }
 
 export async function executeRepositoryCommitAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryCommitRequest
-): Promise<RepositoryCommitOutcome> {
-  return executeNodeAction(commitAction(services, node, options), services);
+): Promise<RepositoryCommitActionOutcome> {
+  return executeNodeAction(commitAction(services, selection, options), services);
 }
 
 interface RepositoryUpdateRequest {
@@ -560,15 +639,20 @@ interface RepositoryUpdateRequest {
   version?: string;
 }
 
+/** Исход получения раннера: захваченные вами объекты выборки, которые получение реально перезаписало. */
+export interface RepositoryUpdateActionOutcome extends RepositoryUpdateOutcome {
+  readonly lockedOverwritten: string[];
+}
+
 function updateAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryUpdateRequest
-): RepositoryNodeAction<RepositoryUpdateOutcome> {
-  const target = requireTarget(services.repositoryService, node);
-  const objects = services.repositoryService.buildObjectsSelectionForNode(node, options.recursive);
-  const label = nodeLabel(node, target);
-  let outcome: RepositoryUpdateOutcome | undefined;
+): RepositoryNodeAction<RepositoryUpdateActionOutcome> {
+  const { target, nodes, objects, label } = prepareSelection(services, selection, options.recursive);
+  // Учёт до запуска: перезапись захваченных решает журнал, но кандидаты — только захваченные в выборке.
+  const lockedInSelection = services.repositoryService.findLockedInSelectionForNodes(nodes, options.recursive);
+  let outcome: RepositoryUpdateActionOutcome | undefined;
   return {
     options: {
       operation: { kind: 'update', objectsXml: objects.xml, version: options.version, force: options.force },
@@ -580,7 +664,10 @@ function updateAction(
       failureOperation: 'получении изменений из хранилища',
       // Формат лога тот же, что у захвата: строки «Объект получен из хранилища».
       afterSuccess: (result) => {
-        outcome = { receivedFromRepository: hasReceivedFromRepository(result.log) };
+        outcome = {
+          receivedFromRepository: hasReceivedFromRepository(result.log),
+          lockedOverwritten: resolveOverwrittenLocked(lockedInSelection, result.log),
+        };
       },
     },
     outcome: () => requireOutcome(outcome),
@@ -593,18 +680,18 @@ function updateAction(
  */
 export async function runRepositoryUpdateAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryUpdateRequest
-): Promise<RepositoryUpdateOutcome | undefined> {
-  return runNodeAction(updateAction(services, node, options), services);
+): Promise<RepositoryUpdateActionOutcome | undefined> {
+  return runNodeAction(updateAction(services, selection, options), services);
 }
 
 export async function executeRepositoryUpdateAction(
   services: RepositoryCliServices,
-  node: RepositoryNodeRef,
+  selection: RepositoryNodeSelection,
   options: RepositoryUpdateRequest
-): Promise<RepositoryUpdateOutcome> {
-  return executeNodeAction(updateAction(services, node, options), services);
+): Promise<RepositoryUpdateActionOutcome> {
+  return executeNodeAction(updateAction(services, selection, options), services);
 }
 
 /** Исход заполняет `afterSuccess`; успешный запуск без него означал бы ошибку в коде раннера. */

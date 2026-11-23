@@ -42,7 +42,7 @@ suite('repositoryChains: runLockChain', () => {
 
     assert.deepStrictEqual(p.events, ['repo:lock', 'import:cf']);
     assert.deepStrictEqual(result, {
-      lockedObjects: [T], requestedObjects: [T], receivedFromRepository: true,
+      lockedObjects: [T], requestedObjects: [T], notLocked: [], lockedByOthers: [], receivedFromRepository: true,
       databaseLoadedBefore: false, projectImported: true, projectBehind: false, warnings: [],
       databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
@@ -162,7 +162,7 @@ suite('repositoryChains: runUpdateChain', () => {
     const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan(), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'import:cf']);
     assert.deepStrictEqual(result, {
-      receivedFromRepository: true, changesLoadedAfter: false, projectImported: true, projectBehind: false, warnings: [],
+      requestedObjects: [T], lockedOverwritten: [], receivedFromRepository: true, changesLoadedAfter: false, projectImported: true, projectBehind: false, warnings: [],
       databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
     assert.deepStrictEqual(p.toasts, []);
@@ -200,7 +200,7 @@ suite('repositoryChains: runUpdateChain', () => {
     const result = await runUpdateChain(p.services, p.cfTarget, p.refs.catalog, request, plan({ loadChangesAfterReceive: true, updateDatabaseOnLoad: true }), 'interactive');
     assert.deepStrictEqual(p.events, ['repo:update', 'update:cf']);
     assert.deepStrictEqual(result, {
-      receivedFromRepository: true, changesLoadedAfter: false, projectImported: false, projectBehind: true,
+      requestedObjects: [T], lockedOverwritten: [], receivedFromRepository: true, changesLoadedAfter: false, projectImported: false, projectBehind: true,
       warnings: [describeLoadFailureAfterReceive('Основная')],
       databaseConfigurationUpdated: false, databaseConfigurationBehind: true,
     });
@@ -269,7 +269,7 @@ suite('repositoryChains: runCommitChain', () => {
     const result = await runCommitChain(p.services, p.cfTarget, p.refs.catalog, request, { updateDatabaseFirst: false, updateDatabaseOnLoad: false }, 'interactive');
     assert.deepStrictEqual(p.events, ['repo:commit']);
     assert.deepStrictEqual(result, {
-      committedObjects: [T], keptLocked: false, referencesCleaned: false,
+      committedObjects: [T], requestedObjects: [T], notCommitted: [], keptLocked: false, referencesCleaned: false,
       databaseLoadedBefore: false, projectImported: false, warnings: [],
       databaseConfigurationUpdated: false, databaseConfigurationBehind: false,
     });
