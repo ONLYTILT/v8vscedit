@@ -65,7 +65,12 @@ interface UniversalPanelState {
   readonly processingMessage?: string;
   readonly searchQuery: string;
   readonly openNodeIds: readonly string[];
-  readonly selectedNodeId?: string;
+  /**
+   * `null`, а не отсутствие поля: id позиционные, и при сериализации `undefined`
+   * теряется — webview оставил бы прежний id, подсвечивающий чужой узел на той же
+   * позиции (типичный случай — выбранный узел отфильтрован поиском).
+   */
+  readonly selectedNodeId: string | null;
   readonly rootNodes: readonly TreeNodeDto[];
   readonly standaloneStatus: {
     readonly configured: boolean;
@@ -298,7 +303,7 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
       processingMessage: processingState.message,
       searchQuery: this.services.treeProvider.getSearchQuery(),
       openNodeIds: [...this.currentOpenNodeIds],
-      selectedNodeId: this.currentSelectedNodeId,
+      selectedNodeId: this.currentSelectedNodeId ?? null,
       rootNodes: this.cachedRootNodes,
       standaloneStatus: this.toStatusDto(this.services.getStandaloneServerStatus()),
     };
@@ -317,7 +322,7 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
         processingMessage: processingState.message,
         searchQuery: this.services.treeProvider.getSearchQuery(),
         openNodeIds: [...this.currentOpenNodeIds],
-        selectedNodeId: this.currentSelectedNodeId,
+        selectedNodeId: this.currentSelectedNodeId ?? null,
         rootNodes: this.cachedRootNodes,
         standaloneStatus: this.toStatusDto(this.services.getStandaloneServerStatus()),
       },

@@ -69,10 +69,26 @@ interface ChildrenLoadedMessage {
   readonly done: boolean;
 }
 
+/** Полный снимок состояния панели, который хост шлёт сообщением `state`. */
+export interface PanelStateLike {
+  readonly searchQuery: string;
+  readonly openNodeIds: readonly string[];
+  readonly selectedNodeId?: string | null;
+  readonly rootNodes: readonly TreeNodeDtoLike[];
+}
+
 export interface UniversalPanelFixture {
   readonly rootNodes: readonly TreeNodeDtoLike[];
   /** Загружает дочерние узлы через протокол webview и возвращает их (как это делает UI при раскрытии). */
   loadChildren(nodeId: string): Promise<readonly TreeNodeDtoLike[]>;
+  /**
+   * Шлёт команду от webview. Обработчик хоста — async-функция: её часть до первого
+   * `await` (для `selectNode` — запоминание выбранного узла) выполняется синхронно
+   * внутри `fire`, поэтому к возврату из метода состояние выбора уже применено.
+   */
+  sendCommand(command: string, payload?: unknown): void;
+  /** Шлёт запрос поиска (как поле поиска webview) и возвращает следующий снимок `state`. */
+  search(query: string): Promise<PanelStateLike>;
   dispose(): void;
 }
 
@@ -194,6 +210,22 @@ export function createUniversalPanelFixture(options: UniversalPanelFixtureOption
           && (item as { nodeId?: string }).nodeId === nodeId
       ).flatMap((message) => [...message.children]);
       return children.length > 0 ? children : [...finalChunk.children];
+    },
+    sendCommand: (command: string, payload?: unknown) => {
+      messageEmitter.fire({ type: 'command', command, payload });
+    },
+    search: async (query: string) => {
+      const sentAt = postedMessages.length;
+      requestCounter += 1;
+      messageEmitter.fire({ type: 'request', requestId: `search-${String(requestCounter)}`, name: 'search', payload: { query } });
+      const message = await waitFor(
+        () => postedMessages.slice(sentAt).find(
+          (item): item is { type: 'state'; state: PanelStateLike } =>
+            typeof item === 'object' && item !== null && (item as { type?: string }).type === 'state'
+        ),
+        `не получен снимок state после поиска «${query}»`
+      );
+      return message.state;
     },
     dispose: () => {
       treeProvider.dispose();

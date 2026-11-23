@@ -25,7 +25,8 @@ export interface UniversalPanelState {
   readonly processingMessage?: string;
   readonly searchQuery: string;
   readonly openNodeIds: readonly string[];
-  readonly selectedNodeId?: string;
+  /** `null` — выбранного узла нет в текущем дереве (например, отфильтрован поиском). */
+  readonly selectedNodeId: string | null;
   readonly rootNodes: readonly TreeNodeDto[];
   readonly standaloneStatus: StandaloneServerStatusDto;
 }

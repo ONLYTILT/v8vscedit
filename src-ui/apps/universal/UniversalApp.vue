@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, watchEffect, onMounted, onUnmounted } from 'vue';
+import { ref, shallowRef, watchEffect, nextTick, onMounted, onUnmounted } from 'vue';
 import { MessageBus } from '@ui-shared/api/messageBus';
 import type { HostToUiMessage } from '@ui-shared/protocol/hostMessages';
 import type { TreeNodeDto, TreeNodeActionDto } from '@ui-shared/types/tree';
@@ -30,6 +30,22 @@ const standaloneStatus = ref<StandaloneServerStatusDto>(
 );
 
 const selectedNodeId = ref<string | null>(props.initialState?.selectedNodeId ?? null);
+const treeContainer = ref<HTMLElement | null>(null);
+/**
+ * Фильтр, фактически применённый хостом (из его снимков), а не текст поля:
+ * `searchQuery` меняется уже при вводе, и по нему не понять, что фильтр снят.
+ */
+let appliedSearchQuery = props.initialState?.searchQuery ?? '';
+
+/**
+ * После снятия фильтра дерево снова полное, и выбранный узел оказывается вне
+ * видимой области — без прокрутки пользователь «теряет» место, где был.
+ */
+function revealSelectedNode(): void {
+  treeContainer.value
+    ?.querySelector<HTMLElement>('.tree-row.selected')
+    ?.scrollIntoView({ block: 'center' });
+}
 
 /** Плоский индекс по id — обновляется watchEffect-ом при изменении rootNodes. shallowRef — Map не нужно делать реактивной. */
 const nodeIndex = shallowRef<Map<string, TreeNodeDto>>(new Map());
@@ -216,7 +232,13 @@ function handleHostMessage(msg: HostToUiMessage): void {
     if (state.processing !== undefined) processing.value = state.processing;
     if (state.processingTitle !== undefined) processingTitle.value = state.processingTitle;
     if (state.processingMessage !== undefined) processingMessage.value = state.processingMessage;
-    if (state.searchQuery !== undefined) searchQuery.value = state.searchQuery;
+    let filterCleared = false;
+    if (state.searchQuery !== undefined) {
+      filterCleared = appliedSearchQuery !== '' && state.searchQuery === '';
+      appliedSearchQuery = state.searchQuery;
+      searchQuery.value = state.searchQuery;
+    }
+    if (filterCleared) void nextTick(revealSelectedNode);
     if (state.openNodeIds) openNodeIds.value = toIdMap(state.openNodeIds);
     if (state.selectedNodeId !== undefined) selectedNodeId.value = state.selectedNodeId;
     if (state.rootNodes) {
@@ -362,7 +384,7 @@ onUnmounted(() => {
       </template>
     </section>
 
-    <div v-if="initialized" class="panel-content">
+    <div v-if="initialized" ref="treeContainer" class="panel-content">
       <UniversalTree
         :nodes="rootNodes"
         :selected-id="selectedNodeId"
