@@ -9,6 +9,8 @@ export type HostToUiMessage<TState = unknown> =
   | { readonly type: 'history'; readonly state: HistoryGraphState }
   | { readonly type: 'commitChanges'; readonly hash: string; readonly section: ChangesSectionDto }
   | { readonly type: 'standaloneStatus'; readonly status: unknown }
+  /** Навигатор: прокрутить к выделенному узлу (приходит после `state` с новым выделением). */
+  | { readonly type: 'revealSelected' }
   | {
       readonly type: 'childrenLoaded';
       readonly nodeId: string;

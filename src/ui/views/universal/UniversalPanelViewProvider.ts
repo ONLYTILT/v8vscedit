@@ -177,6 +177,11 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
   private ready = false;
   private healAttempts = 0;
   private healTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Прокрутку к выделенному узлу просили до готовности webview (панель была закрыта и
+   * только создаётся): сообщение уйдёт по 'ready', иначе его некому было бы принять.
+   */
+  private pendingReveal = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -339,6 +344,7 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
     if (msg.type === 'ready') {
       this.ready = true;
       this.clearHealTimer();
+      this.flushReveal();
       return;
     }
 
@@ -659,6 +665,53 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
   }
 
   // ── Выбор узла ──
+
+  /**
+   * Выделяет узел полного дерева (поиск по файлу редактора, переход после операции),
+   * раскрывает ветку к нему и просит webview прокрутить к выделению.
+   *
+   * Узел ищется заново в ВИДИМОМ дереве по цепочке ключей: под поиском или отбором
+   * захваченных его может не быть — тогда ничего не меняется (`false`), фильтр не
+   * сбрасывается. Свойства и связанный документ не открываются, в отличие от клика:
+   * переход идёт из уже открытого редактора, и открытие модуля объекта увело бы из него.
+   */
+  revealNode(node: MetadataNode): boolean {
+    const tree = this.services.treeProvider;
+    const chain: MetadataNode[] = [];
+    for (let current: MetadataNode | undefined = node; current; current = tree.getParent(current) as MetadataNode | undefined) {
+      chain.unshift(current);
+    }
+
+    let level = tree.getChildren();
+    let nodeKey = '';
+    for (const step of chain) {
+      const parentKey = nodeKey;
+      const stepKey = this.buildNodeKey(step, parentKey);
+      const visible = level.find((candidate) => this.buildNodeKey(candidate, parentKey) === stepKey);
+      if (!visible) {
+        return false;
+      }
+      nodeKey = stepKey;
+      level = tree.getChildren(visible);
+    }
+
+    this.selectedNodeKey = nodeKey;
+    this.openSelectedAncestors(nodeKey);
+    void this.services.state
+      .update(UniversalPanelViewProvider.selectedNodeStateKey, nodeKey)
+      .then(undefined, () => undefined);
+    this.pendingReveal = true;
+    this.refresh();
+    this.flushReveal();
+    return true;
+  }
+
+  private flushReveal(): void {
+    const view = this.ready ? this.view : undefined;
+    if (!this.pendingReveal || !view) {return;}
+    this.pendingReveal = false;
+    void view.webview.postMessage({ type: 'revealSelected' });
+  }
 
   private async selectNode(nodeId: string): Promise<void> {
     const nodeKey = this.nodeKeyById.get(nodeId);

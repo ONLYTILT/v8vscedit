@@ -41,7 +41,8 @@ let appliedLockedOnly = props.initialState?.lockedOnly ?? false;
 
 /**
  * После снятия фильтра дерево снова полное, и выбранный узел оказывается вне
- * видимой области — без прокрутки пользователь «теряет» место, где был.
+ * видимой области — без прокрутки пользователь «теряет» место, где был. То же при
+ * переходе к узлу по файлу редактора («Показать в дереве метаданных»).
  */
 function revealSelectedNode(): void {
   treeContainer.value
@@ -275,6 +276,13 @@ function handleHostMessage(msg: HostToUiMessage): void {
     // перерисовке, а при очистке крестиком searchQuery уже '' и перерисовку не планирует —
     // вызов выше выполнил бы прокрутку по старому, отфильтрованному DOM.
     if (filterCleared) void nextTick(revealSelectedNode);
+    return;
+  }
+
+  if (msg.type === 'revealSelected') {
+    // Хост шлёт его следом за `state` с новым выделением: nextTick дожидается
+    // перерисовки по этому снимку (ветка к узлу уже раскрыта в DOM).
+    void nextTick(revealSelectedNode);
     return;
   }
 

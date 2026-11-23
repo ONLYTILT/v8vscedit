@@ -83,6 +83,12 @@ export interface PanelStateLike {
 
 export interface UniversalPanelFixture {
   readonly rootNodes: readonly TreeNodeDtoLike[];
+  readonly provider: UniversalPanelViewProvider;
+  readonly treeProvider: MetadataTreeProvider;
+  /** Все сообщения, отправленные хостом в webview, по порядку. */
+  readonly postedMessages: readonly unknown[];
+  /** Сигнал готовности webview (Vue примонтировался) — как его шлёт настоящая панель. */
+  ready(): void;
   /** Загружает дочерние узлы через протокол webview и возвращает их (как это делает UI при раскрытии). */
   loadChildren(nodeId: string): Promise<readonly TreeNodeDtoLike[]>;
   /**
@@ -207,6 +213,10 @@ export function createUniversalPanelFixture(options: UniversalPanelFixtureOption
     ((await request(name, payload, 'state')) as { state: PanelStateLike }).state;
   return {
     rootNodes: initialState.state.rootNodes,
+    provider,
+    treeProvider,
+    postedMessages,
+    ready: () => { messageEmitter.fire({ type: 'ready' }); },
     loadChildren: async (nodeId: string) => {
       requestCounter += 1;
       messageEmitter.fire({ type: 'request', requestId: `load-${String(requestCounter)}`, name: 'loadChildren', payload: { nodeId } });

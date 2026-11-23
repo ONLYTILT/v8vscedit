@@ -18,6 +18,7 @@ import { registerFormToolsCommands } from './form/FormToolsCommands';
 import { registerAddMetadataCommand } from './metadata/AddMetadataCommand';
 import { registerMetadataReportCommands } from './metadata/MetadataReportCommands';
 import { registerRemoveMetadataCommand } from './metadata/RemoveMetadataCommand';
+import { registerRevealInNavigatorCommand } from './navigator/RevealInNavigatorCommand';
 import { registerOpenModuleCommands } from './open/OpenModuleCommand';
 import { registerOpenTemplateContentCommand } from './open/OpenTemplateContentCommand';
 import { registerOpenXmlCommand } from './open/OpenXmlCommand';
@@ -60,6 +61,7 @@ export function registerCommands(
   registerExternalObjectCommands(context, services);
   registerFormToolsCommands(context, services);
   registerTreeSearchCommands(context, services);
+  registerRevealInNavigatorCommand(context, services);
   registerInitializeProjectCommand(context, services);
   registerAiMcpCommands(context, services);
   registerDbCommands(context, services);

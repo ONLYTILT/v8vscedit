@@ -581,6 +581,12 @@
       {
         "command": "v8vscedit.bsl.surround.region",
         "title": "Область"
+      },
+      {
+        "command": "v8vscedit.revealInNavigator",
+        "title": "Показать в дереве метаданных",
+        "category": "1С",
+        "icon": "$(list-tree)"
       }
     ],
     "submenus": [
@@ -622,9 +628,18 @@
         {
           "command": "v8vscedit.bsl.surround.region",
           "when": "false"
+        },
+        {
+          "command": "v8vscedit.revealInNavigator",
+          "when": "v8vscedit.activeFileInMetadata"
         }
       ],
       "editor/context": [
+        {
+          "command": "v8vscedit.revealInNavigator",
+          "when": "v8vscedit.activeFileInMetadata",
+          "group": "navigation@90"
+        },
         {
           "submenu": "v8vscedit.bslSurroundMenu",
           "when": "editorLangId == bsl && editorHasSelection",
@@ -671,6 +686,13 @@
           "command": "v8vscedit.bsl.surround.region",
           "when": "editorLangId == bsl && editorHasSelection",
           "group": "regions@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "v8vscedit.revealInNavigator",
+          "when": "resourceScheme == file && resourceExtname =~ /^\\.(bsl|xml)$/i",
+          "group": "2_files@90"
         }
       ]
     },
@@ -1045,6 +1067,13 @@
             "entity.name.type"
           ]
         }
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "v8vscedit.revealInNavigator",
+        "key": "ctrl+alt+t",
+        "when": "editorTextFocus && v8vscedit.activeFileInMetadata"
       }
     ]
   },

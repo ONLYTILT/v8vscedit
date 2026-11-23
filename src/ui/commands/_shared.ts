@@ -96,6 +96,8 @@ export interface CommandServices {
   markConfigurationsClean: (rootPaths: string[]) => void;
   suppressConfigurationReloadForFiles: (filePaths: string[]) => void;
   revealTreeNode: (predicate: (node: MetadataNode) => boolean, rootPath?: string) => Promise<boolean>;
+  /** Выделяет узел в навигаторе и показывает панель; `false` — узел скрыт активным фильтром. */
+  revealNodeInNavigator: (node: MetadataNode) => Promise<boolean>;
   setTreeMessage: (message: string | undefined) => void;
   setTreeProcessingState: (state: UniversalPanelProcessingState) => void;
   refreshActionsView: () => void;

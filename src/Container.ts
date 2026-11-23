@@ -73,6 +73,9 @@ import { disposeRepositoryCommandStatusBar } from './ui/commands/repository/Repo
 import { DatabaseConfigLagStore } from './infra/database/DatabaseConfigLag';
 import { DatabaseLagStatusBar } from './ui/database/DatabaseLagStatusBar';
 import { GitStateObserver } from './ui/git/GitStateObserver';
+import { isMetadataFile } from './infra/fs/MetadataFileTarget';
+import { ACTIVE_FILE_IN_METADATA_CONTEXT } from './ui/commands/navigator/RevealInNavigatorCommand';
+import type { MetadataNode } from './ui/tree/TreeNode';
 import type { GitApiLike, GitExtensionLike } from './ui/git/gitExtensionApi';
 
 /**
@@ -373,6 +376,7 @@ export class Container {
     c.wireMetadataChangesView();
     c.wireCommands();
     c.wireReadonlyGuard();
+    c.wireActiveFileContext();
     c.reloadEntries();
     c.wireMcpConfigurationWatcher();
     // Смена настроек агента пересоздаёт его подключения (после идущей операции, не под ней).
@@ -415,6 +419,8 @@ export class Container {
     this.refreshChangedConfigurationState();
     const hasCfe = entries.some((e) => e.kind === 'cfe');
     void vscode.commands.executeCommand('setContext', 'v8vscedit.hasCfeEntries', hasCfe);
+    // Корни выгрузки могли смениться — признак активного файла пересчитывается и без смены редактора.
+    this.updateActiveFileContext();
     this.outputChannel.appendLine(`[init] Найдено конфигураций: ${String(entries.length)}`);
   }
 
@@ -519,7 +525,8 @@ export class Container {
       getChangedConfigurations: () => this.getChangedConfigurations(),
       markConfigurationsClean: (rootPaths) => this.markConfigurationsClean(rootPaths),
       suppressConfigurationReloadForFiles: (filePaths) => this.suppressConfigurationReloadForFiles(filePaths),
-      revealTreeNode: () => this.revealTreeNode(),
+      revealTreeNode: (predicate, rootPath) => this.revealTreeNode(predicate, rootPath),
+      revealNodeInNavigator: (node) => this.revealNodeInNavigator(node),
       // Нативный TreeView демонтирован: статус-сообщения дерева больше некуда выводить.
       setTreeMessage: () => undefined,
       setTreeProcessingState: (state) => this.setTreeProcessingState(state),
@@ -890,14 +897,37 @@ export class Container {
     return true;
   }
 
+  /** Находит узел полного дерева и выделяет его в навигаторе (переход после операции, напр. заимствования). */
+  private revealTreeNode(predicate: (node: MetadataNode) => boolean, rootPath?: string): Promise<boolean> {
+    const node = this.treeProvider.findNode(predicate, rootPath);
+    return node ? this.revealNodeInNavigator(node) : Promise.resolve(false);
+  }
+
   /**
-   * No-op: нативный TreeView демонтирован, основной UI навигатора — webview,
-   * который сам управляет выделением узлов. Подсветка узла после операций здесь
-   * никогда не работала (треевью не создавался), поэтому метод всегда возвращает false.
-   * Оставлен для совместимости с контрактом CommandServices.
+   * Выделение — в webview навигатора; показ панели — только если узел виден: скрытый
+   * фильтром узел не должен уводить фокус из редактора в панель без результата.
    */
-  private revealTreeNode(): Promise<boolean> {
-    return Promise.resolve(false);
+  private async revealNodeInNavigator(node: MetadataNode): Promise<boolean> {
+    if (!this.universalPanelViewProvider.revealNode(node)) {
+      return false;
+    }
+    await vscode.commands.executeCommand(`${UniversalPanelViewProvider.viewType}.focus`);
+    return true;
+  }
+
+  /** Признак для `when` горячей клавиши «Показать в дереве метаданных» (только строка пути, без ФС). */
+  private wireActiveFileContext(): void {
+    this.context.subscriptions.push(
+      vscode.window.onDidChangeActiveTextEditor(() => this.updateActiveFileContext())
+    );
+    this.updateActiveFileContext();
+  }
+
+  private updateActiveFileContext(): void {
+    const uri = vscode.window.activeTextEditor?.document.uri;
+    const roots = this.treeProvider.getEntries().map((entry) => entry.rootPath);
+    const inMetadata = uri?.scheme === 'file' && isMetadataFile(roots, uri.fsPath);
+    void vscode.commands.executeCommand('setContext', ACTIVE_FILE_IN_METADATA_CONTEXT, inMetadata);
   }
 
   /**

@@ -160,6 +160,7 @@ function createBaselineServices(overrides: Partial<CommandServices> = {}): Comma
     markConfigurationsClean: () => undefined,
     suppressConfigurationReloadForFiles: () => undefined,
     revealTreeNode: () => Promise.resolve(false),
+    revealNodeInNavigator: () => Promise.resolve(false),
     setTreeMessage: () => undefined,
     setTreeProcessingState: () => undefined,
     refreshActionsView: () => undefined,
