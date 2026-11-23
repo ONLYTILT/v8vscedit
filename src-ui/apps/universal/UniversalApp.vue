@@ -344,6 +344,7 @@ onMounted(() => {
   props.messageBus.on('init', handleHostMessage);
   props.messageBus.on('childrenLoaded', handleHostMessage);
   props.messageBus.on('standaloneStatus', handleHostMessage);
+  props.messageBus.on('revealSelected', handleHostMessage);
   // Однократный pull при монтировании — далее статус приходит push-ом в state
   // или burst-поллингом после команд автономного сервера.
   requestStandaloneStatus();
@@ -354,6 +355,7 @@ onUnmounted(() => {
   props.messageBus.off('init', handleHostMessage);
   props.messageBus.off('childrenLoaded', handleHostMessage);
   props.messageBus.off('standaloneStatus', handleHostMessage);
+  props.messageBus.off('revealSelected', handleHostMessage);
   stopStandalonePollBurst();
 });
 </script>
