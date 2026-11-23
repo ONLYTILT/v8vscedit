@@ -238,7 +238,6 @@ function handleHostMessage(msg: HostToUiMessage): void {
       appliedSearchQuery = state.searchQuery;
       searchQuery.value = state.searchQuery;
     }
-    if (filterCleared) void nextTick(revealSelectedNode);
     if (state.openNodeIds) openNodeIds.value = toIdMap(state.openNodeIds);
     if (state.selectedNodeId !== undefined) selectedNodeId.value = state.selectedNodeId;
     if (state.rootNodes) {
@@ -255,6 +254,10 @@ function handleHostMessage(msg: HostToUiMessage): void {
       loadingNodeIds.value = Object.freeze(stillLoading);
     }
     if (state.standaloneStatus) standaloneStatus.value = state.standaloneStatus as StandaloneServerStatusDto;
+    // Только ПОСЛЕ присваивания rootNodes: nextTick цепляется к уже запланированной
+    // перерисовке, а при очистке крестиком searchQuery уже '' и перерисовку не планирует —
+    // вызов выше выполнил бы прокрутку по старому, отфильтрованному DOM.
+    if (filterCleared) void nextTick(revealSelectedNode);
     return;
   }
 
