@@ -6,6 +6,7 @@ import {
   DataCompositionSchemaService,
   MxlTemplateService,
 } from '../../infra/xml';
+import { removeTreeSync } from './support/tempTree';
 
 suite('MxlTemplateService и DataCompositionSchemaService', () => {
   test('компилирует, анализирует, декомпилирует и валидирует MXL', () => {
@@ -56,6 +57,34 @@ suite('MxlTemplateService и DataCompositionSchemaService', () => {
     const dsl = service.decompile({ templatePath });
     assert.strictEqual(dsl.columns, 4);
     assert.strictEqual(dsl.areas[1].name, 'Строка');
+  });
+
+  test('дескриптор макета: info/validate/compile работают с ТЕЛОМ, дескриптор остаётся байт-в-байт', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-mxl-descriptor-'));
+    try {
+      const descriptor = path.join(root, 'Templates', 'Печать.xml');
+      const body = path.join(root, 'Templates', 'Печать', 'Ext', 'Template.xml');
+      fs.mkdirSync(path.dirname(descriptor), { recursive: true });
+      const descriptorXml = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<MetaDataObject><Template><Properties><Name>Печать</Name><TemplateType>SpreadsheetDocument</TemplateType></Properties></Template></MetaDataObject>',
+        '',
+      ].join('\n');
+      fs.writeFileSync(descriptor, descriptorXml, 'utf-8');
+      const service = new MxlTemplateService();
+      const definition = { columns: 1, areas: [{ name: 'Шапка', rows: [{ cells: [{ col: 1, text: 'Тест' }] }] }] };
+
+      const compiled = service.compile({ outputPath: descriptor, definition });
+      assert.strictEqual(compiled.templatePath, body);
+      assert.deepStrictEqual([...compiled.changedFiles], [body]);
+      assert.strictEqual(fs.readFileSync(descriptor, 'utf-8'), descriptorXml);
+
+      assert.strictEqual(service.info({ templatePath: descriptor }).templatePath, body);
+      assert.strictEqual(service.info({ templatePath: descriptor }).name, 'Печать');
+      assert.strictEqual(service.validate({ templatePath: descriptor }).templatePath, body);
+    } finally {
+      removeTreeSync(root);
+    }
   });
 
   test('компилирует, редактирует, анализирует и валидирует СКД', () => {

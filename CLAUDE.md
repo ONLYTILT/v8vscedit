@@ -143,6 +143,7 @@ src/
 │   │   ├── ConfigurationXmlEditor.ts # редактирование Configuration.xml
 │   │   ├── MetadataXmlCreator.ts     # создание новых XML-объектов метаданных
 │   │   ├── MetadataXmlRemover.ts     # удаление XML-объектов метаданных
+│   │   ├── role/                     # RightsXmlDocument (splice Rights.xml) + RightsXmlRender (рендеры блоков)
 │   │   ├── dumpInfo/                 # ConfigDumpInfoIndex: ЕДИНСТВЕННЫЙ разбор, сравнение (ConfigDumpInfoDiff) и правка
 │   │   │                              # (ConfigDumpInfoEditor) ConfigDumpInfo.xml (владельцы, версии)
 │   │   ├── childObjects/             # канон порядка <ChildObjects> (см. docs/xml-format-rulesets.md)
@@ -176,6 +177,8 @@ src/
 │   │   └── ChangeDetectionRunner.ts  # single-flight фоновой проверки изменений: request/
 │   │                                  # invalidate (без abort)/discard (abort без повтора)/whenIdle/dispose
 │   │                                  # (Container.changeDetection)
+│   ├── role/                         # RoleRightsCatalog.ts — KNOWN_RIGHTS/NESTED_KIND_RIGHTS, isAllowedRight
+│   │                                  # (ЕДИНСТВЕННЫЙ предикат прав), resolveRoleObjectName; + Compile/Validate/Edit
 │   ├── cfe/                          # расширения: CfeBorrowService, CfeDiffService, CfePatchMethodService
 │   ├── support/                      # ParentConfigurationsParser (чистый разбор bin), SupportMode,
 │   │                                  # SupportInfoService (кэш + режим по пути), SupportFiles (имена файлов
@@ -263,7 +266,9 @@ src/
 │   ├── tree/                         # MetadataTreeProvider (тонкий), TreeNode, nodeBuilders/, decorations/,
 │   │                                  # formNodePaths.ts — ЕДИНЫЙ адаптер «узел формы → файлы формы» для
 │   │                                  # ui/mcp и ui/commands (xmlPath узла формы объекта — это XML
-│   │                                  # ВЛАДЕЛЬЦА, а не форма; docs/metadata-navigator.md)
+│   │                                  # ВЛАДЕЛЬЦА, а не форма; docs/metadata-navigator.md);
+│   │                                  # templateNodePaths.ts — то же для макетов (узел Template → тело
+│   │                                  # Ext/Template.xml; xmlPath узла — дескриптор, не тело)
 │   ├── views/                        # webview-провайдеры
 │   │   ├── universal/                # UniversalPanelViewProvider — ОСНОВНОЙ UI навигатора
 │   │   ├── properties/               # PropertyBuilder по PropertySchema
@@ -616,6 +621,23 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
   заимствование CFE, декорации), трактовать его как путь формы нельзя: так `edit_form` писал правку поверх
   XML справочника. Тестовые узлы формы строить как продакшн-билдер (с `xmlPath` владельца). См.
   [metadata-navigator.md](./docs/metadata-navigator.md#инвариант-узла-формы-xmlpath-принадлежит-владельцу).
+- **Новый потребитель пути макета** (MCP-инструмент или команда навигатора, которым нужно тело
+  `Ext/Template.xml` макета объекта или общего макета): только через `ui/tree/templateNodePaths.ts`
+  (`resolveTemplateNodeParts`/`resolveTemplateBodyFromNode`, проверка типа макета и intent read/write) →
+  арифметика путей — в `MetaPathResolver` (`resolveTemplateBodyByDescriptor`/`resolveChildTemplateDescriptor`/
+  `resolveChildTemplateBody`/`resolveTemplateBodyPath`; копий `resolveTemplateContentPath` заводить нельзя) →
+  тело читается и пишется через `readTemplateBody`/`assertTemplateBodyRoot`/`writeTemplateBody`
+  (`infra/xml/TemplateXml.ts`: отказ, если на месте тела дескриптор `MetaDataObject`). **`node.xmlPath` узла
+  Template — дескриптор** (без дескриптора — XML владельца), телом его считать нельзя: так `compile_*`
+  писали поверх дескриптора. См. [mcp-paths.md](./docs/mcp-paths.md#макеты-тело-и-дескриптор).
+- **Редактор Rights.xml / новое правило прав роли:** правка файла — только splice через
+  `infra/xml/role/RightsXmlDocument.ts` (рендеры блоков — `RightsXmlRender.ts`), пересборка документа
+  запрещена; no-op (`applied: 0`) файл не пишет, повтор права — байт-в-байт, BOM/EOL/`xsi:type`/`<field>`/
+  `<condition/>` сохраняются. Допустимость права — только `isAllowedRight` (`infra/role/RoleRightsCatalog.ts`,
+  им пользуются edit/compile/validate); новое правило (`KNOWN_RIGHTS`/`NESTED_KIND_RIGHTS`) снимается с
+  эталона `example/` и подтверждается `roleRightsCorpus.test.ts`. Имена объектов переводит
+  `resolveRoleObjectName` (strict для grant/compile, lenient для revoke/setRls). См.
+  [xml-format-rulesets.md](./docs/xml-format-rulesets.md#rightsxml-роли-точечная-правка-и-правила-прав).
 - **Новый builder узла:** `ui/tree/nodeBuilders/<имя>.ts` → регистрация в диспетчере `metaObjectTreeBuilder.ts`. XML — только через `parseObjectXml`/`ObjectXmlReader`.
 - **Новая декорация узла:** класс в `ui/tree/decorations/` (реализует `vscode.FileDecorationProvider`) → регистрация в `Container.wireTreeView` → суффикс `contextValue` — только в `TreeNode`.
 - **Новый view/webview:** класс в `ui/views/<Имя>ViewProvider.ts` (без XML/FS) → данные готовит отдельный сервис → создание и команда открытия через `Container`.
@@ -848,6 +870,12 @@ Vue-приложения (сборка `vite.webview.config.ts`, проверк�
 14. Сегмент `Ext` в `resolveOwnerXmlForExtContent` ищется по первому вхождению: объект/папка с именем `Ext`
     даст режим `None`.
 15. `SupportInfoService.loadConfig` не обрабатывает `EBUSY` при чтении bin (платформа может держать файл).
+16. Правка ролей (`edit_role`): пресеты прав не фильтруются через `isAllowedRight` для вложенных объектов;
+    `removeObject` при дублях имени удаляет только первое вхождение; смешанная форма `Подсистема.A.Подсистема.B`
+    не отбивается strict-режимом.
+17. `infra/xml/XmlUtils.ts` — 841 строка (выше ориентира ~800): кандидат на вынос `XmlRootElement.ts`
+    (`sliceToRootElement`/`rootLocalNamePattern`). `buildEmptyRightsXml` (`auxiliaryFileBuilders.ts`) дублирует
+    раскладку `RightsXmlRender`.
 
 ## `.cursor/`, `.codex/`, `.claude/skills/` — это доменные 1С-скилы, а не разработка расширения
 

@@ -157,6 +157,61 @@ export class MetaPathResolver {
     return this.resolveFormXmlByDescriptor(this.resolveChildFormDescriptor(ownerObjectXmlPath, formName));
   }
 
+  /**
+   * Тело макета по его дескриптору: `<dir>/<имя>/Ext/Template.xml`.
+   * Явная арифметика без ФС — по той же причине, что и у формы
+   * ({@link resolveFormXmlByDescriptor}): эвристика раскладки ломается на макете
+   * с именем `Templates`.
+   */
+  resolveTemplateBodyByDescriptor(descriptorXmlPath: string): string {
+    const dir = path.dirname(descriptorXmlPath);
+    const templateName = path.basename(descriptorXmlPath, '.xml');
+    return path.join(dir, templateName, 'Ext', 'Template.xml');
+  }
+
+  /** Дескриптор макета объекта: `<каталог объекта>/Templates/<Имя>.xml`. */
+  resolveChildTemplateDescriptor(ownerObjectXmlPath: string, templateName: string): string {
+    const loc = getObjectLocationFromXml(ownerObjectXmlPath);
+    return path.join(loc.objectDir, 'Templates', `${templateName}.xml`);
+  }
+
+  /** Тело макета объекта по XML владельца и имени макета. */
+  resolveChildTemplateBody(ownerObjectXmlPath: string, templateName: string): string {
+    return this.resolveTemplateBodyByDescriptor(this.resolveChildTemplateDescriptor(ownerObjectXmlPath, templateName));
+  }
+
+  /**
+   * Путь тела макета по любому входу инструмента: каталог макета, тело или дескриптор.
+   * Существование результата НЕ проверяется — чтение и запись решают это сами.
+   *
+   * Порядок веток важен. Дескриптор тоже оканчивается на `.xml`, поэтому сначала
+   * распознаётся тело; `<dir>/Template.xml` вне `Ext` считается телом, только если
+   * рядом действительно лежит `Ext/Template.xml` — иначе это дескриптор макета с
+   * именем `Template`. Любой иной `.xml` — дескриптор, даже существующий: прежние
+   * копии подменяли путь лишь при отсутствии входного файла и отдавали дескриптор
+   * как тело, а `compile_*` затирали им метаданные макета.
+   */
+  resolveTemplateBodyPath(inputPath: string): string {
+    const resolved = path.resolve(inputPath);
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+      return path.join(resolved, 'Ext', 'Template.xml');
+    }
+    const dir = path.dirname(resolved);
+    if (path.basename(resolved) === 'Template.xml') {
+      if (path.basename(dir) === 'Ext') {
+        return resolved;
+      }
+      const nested = path.join(dir, 'Ext', 'Template.xml');
+      if (fs.existsSync(nested)) {
+        return nested;
+      }
+    }
+    if (resolved.endsWith('.xml')) {
+      return this.resolveTemplateBodyByDescriptor(resolved);
+    }
+    throw new Error(`Путь не указывает на макет (каталог, дескриптор .xml или Ext/Template.xml): ${inputPath}`);
+  }
+
   private kindLabel(kind: string): string {
     try {
       return getMetaLabel(kind as MetaKind);
@@ -341,6 +396,26 @@ export function resolveChildFormDescriptor(ownerObjectXmlPath: string, formName:
 /** Тело формы объекта — см. {@link MetaPathResolver.resolveChildFormXml}. */
 export function resolveChildFormXml(ownerObjectXmlPath: string, formName: string): string {
   return singleton.resolveChildFormXml(ownerObjectXmlPath, formName);
+}
+
+/** Тело макета по его дескриптору — см. {@link MetaPathResolver.resolveTemplateBodyByDescriptor}. */
+export function resolveTemplateBodyByDescriptor(descriptorXmlPath: string): string {
+  return singleton.resolveTemplateBodyByDescriptor(descriptorXmlPath);
+}
+
+/** Дескриптор макета объекта — см. {@link MetaPathResolver.resolveChildTemplateDescriptor}. */
+export function resolveChildTemplateDescriptor(ownerObjectXmlPath: string, templateName: string): string {
+  return singleton.resolveChildTemplateDescriptor(ownerObjectXmlPath, templateName);
+}
+
+/** Тело макета объекта — см. {@link MetaPathResolver.resolveChildTemplateBody}. */
+export function resolveChildTemplateBody(ownerObjectXmlPath: string, templateName: string): string {
+  return singleton.resolveChildTemplateBody(ownerObjectXmlPath, templateName);
+}
+
+/** Путь тела макета по любому входу — см. {@link MetaPathResolver.resolveTemplateBodyPath}. */
+export function resolveTemplateBodyPath(inputPath: string): string {
+  return singleton.resolveTemplateBodyPath(inputPath);
 }
 
 export function getFormModulePathForChild(node: NodeLike): string | null {

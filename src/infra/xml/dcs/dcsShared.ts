@@ -1,30 +1,4 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { escapeXmlText, unescapeXml } from '../XmlUtils';
-
-export function resolveTemplateContentPath(inputPath: string): string {
-  let target = path.resolve(inputPath);
-  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
-    target = path.join(target, 'Ext', 'Template.xml');
-  }
-  if (!fs.existsSync(target) && path.basename(target) === 'Template.xml') {
-    const ext = path.join(path.dirname(target), 'Ext', 'Template.xml');
-    if (fs.existsSync(ext)) {
-      target = ext;
-    }
-  }
-  if (!fs.existsSync(target) && target.endsWith('.xml')) {
-    const stem = path.basename(target, '.xml');
-    const nested = path.join(path.dirname(target), stem, 'Ext', 'Template.xml');
-    if (fs.existsSync(nested)) {
-      target = nested;
-    }
-  }
-  if (!fs.existsSync(target)) {
-    throw new Error(`Template.xml СКД не найден: ${target}`);
-  }
-  return target;
-}
 
 export function resolveType(type: string): string {
   const aliases: Record<string, string> = { строка: 'string', число: 'decimal', булево: 'boolean', дата: 'date', bool: 'boolean', int: 'decimal', number: 'decimal' };

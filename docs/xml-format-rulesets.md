@@ -904,6 +904,53 @@ ns-префикс и атрибуты (`[A-Za-z_][\w.:-]*` плюс опцион
 Примечание о статусе: цифры — замеры по корпусу и прямые прогоны кода поверх скомпилированного `out/`;
 полный прогон набора тестов по этому кластеру отложен до конца бэклога и не выполнялся.
 
+## Rights.xml роли: точечная правка и правила прав
+
+`edit_role` правит `Roles/<Имя>/Ext/Rights.xml` точечным splice, а не пересборкой документа:
+`infra/xml/role/RightsXmlDocument.ts` (механика: ленивый разбор только затронутых объектов, нетронутые
+байты копируются как есть) и `infra/xml/role/RightsXmlRender.ts` (единые рендеры блоков;
+`serializeRightsXml` - для `compile_role`, корень с `xsi:type="Rights"`).
+
+**Формат по замерам эталона 2.20 (826 `Rights.xml`):** `xsi:type` на корне - 826/826; BOM - 826/826;
+хвостового перевода строки - 0; `<field>` - 15 в 2 файлах; `<condition/>` - 1; сущности `&amp;` 139 499,
+`&lt;` 59 573, `&gt;` 36 397; имя корневого объекта конфигурации `Configuration.<Имя>` - 704, голого
+`Configuration` - 0.
+
+**Инварианты (иначе правка роли даёт шум в git-диффе):**
+- no-op (`applied: 0`) файл не пишет;
+- повтор уже выданного права - байт-в-байт;
+- сущности не экранируются повторно (`&amp;` не превращается в `&amp;amp;`);
+- сохраняются `xsi:type`, `<field>`, `<condition/>`, BOM, EOL и отсутствие хвостового перевода строки;
+- существующие объекты и права не переупорядочиваются - новое только дописывается.
+
+Файл до 24 МБ читается целиком осознанно: роль - не файл размером с ГБ, потоковый разбор для splice не
+нужен.
+
+**Имена объектов (`resolveRoleObjectName`, `infra/role/RoleRightsCatalog.ts`).** Перевод позиционный
+по сегментам: английская форма; канон MCP во множественном числе (из `META_TYPES.pathSegment`);
+legacy единственное число (`LEGACY_SINGULAR_ROOT_ALIASES` - согласованное с пользователем исключение из
+запрета №2 на параллельные словари); вложенные виды - из `CHILD_TAG_CONFIG`.
+`Подсистема.A.B` -> `Subsystem.A.Subsystem.B`. `Configuration`/`Конфигурация`/`Configuration.*` ->
+`Configuration.<Имя конфигурации>` (голого `Configuration` в эталоне 0). Вложенные виды без русского
+канона (`Operation`, `IntegrationServiceChannel`, `AccountingFlag`, `ExtDimensionAccountingFlag`,
+`StandardTabularSection`) принимаются только по-английски. Режимы асимметричны намеренно: grant/compile -
+`strict` (ошибка без записи), revoke/setRls - `lenient` (позволяет удалить мусор, оставшийся от старого
+дефекта, например `Справочники.Банки`).
+
+**Правила прав - снимаются с эталона.** `KNOWN_RIGHTS` (права по виду объекта) снят с корпуса;
+дополнения: история данных и `InteractiveDeleteMarked` у `BusinessProcess`/`Task`/`ChartOfCalculationTypes`/
+`ChartOfAccounts`, `ExclusiveModeTerminationAtSessionStart` у `Configuration`. Вложенные объекты -
+`NESTED_KIND_RIGHTS`: `Operation`/`Method`/`IntegrationServiceChannel` - `Use`; `Command`/`Subsystem` -
+`View`; прочие вложенные - `View`/`Edit` (контейнеры - `NESTED_CONTAINER_KINDS`). Единственный предикат
+допустимости для edit/compile/validate - `isAllowedRight`; второй список заводить нельзя. Корпусный
+гейт - `roleRightsCorpus.test.ts`.
+
+**Известные ограничения:**
+- дубли имени объекта в файле: работа идёт с первым вхождением (`removeObject` удаляет только его);
+- смешанные EOL нормализуются `writeTextFilePreservingBomAndEol`;
+- пресеты прав не фильтруются через `isAllowedRight` для вложенных объектов;
+- смешанная форма `Подсистема.A.Подсистема.B` strict-режимом не отбивается.
+
 ## Кодировка `encoding` в декларации генерируемых файлов
 
 Генераторы XML (`MetadataXmlCreator` и соседние `infra/xml/creator/*`, `RoleRightsXml`,

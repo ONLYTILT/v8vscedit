@@ -250,7 +250,7 @@ export const EXTENSION_MCP_TOOLS: readonly AiMcpToolInfo[] = [
   {
     profile: 'extension',
     name: 'v8vscedit_edit_role',
-    description: 'Точечное редактирование прав роли в Rights.xml: grant/revoke/setRls/setFlags/addTemplate/removeTemplate.',
+    description: 'Точечное редактирование прав роли в Rights.xml (grant/revoke/setRls/setFlags/addTemplate/removeTemplate); объекты — Catalog.X, Справочники.X или Справочник.X; повтор выданного права файл не меняет.',
     requirement: 'Канонический путь роли (Роли.БазовыеПрава); роль не заблокирована поддержкой и хранилищем',
   },
   {

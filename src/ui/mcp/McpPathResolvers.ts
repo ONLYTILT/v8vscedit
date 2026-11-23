@@ -5,6 +5,7 @@ import {
 } from '../../domain/CanonicalNames';
 import { getMetaFolder, type MetaKind } from '../../domain/MetaTypes';
 import { resolveFormBodyFromNode, resolveObjectFormNodeParts } from '../tree/formNodePaths';
+import { resolveTemplateBodyFromNode, type ExpectedTemplateType, type TemplateBodyIntent } from '../tree/templateNodePaths';
 import type { MetadataNode } from '../tree/TreeNode';
 import type { McpMetadataPathService } from './McpMetadataPathService';
 
@@ -66,25 +67,19 @@ export function resolveObjectFormNodeByCanonical(
 }
 
 /**
- * Резолвит канонический путь макета (`Справочники.X.Макет.Y` или
- * `ОбщиеМакеты.X`) в путь к XML-файлу макета.
+ * Резолвит канонический путь макета (`Справочники.X.Макет.Y` или `ОбщиеМакеты.X`)
+ * в путь к ТЕЛУ макета (`…/Ext/Template.xml`), а не к дескриптору. Деривация и
+ * проверка типа — общий адаптер `ui/tree/templateNodePaths` (тот же код у команд
+ * навигатора).
  */
-export function resolveTemplateXmlByCanonical(
+export function resolveTemplateBodyByCanonical(
   paths: McpMetadataPathService,
   canonical: string,
-  configuration?: string,
+  configuration: string | undefined,
+  expected: ExpectedTemplateType | undefined,
+  intent: TemplateBodyIntent,
 ): string {
-  const node = paths.resolveNode(canonical, configuration);
-  if (node.nodeKind !== 'Template' && node.nodeKind !== 'CommonTemplate') {
-    throw new Error(
-      `Путь "${canonical}" должен указывать на макет (Справочники.X.Макет.Y или ОбщиеМакеты.X), ` +
-      `получено ${node.nodeKind}.`,
-    );
-  }
-  if (!node.xmlPath) {
-    throw new Error(`Макет "${canonical}" не имеет XML-файла.`);
-  }
-  return node.xmlPath;
+  return resolveTemplateBodyFromNode(paths.resolveNode(canonical, configuration), canonical, expected, intent);
 }
 
 /**

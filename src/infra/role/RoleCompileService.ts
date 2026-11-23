@@ -1,14 +1,16 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { writeFileAtomic } from '../fs/AtomicFileWriter';
 import { ConfigurationXmlEditor } from '../xml/ConfigurationXmlEditor';
+import { isAllowedRight, resolveRoleObjectName, type RoleNameContext } from './RoleRightsCatalog';
 import {
   PRESETS,
   detectFormatVersion,
   escapeXml,
   getObjectType,
+  readConfigurationName,
   serializeRightsXml,
-  translateObjectName,
   translateRightName,
   type SerializableRoleObject,
 } from './RoleRightsXml';
@@ -50,11 +52,22 @@ export class RoleCompileService {
 
     const formatVersion = detectFormatVersion(configDir);
     const warnings: string[] = [];
-    const objects = parseRoleObjects(definition.objects ?? definition.rights ?? [], warnings);
+    // Имена разбираются строго и ДО любой записи: роль с именем, которого платформа не
+    // знает, не загрузится, а наполовину созданная роль осталась бы мусором в выгрузке.
+    const errors: string[] = [];
+    const objects = parseRoleObjects(
+      definition.objects ?? definition.rights ?? [],
+      { configurationName: readConfigurationName(configDir) },
+      warnings,
+      errors,
+    );
+    if (errors.length > 0) {
+      throw new Error(errors.join('\n'));
+    }
     fs.mkdirSync(path.dirname(rightsPath), { recursive: true });
     fs.mkdirSync(rolesDir, { recursive: true });
-    fs.writeFileSync(metadataPath, buildRoleMetadataXml(definition, formatVersion), 'utf-8');
-    fs.writeFileSync(rightsPath, buildRightsXml(definition, objects, formatVersion), 'utf-8');
+    writeFileAtomic(metadataPath, buildRoleMetadataXml(definition, formatVersion));
+    writeFileAtomic(rightsPath, buildRightsXml(definition, objects, formatVersion));
     const changedFiles = [metadataPath, rightsPath];
 
     const configXmlPath = path.join(configDir, 'Configuration.xml');
@@ -75,32 +88,67 @@ export class RoleCompileService {
   }
 }
 
-function parseRoleObjects(entries: readonly RoleObjectDefinition[], warnings: string[]): ParsedObjectDefinition[] {
+function parseRoleObjects(
+  entries: readonly RoleObjectDefinition[],
+  ctx: RoleNameContext,
+  warnings: string[],
+  errors: string[],
+): ParsedObjectDefinition[] {
   return entries
-    .map((entry) => parseRoleObject(entry, warnings))
+    .map((entry) => parseRoleObject(entry, ctx, warnings, errors))
     .filter((item): item is ParsedObjectDefinition => Boolean(item));
 }
 
-function parseRoleObject(entry: RoleObjectDefinition, warnings: string[]): ParsedObjectDefinition | null {
+function resolveObjectName(raw: string, ctx: RoleNameContext, errors: string[]): string | null {
+  const resolved = resolveRoleObjectName(raw, ctx, 'strict');
+  if ('error' in resolved) {
+    errors.push(resolved.error);
+    return null;
+  }
+  return resolved.name;
+}
+
+/** Неизвестное право известного вида — предупреждение и пропуск, как у edit_role. */
+function keepAllowed(objectName: string, rightName: string, warnings: string[]): boolean {
+  if (isAllowedRight(objectName, rightName)) {
+    return true;
+  }
+  warnings.push(`${objectName}: право "${rightName}" не существует в платформе 1С 8.3 и пропущено.`);
+  return false;
+}
+
+function parseRoleObject(
+  entry: RoleObjectDefinition,
+  ctx: RoleNameContext,
+  warnings: string[],
+  errors: string[],
+): ParsedObjectDefinition | null {
   if (typeof entry === 'string') {
     const index = entry.indexOf(':');
     if (index === -1) {
       warnings.push(`Некорректная строка прав: ${entry}`);
       return null;
     }
-    const objectName = translateObjectName(entry.slice(0, index).trim());
+    const objectName = resolveObjectName(entry.slice(0, index).trim(), ctx, errors);
+    if (!objectName) {
+      return null;
+    }
     const rightsText = entry.slice(index + 1).trim();
     const rightNames = rightsText.startsWith('@')
       ? resolvePreset(getObjectType(objectName), rightsText, warnings)
       : rightsText.split(',').map((item) => translateRightName(item.trim())).filter(Boolean);
     return {
       name: objectName,
-      rights: rightNames.map((name) => ({ name, value: 'true' })),
+      rights: rightNames.filter((name) => keepAllowed(objectName, name, warnings)).map((name) => ({ name, value: 'true' })),
     };
   }
-  const objectName = translateObjectName((entry.name ?? '').trim());
-  if (!objectName) {
+  const rawName = (entry.name ?? '').trim();
+  if (!rawName) {
     warnings.push('Объект прав без поля name пропущен.');
+    return null;
+  }
+  const objectName = resolveObjectName(rawName, ctx, errors);
+  if (!objectName) {
     return null;
   }
   const rights = new Map<string, ParsedRightDefinition>();
@@ -111,16 +159,20 @@ function parseRoleObject(entry: RoleObjectDefinition, warnings: string[]): Parse
     const items: readonly string[] = entry.rights;
     for (const item of items) {
       const rightName = translateRightName(item);
-      rights.set(rightName, { name: rightName, value: 'true' });
+      if (keepAllowed(objectName, rightName, warnings)) {
+        rights.set(rightName, { name: rightName, value: 'true' });
+      }
     }
   } else if (entry.rights) {
-    for (const [rawName, value] of Object.entries(entry.rights)) {
-      const rightName = translateRightName(rawName);
-      rights.set(rightName, { name: rightName, value: value ? 'true' : 'false' });
+    for (const [rawRight, value] of Object.entries(entry.rights)) {
+      const rightName = translateRightName(rawRight);
+      if (keepAllowed(objectName, rightName, warnings)) {
+        rights.set(rightName, { name: rightName, value: value ? 'true' : 'false' });
+      }
     }
   }
-  for (const [rawName, condition] of Object.entries(entry.rls ?? {})) {
-    const rightName = translateRightName(rawName);
+  for (const [rawRight, condition] of Object.entries(entry.rls ?? {})) {
+    const rightName = translateRightName(rawRight);
     const existing = rights.get(rightName);
     if (!existing) {
       warnings.push(`${objectName}: RLS задано для отсутствующего права ${rightName}.`);

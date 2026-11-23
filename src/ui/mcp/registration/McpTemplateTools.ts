@@ -7,7 +7,7 @@
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as z from 'zod/v4';
-import { resolveTemplateXmlByCanonical } from '../McpPathResolvers';
+import { resolveTemplateBodyByCanonical } from '../McpPathResolvers';
 import type { McpRegistrationDeps } from './McpRegistrationDeps';
 
 export function registerTemplateTools(server: McpServer, deps: McpRegistrationDeps): void {
@@ -31,7 +31,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
       }),
     },
     ({ path: canonical, configuration, ...rest }) => gate.wrap(() => {
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'SpreadsheetDocument', 'read');
       return services.mxlTemplateService.info({ ...rest, templatePath });
     })
   );
@@ -52,7 +52,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
       }),
     },
     ({ path: canonical, configuration, ...rest }) => gate.wrap(() => {
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'SpreadsheetDocument', 'read');
       return services.mxlTemplateService.validate({ ...rest, templatePath });
     })
   );
@@ -77,7 +77,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
     },
     (args) => gate.wrap(() => {
       gate.assertNodeEditable(paths.resolveNode(args.path, args.configuration));
-      const outputPath = resolveTemplateXmlByCanonical(paths, args.path, args.configuration);
+      const outputPath = resolveTemplateBodyByCanonical(paths, args.path, args.configuration, 'SpreadsheetDocument', 'write');
       // args.definition имеет тип any (z.any()); сервис нормализует данные внутри.
       const result = services.mxlTemplateService.compile({ ...args, outputPath });
       // Сервис бросает исключение при провале (перехват в wrap); дошли сюда — успех.
@@ -100,7 +100,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
       }),
     },
     ({ path: canonical, configuration }) => gate.wrap(() => {
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'SpreadsheetDocument', 'read');
       return services.mxlTemplateService.decompile({ templatePath });
     })
   );
@@ -123,7 +123,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
       }),
     },
     ({ path: canonical, configuration, ...rest }) => gate.wrap(() => {
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'DataCompositionSchema', 'read');
       return services.dataCompositionSchemaService.info({ ...rest, templatePath });
     })
   );
@@ -144,7 +144,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
       }),
     },
     ({ path: canonical, configuration, ...rest }) => gate.wrap(() => {
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'DataCompositionSchema', 'read');
       return services.dataCompositionSchemaService.validate({ ...rest, templatePath });
     })
   );
@@ -169,7 +169,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
     },
     (args) => gate.wrap(() => {
       gate.assertNodeEditable(paths.resolveNode(args.path, args.configuration));
-      const outputPath = resolveTemplateXmlByCanonical(paths, args.path, args.configuration);
+      const outputPath = resolveTemplateBodyByCanonical(paths, args.path, args.configuration, 'DataCompositionSchema', 'write');
       const result = services.dataCompositionSchemaService.compile({ ...args, outputPath });
       // Сервис бросает исключение при провале (перехват в wrap); дошли сюда — успех.
       gate.afterMutationIfSucceeded(result.changedFiles);
@@ -232,7 +232,7 @@ export function registerTemplateTools(server: McpServer, deps: McpRegistrationDe
     },
     ({ path: canonical, configuration, ...rest }) => gate.wrap(() => {
       gate.assertNodeEditable(paths.resolveNode(canonical, configuration));
-      const templatePath = resolveTemplateXmlByCanonical(paths, canonical, configuration);
+      const templatePath = resolveTemplateBodyByCanonical(paths, canonical, configuration, 'DataCompositionSchema', 'write');
       const result = services.dataCompositionSchemaService.edit({ ...rest, templatePath });
       // Сервис бросает исключение при провале (перехват в wrap); дошли сюда — успех.
       gate.afterMutationIfSucceeded(result.changedFiles);

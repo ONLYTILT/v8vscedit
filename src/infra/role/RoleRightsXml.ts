@@ -8,8 +8,9 @@ import {
   extractSimpleTag,
   extractSynonym,
 } from '../xml/XmlUtils';
+import { renderRightsDocument, type SerializableRoleRights } from '../xml/role/RightsXmlRender';
 
-export const RIGHTS_NS = 'http://v8.1c.ru/8.2/roles';
+export { RIGHTS_NS } from '../xml/role/RightsXmlRender';
 export const DEFAULT_FORMAT_VERSION = '2.18';
 
 export const parser = new XMLParser({
@@ -56,44 +57,6 @@ export interface ParsedRoleRights {
   readonly root: RightsXmlRoot;
 }
 
-export const TYPE_ALIASES: Readonly<Record<string, string>> = {
-  Справочник: 'Catalog',
-  Документ: 'Document',
-  РегистрСведений: 'InformationRegister',
-  РегистрНакопления: 'AccumulationRegister',
-  РегистрБухгалтерии: 'AccountingRegister',
-  РегистрРасчета: 'CalculationRegister',
-  Константа: 'Constant',
-  ПланСчетов: 'ChartOfAccounts',
-  ПланВидовХарактеристик: 'ChartOfCharacteristicTypes',
-  ПланВидовРасчета: 'ChartOfCalculationTypes',
-  ПланОбмена: 'ExchangePlan',
-  БизнесПроцесс: 'BusinessProcess',
-  Задача: 'Task',
-  Обработка: 'DataProcessor',
-  Отчет: 'Report',
-  ОбщаяФорма: 'CommonForm',
-  ОбщаяКоманда: 'CommonCommand',
-  Подсистема: 'Subsystem',
-  КритерийОтбора: 'FilterCriterion',
-  ЖурналДокументов: 'DocumentJournal',
-  Последовательность: 'Sequence',
-  ВебСервис: 'WebService',
-  HTTPСервис: 'HTTPService',
-  СервисИнтеграции: 'IntegrationService',
-  ПараметрСеанса: 'SessionParameter',
-  ОбщийРеквизит: 'CommonAttribute',
-  Конфигурация: 'Configuration',
-  Перечисление: 'Enum',
-  Реквизит: 'Attribute',
-  СтандартныйРеквизит: 'StandardAttribute',
-  ТабличнаяЧасть: 'TabularSection',
-  Измерение: 'Dimension',
-  Ресурс: 'Resource',
-  Команда: 'Command',
-  РеквизитАдресации: 'AddressingAttribute',
-};
-
 export const RIGHT_ALIASES: Readonly<Record<string, string>> = {
   Чтение: 'Read',
   Добавление: 'Insert',
@@ -117,65 +80,6 @@ export const RIGHT_ALIASES: Readonly<Record<string, string>> = {
   Вывод: 'Output',
   СохранениеДанныхПользователя: 'SaveUserData',
 };
-
-export const KNOWN_RIGHTS: Readonly<Partial<Record<string, readonly string[]>>> = {
-  Configuration: [
-    'Administration', 'DataAdministration', 'UpdateDataBaseConfiguration', 'ConfigurationExtensionsAdministration',
-    'ActiveUsers', 'EventLog', 'ViewEventLog', 'ExclusiveMode', 'ThinClient', 'ThickClient', 'WebClient', 'MobileClient',
-    'ExternalConnection', 'Automation', 'Output', 'OutputToPrinterFileClipboard', 'SaveUserData',
-    'TechnicalSpecialistMode', 'InteractiveOpenExtDataProcessors', 'InteractiveOpenExtReports',
-    'AllFunctionsMode', 'AnalyticsSystemClient', 'CollaborationSystemInfoBaseRegistration',
-    'MainWindowModeNormal', 'MainWindowModeWorkplace', 'MainWindowModeEmbeddedWorkplace',
-    'MainWindowModeFullscreenWorkplace', 'MainWindowModeKiosk',
-    'StartAutomation', 'StartThickClient', 'StartThinClient', 'StartWebClient',
-    'StartExternalConnection', 'StartMobileClient',
-  ],
-  Catalog: [
-    'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'InteractiveInsert',
-    'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeleteMarked',
-    'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData',
-    'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData',
-    'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData',
-    'ReadDataHistoryOfMissingData', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment',
-    'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
-  ],
-  Document: [
-    'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'Posting', 'UndoPosting',
-    'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete',
-    'InteractiveDeleteMarked', 'InteractivePosting', 'InteractivePostingRegular', 'InteractiveUndoPosting',
-    'InteractiveChangeOfPosted', 'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory',
-    'UpdateDataHistoryOfMissingData', 'ReadDataHistoryOfMissingData', 'UpdateDataHistorySettings',
-    'UpdateDataHistoryVersionComment', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
-  ],
-  InformationRegister: ['Read', 'Update', 'View', 'Edit', 'TotalsControl', 'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData', 'ReadDataHistoryOfMissingData', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion'],
-  AccumulationRegister: ['Read', 'Update', 'View', 'Edit', 'TotalsControl'],
-  AccountingRegister: ['Read', 'Update', 'View', 'Edit', 'TotalsControl'],
-  CalculationRegister: ['Read', 'View'],
-  Constant: ['Read', 'Update', 'View', 'Edit', 'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion'],
-  ChartOfAccounts: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData', 'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData', 'ReadDataHistory', 'ReadDataHistoryOfMissingData', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment'],
-  ChartOfCharacteristicTypes: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeleteMarked', 'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData', 'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData', 'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory', 'ReadDataHistoryOfMissingData', 'UpdateDataHistoryOfMissingData', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion'],
-  ChartOfCalculationTypes: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData', 'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData'],
-  ExchangePlan: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeleteMarked', 'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory', 'ReadDataHistoryOfMissingData', 'UpdateDataHistoryOfMissingData', 'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion'],
-  BusinessProcess: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'Start', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveActivate', 'InteractiveStart'],
-  Task: ['Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString', 'Execute', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveActivate', 'InteractiveExecute'],
-  DataProcessor: ['Use', 'View'],
-  Report: ['Use', 'View'],
-  CommonForm: ['View'],
-  CommonCommand: ['View'],
-  Subsystem: ['View'],
-  FilterCriterion: ['View'],
-  DocumentJournal: ['Read', 'View'],
-  Sequence: ['Read', 'Update'],
-  WebService: ['Use'],
-  HTTPService: ['Use'],
-  IntegrationService: ['Use'],
-  SessionParameter: ['Get', 'Set'],
-  CommonAttribute: ['View', 'Edit'],
-};
-
-export const NESTED_RIGHTS = ['View', 'Edit'] as const;
-export const COMMAND_RIGHTS = ['View'] as const;
-export const CHANNEL_RIGHTS = ['Use'] as const;
 
 export const PRESETS: Readonly<Partial<Record<string, Readonly<Partial<Record<string, readonly string[]>>>>>> = {
   view: {
@@ -298,27 +202,12 @@ export function inferRoleFolderName(rightsPath: string): string {
   return path.basename(path.dirname(path.dirname(rightsPath)));
 }
 
-export function translateObjectName(name: string): string {
-  const translated = name.split('.').map((part) => TYPE_ALIASES[part] ?? part).join('.');
-  // У прав на корень конфигурации в 1С имя — просто "Configuration".
-  // Агенты часто пишут "Configuration.Configuration" по аналогии с другими
-  // объектами, но платформа на загрузке "повисает", не находя такой объект.
-  if (/^Configuration(?:\.[^.]+)?$/.test(translated)) {
-    return 'Configuration';
-  }
-  return translated;
-}
-
 export function translateRightName(name: string): string {
   return RIGHT_ALIASES[name] ?? name;
 }
 
 export function getObjectType(objectName: string): string {
   return objectName.split('.')[0] ?? objectName;
-}
-
-export function isNestedObject(objectName: string): boolean {
-  return objectName.split('.').length >= 3;
 }
 
 export function asArray<T>(value: T | readonly T[] | undefined): readonly T[] {
@@ -337,6 +226,18 @@ export function escapeTextSearch(value: string): string {
   return escapeXmlText(value);
 }
 
+/**
+ * Имя конфигурации (`<Name>` из `Configuration.xml` каталога выгрузки) — нужно для
+ * объекта прав на корень: платформа пишет его как `Configuration.<Имя>`.
+ */
+export function readConfigurationName(configDir: string): string | undefined {
+  const configXmlPath = path.join(configDir, 'Configuration.xml');
+  if (!fs.existsSync(configXmlPath)) {
+    return undefined;
+  }
+  return extractSimpleTag(fs.readFileSync(configXmlPath, 'utf-8'), 'Name');
+}
+
 export function detectFormatVersion(configDir: string): string {
   const configXmlPath = path.join(configDir, 'Configuration.xml');
   if (!fs.existsSync(configXmlPath)) {
@@ -345,60 +246,16 @@ export function detectFormatVersion(configDir: string): string {
   return extractMetaDataObjectVersion(fs.readFileSync(configXmlPath, 'utf-8')) ?? DEFAULT_FORMAT_VERSION;
 }
 
-export interface SerializableRoleRight {
-  readonly name: string;
-  readonly value: 'true' | 'false';
-  readonly condition?: string;
-}
+export type {
+  SerializableRoleObject,
+  SerializableRoleRight,
+  SerializableRoleRights,
+  SerializableRoleTemplate,
+} from '../xml/role/RightsXmlRender';
 
-export interface SerializableRoleObject {
-  readonly name: string;
-  readonly rights: readonly SerializableRoleRight[];
-}
-
-export interface SerializableRoleTemplate {
-  readonly name: string;
-  readonly condition: string;
-}
-
-export interface SerializableRoleRights {
-  readonly setForNewObjects: boolean;
-  readonly setForAttributesByDefault: boolean;
-  readonly independentRightsOfChildObjects: boolean;
-  readonly objects: readonly SerializableRoleObject[];
-  readonly templates: readonly SerializableRoleTemplate[];
-  readonly formatVersion: string;
-}
-
+/** Новый Rights.xml целиком (compile_role); раскладка — общий рендер с edit_role. */
 export function serializeRightsXml(rights: SerializableRoleRights): string {
-  const lines: string[] = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    `<Rights xmlns="${RIGHTS_NS}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="${escapeXml(rights.formatVersion)}">`,
-    `\t<setForNewObjects>${String(rights.setForNewObjects)}</setForNewObjects>`,
-    `\t<setForAttributesByDefault>${String(rights.setForAttributesByDefault)}</setForAttributesByDefault>`,
-    `\t<independentRightsOfChildObjects>${String(rights.independentRightsOfChildObjects)}</independentRightsOfChildObjects>`,
-  ];
-  for (const object of rights.objects) {
-    lines.push('\t<object>', `\t\t<name>${escapeXmlText(object.name)}</name>`);
-    for (const right of object.rights) {
-      lines.push('\t\t<right>', `\t\t\t<name>${escapeXmlText(right.name)}</name>`, `\t\t\t<value>${right.value}</value>`);
-      if (right.condition) {
-        lines.push('\t\t\t<restrictionByCondition>', `\t\t\t\t<condition>${escapeXmlText(right.condition)}</condition>`, '\t\t\t</restrictionByCondition>');
-      }
-      lines.push('\t\t</right>');
-    }
-    lines.push('\t</object>');
-  }
-  for (const template of rights.templates) {
-    lines.push(
-      '\t<restrictionTemplate>',
-      `\t\t<name>${escapeXmlText(template.name)}</name>`,
-      `\t\t<condition>${escapeXmlText(template.condition)}</condition>`,
-      '\t</restrictionTemplate>'
-    );
-  }
-  lines.push('</Rights>', '');
-  return lines.join('\n');
+  return renderRightsDocument(rights, '\n');
 }
 
 export function paginate(lines: readonly string[], offset = 0, limit = 150): string[] {

@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { XMLValidator } from 'fast-xml-parser';
-import { escapeXmlAttribute, escapeXmlText, unescapeXml, writeTextFilePreservingBomAndEol } from './XmlUtils';
+import { readTemplateBody, resolveExistingTemplateBody, templateBodyRootError, writeTemplateBody } from './TemplateXml';
+import { escapeXmlAttribute, escapeXmlText, unescapeXml } from './XmlUtils';
 
 const SPREADSHEET_NS = 'http://v8.1c.ru/8.2/data/spreadsheet';
 
@@ -126,15 +127,7 @@ export interface MxlValidationResult {
 export class MxlTemplateService {
   compile(options: MxlCompileOptions): MxlCompileResult {
     const definition = normalizeDefinition(options.definition);
-    const templatePath = path.resolve(options.outputPath);
-    const xml = buildSpreadsheetXml(definition);
-    fs.mkdirSync(path.dirname(templatePath), { recursive: true });
-    const previous = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, 'utf-8') : '';
-    if (previous) {
-      writeTextFilePreservingBomAndEol(templatePath, previous, xml);
-    } else {
-      fs.writeFileSync(templatePath, xml, 'utf-8');
-    }
+    const templatePath = writeTemplateBody(options.outputPath, buildSpreadsheetXml(definition));
     return {
       templatePath,
       changedFiles: [templatePath],
@@ -169,8 +162,7 @@ export class MxlTemplateService {
   }
 
   info(options: MxlInfoOptions): MxlInfoResult {
-    const templatePath = resolveTemplateContentPath(options.templatePath);
-    const xml = fs.readFileSync(templatePath, 'utf-8');
+    const { path: templatePath, xml } = readTemplateBody(options.templatePath);
     const rows = parseRows(xml);
     const rowMap = new Map(rows.map((row) => [row.index, row]));
     const height = readInt(xml, 'height') || rows.length;
@@ -205,7 +197,7 @@ export class MxlTemplateService {
   }
 
   validate(options: MxlValidationOptions): MxlValidationResult {
-    const templatePath = resolveTemplateContentPath(options.templatePath);
+    const templatePath = resolveExistingTemplateBody(options.templatePath);
     const xml = fs.readFileSync(templatePath, 'utf-8');
     const maxErrors = options.maxErrors ?? 20;
     const issues: MxlValidationIssue[] = [];
@@ -214,6 +206,11 @@ export class MxlTemplateService {
         issues.push({ severity, message });
       }
     };
+    const rootError = templateBodyRootError(xml, templatePath);
+    if (rootError) {
+      push('error', rootError);
+      return buildValidationResult(templatePath, issues, maxErrors);
+    }
     const syntax = XMLValidator.validate(xml);
     if (syntax !== true) {
       push('error', `XML не разобран: ${syntax.err.msg}`);
@@ -265,30 +262,6 @@ export class MxlTemplateService {
     }
     return buildValidationResult(templatePath, issues, maxErrors);
   }
-}
-
-function resolveTemplateContentPath(inputPath: string): string {
-  let target = path.resolve(inputPath);
-  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
-    target = path.join(target, 'Ext', 'Template.xml');
-  }
-  if (!fs.existsSync(target) && path.basename(target) === 'Template.xml') {
-    const ext = path.join(path.dirname(target), 'Ext', 'Template.xml');
-    if (fs.existsSync(ext)) {
-      target = ext;
-    }
-  }
-  if (!fs.existsSync(target) && target.endsWith('.xml')) {
-    const stem = path.basename(target, '.xml');
-    const nested = path.join(path.dirname(target), stem, 'Ext', 'Template.xml');
-    if (fs.existsSync(nested)) {
-      target = nested;
-    }
-  }
-  if (!fs.existsSync(target)) {
-    throw new Error(`Template.xml не найден: ${target}`);
-  }
-  return target;
 }
 
 function normalizeDefinition(definition: MxlDefinition): MxlDefinition {

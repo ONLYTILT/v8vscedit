@@ -2,17 +2,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { XMLValidator } from 'fast-xml-parser';
 import { extractSimpleTag, extractSynonym } from '../xml/XmlUtils';
+import { KNOWN_RIGHTS, isAllowedRight } from './RoleRightsCatalog';
 import {
-  COMMAND_RIGHTS,
-  CHANNEL_RIGHTS,
-  KNOWN_RIGHTS,
-  NESTED_RIGHTS,
   RIGHTS_NS,
   asArray,
   escapeTextSearch,
   getObjectType,
   inferRoleFolderName,
-  isNestedObject,
   parseRightsRoot,
   readRoleMetadata,
   resolveRightsXmlPath,
@@ -171,20 +167,29 @@ function inferRoleNameFromPath(inputPath: string): string {
   return path.basename(path.dirname(path.dirname(inputPath)));
 }
 
+function isNestedObject(objectName: string): boolean {
+  return objectName.split('.').length >= 3;
+}
+
+/** Критерий — общий с edit/compile (`isAllowedRight`); тексты предупреждений прежние. */
 function validateRightName(objectName: string, rightName: string, warn: (message: string) => void): void {
-  const objectType = getObjectType(objectName);
+  if (isAllowedRight(objectName, rightName)) {
+    return;
+  }
   if (isNestedObject(objectName)) {
-    if (objectName.includes('.Command.') && !COMMAND_RIGHTS.includes(rightName as 'View')) {
+    const parts = objectName.split('.');
+    const nestedKind = parts[parts.length - 2];
+    if (nestedKind === 'Command') {
       warn(`${objectName}: "${rightName}" не является правом команды.`);
-    } else if (objectName.includes('.IntegrationServiceChannel.') && !CHANNEL_RIGHTS.includes(rightName as 'Use')) {
+    } else if (nestedKind === 'IntegrationServiceChannel') {
       warn(`${objectName}: "${rightName}" не является правом канала сервиса интеграции.`);
-    } else if (!objectName.includes('.Command.') && !objectName.includes('.IntegrationServiceChannel.') && !NESTED_RIGHTS.includes(rightName as 'View' | 'Edit')) {
+    } else {
       warn(`${objectName}: "${rightName}" не является правом дочернего объекта.`);
     }
     return;
   }
-  const valid = KNOWN_RIGHTS[objectType];
-  if (valid && !valid.includes(rightName)) {
+  const valid = KNOWN_RIGHTS[getObjectType(objectName)];
+  if (valid) {
     const similar = valid.filter((item) => item.includes(rightName) || rightName.includes(item)).slice(0, 3);
     warn(`${objectName}: неизвестное право "${rightName}".${similar.length > 0 ? ` Возможно: ${similar.join(', ')}.` : ''}`);
   }

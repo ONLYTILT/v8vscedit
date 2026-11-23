@@ -243,6 +243,35 @@ MCP-серверу расширения, и разработчики этих а
 платформы проходит чисто» —
 [xml-format-rulesets.md](./xml-format-rulesets.md#formvalidateservice-платформенная-выгрузка-обязана-проходить-чисто).
 
+#### Макеты: тело и дескриптор
+
+Инструменты макетов (`mxl_info`, `validate_mxl`, `compile_mxl`, `decompile_mxl`, `skd_info`,
+`validate_skd`, `compile_skd`, `edit_skd`) и команды навигатора работают с **телом** макета —
+`Ext/Template.xml`. Дескриптор (`Templates/<Имя>.xml`: имя, синоним, `TemplateType`) им не нужен. Раньше
+инструменты получали дескриптор, а `compile_*` писали поверх него и затирали метаданные макета.
+Резолвер `resolveTemplateBodyByCanonical` (`ui/mcp/McpPathResolvers.ts`) возвращает именно тело:
+
+| Канонический путь | Тело макета (`Ext/Template.xml`) | Дескриптор |
+|---|---|---|
+| `Справочники.X.Макет.Y` | `Catalogs/X/Templates/Y/Ext/Template.xml` | `Catalogs/X/Templates/Y.xml` |
+| `ОбщиеМакеты.X` | `CommonTemplates/X/Ext/Template.xml` | `CommonTemplates/X.xml` |
+
+- **`node.xmlPath` узла `Template` — дескриптор** (а если дескриптора нет — XML владельца); в арифметике
+  тела он не участвует. Арифметика живёт в `MetaPathResolver` (`resolveTemplateBodyByDescriptor`,
+  `resolveChildTemplateDescriptor`, `resolveChildTemplateBody`, `resolveTemplateBodyPath` — единая замена
+  двух прежних копий `resolveTemplateContentPath`) и подаётся единым адаптером
+  `ui/tree/templateNodePaths.ts` (`resolveTemplateNodeParts`/`resolveTemplateBodyFromNode`) — его зовут и
+  MCP, и `TemplateToolsCommands`.
+- **Проверка типа макета.** Тип берётся из `TemplateType` дескриптора: `mxl_*` принимают только
+  табличный документ, `skd_*` — только схему компоновки данных; несовпадение — ошибка. Нераспознанный
+  тип проверку пропускает (ложный отказ дороже).
+- **Чтение и запись без дескриптора.** Чтение (`intent: 'read'`) макета без дескриптора допустимо —
+  безвредно. Запись (`'write'`) — отказ с подсказкой `v8vscedit_add_template`: тело без метаданных
+  платформа не загрузит.
+- **Guard по содержимому** — `infra/xml/TemplateXml.ts`: `readTemplateBody`/`assertTemplateBodyRoot`/
+  `writeTemplateBody`. Если на месте тела лежит дескриптор (корень `MetaDataObject`), запись отклоняется;
+  новое тело пишется атомарно.
+
 ### 2.6. Расширенные примеры путей
 
 ```text
@@ -626,7 +655,7 @@ MCP-инструменты принимают только канон. Люба�
 | `v8vscedit_role_info` | Права, RLS и шаблоны из Rights.xml. | `Роли.X` |
 | `v8vscedit_validate_role` | Валидирует Rights.xml и регистрацию роли. | `Роли.X` |
 | `v8vscedit_compile_role` | Создаёт роль и регистрирует в Configuration.xml. | `parentPath = Конфигурация / Расширение` |
-| `v8vscedit_edit_role` | Точечное редактирование прав роли. | `Роли.X` |
+| `v8vscedit_edit_role` | Точечное (splice) редактирование прав роли; имена объектов - канон во множественном числе, английская форма или legacy единственное число (`Справочник.X`), `Подсистема.A.B`, `Конфигурация`; см. xml-format-rulesets.md. | `Роли.X` |
 | `v8vscedit_list_default_roles` | Список `<DefaultRoles>` из Configuration.xml. | `Конфигурация` / `Расширение` |
 | `v8vscedit_add_default_role` | Добавляет роль в `<DefaultRoles>`. | `Конфигурация` / `Расширение` |
 | `v8vscedit_remove_default_role` | Удаляет роль из `<DefaultRoles>`. | `Конфигурация` / `Расширение` |

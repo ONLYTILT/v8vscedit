@@ -232,6 +232,40 @@ export function escapeRegExp(value: string): string {
 }
 
 /**
+ * Первый элемент документа: снимает BOM, пролог `<?xml …?>`, пробелы и XML-комментарии.
+ * `null` — оборванный пролог/комментарий, решение по корню принять нельзя; пустая строка —
+ * документ пуст. Общая точка для guard'ов корня тела формы и тела макета.
+ */
+export function sliceToRootElement(xml: string): string | null {
+  let rest = xml.startsWith('﻿') ? xml.slice(1) : xml;
+  for (;;) {
+    rest = rest.replace(/^\s+/, '');
+    if (rest.startsWith('<?')) {
+      const end = rest.indexOf('?>');
+      if (end < 0) {
+        return null;
+      }
+      rest = rest.slice(end + 2);
+      continue;
+    }
+    if (rest.startsWith('<!--')) {
+      const end = rest.indexOf('-->', 4);
+      if (end < 0) {
+        return null;
+      }
+      rest = rest.slice(end + 3);
+      continue;
+    }
+    return rest;
+  }
+}
+
+/** Локальное имя первого тега: префикс пространства (`lf:Form`) допустим. */
+export function rootLocalNamePattern(localName: string): RegExp {
+  return new RegExp(`^<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?${localName}(?=[\\s/>])`);
+}
+
+/**
  * Извлекает версию формата из атрибута `version="…"` корневого тега
  * `<MetaDataObject>` (единый примитив, дедупликация 5a-5). Только текстовое
  * извлечение по границе имени тега — политику поиска Configuration.xml

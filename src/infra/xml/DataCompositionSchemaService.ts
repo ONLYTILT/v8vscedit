@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { XMLValidator } from 'fast-xml-parser';
+import { readTemplateBody, resolveExistingTemplateBody, templateBodyRootError, writeTemplateBody } from './TemplateXml';
 import { writeTextFilePreservingBomAndEol } from './XmlUtils';
-import { resolveTemplateContentPath } from './dcs/dcsShared';
 import { buildSchemaXml } from './dcs/schemaBuilders';
 import { applyEdit } from './dcs/editOperations';
 import { buildInfoLines, parseSchema } from './dcs/schemaParse';
@@ -211,15 +210,7 @@ export interface SkdValidationResult {
 
 export class DataCompositionSchemaService {
   compile(options: SkdCompileOptions): SkdCompileResult {
-    const templatePath = path.resolve(options.outputPath);
-    const xml = buildSchemaXml(options.definition);
-    fs.mkdirSync(path.dirname(templatePath), { recursive: true });
-    const previous = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, 'utf-8') : '';
-    if (previous) {
-      writeTextFilePreservingBomAndEol(templatePath, previous, xml);
-    } else {
-      fs.writeFileSync(templatePath, xml, 'utf-8');
-    }
+    const templatePath = writeTemplateBody(options.outputPath, buildSchemaXml(options.definition));
     const info = this.info({ templatePath });
     return {
       templatePath,
@@ -230,8 +221,7 @@ export class DataCompositionSchemaService {
   }
 
   info(options: SkdInfoOptions): SkdInfoResult {
-    const templatePath = resolveTemplateContentPath(options.templatePath);
-    const xml = fs.readFileSync(templatePath, 'utf-8');
+    const { path: templatePath, xml } = readTemplateBody(options.templatePath);
     const parsed = parseSchema(xml);
     return {
       templatePath,
@@ -241,8 +231,7 @@ export class DataCompositionSchemaService {
   }
 
   edit(options: SkdEditOptions): SkdEditResult {
-    const templatePath = resolveTemplateContentPath(options.templatePath);
-    const original = fs.readFileSync(templatePath, 'utf-8');
+    const { path: templatePath, xml: original } = readTemplateBody(options.templatePath);
     let xml = original;
     const warnings: string[] = [];
     const lines: string[] = [];
@@ -268,7 +257,7 @@ export class DataCompositionSchemaService {
   }
 
   validate(options: SkdValidationOptions): SkdValidationResult {
-    const templatePath = resolveTemplateContentPath(options.templatePath);
+    const templatePath = resolveExistingTemplateBody(options.templatePath);
     const xml = fs.readFileSync(templatePath, 'utf-8');
     const maxErrors = options.maxErrors ?? 20;
     const issues: SkdValidationIssue[] = [];
@@ -277,6 +266,11 @@ export class DataCompositionSchemaService {
         issues.push({ severity, message });
       }
     };
+    const rootError = templateBodyRootError(xml, templatePath);
+    if (rootError) {
+      push('error', rootError);
+      return buildValidationResult(templatePath, issues, maxErrors);
+    }
     const syntax = XMLValidator.validate(xml);
     if (syntax !== true) {
       push('error', `XML не разобран: ${syntax.err.msg}`);

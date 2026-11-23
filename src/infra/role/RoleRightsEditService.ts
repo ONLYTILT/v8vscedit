@@ -1,19 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { parseRightsXmlDocument, type RightsXmlDocument } from '../xml/role/RightsXmlDocument';
 import { writeTextFilePreservingBomAndEol } from '../xml/XmlUtils';
+import { isAllowedRight, resolveRoleObjectName, type RoleNameContext } from './RoleRightsCatalog';
 import {
-  DEFAULT_FORMAT_VERSION,
-  KNOWN_RIGHTS,
   PRESETS,
-  asArray,
   getObjectType,
-  parseRightsRoot,
+  readConfigurationName,
   resolveRightsXmlPath,
-  serializeRightsXml,
-  translateObjectName,
   translateRightName,
-  type RightsXmlRoot,
-  type SerializableRoleObject,
 } from './RoleRightsXml';
 import type {
   RoleRightsEditOperation,
@@ -21,28 +16,28 @@ import type {
   RoleRightsEditResult,
 } from './types';
 
-interface RightEntry {
-  value: 'true' | 'false';
-  condition?: string;
+/** Итог одной операции: изменила ли она документ и что сказать агенту. */
+interface OperationOutcome {
+  readonly changed: boolean;
+  readonly warnings: readonly string[];
 }
 
-interface RoleRightsState {
-  setForNewObjects: boolean;
-  setForAttributesByDefault: boolean;
-  independentRightsOfChildObjects: boolean;
-  objects: Map<string, Map<string, RightEntry>>;
-  templates: Map<string, string>;
-  formatVersion: string;
-}
+type GrantOperation = Extract<RoleRightsEditOperation, { op: 'grant' }>;
+type RevokeOperation = Extract<RoleRightsEditOperation, { op: 'revoke' }>;
+type SetRlsOperation = Extract<RoleRightsEditOperation, { op: 'setRls' }>;
 
 /**
- * Точечное редактирование Rights.xml существующей роли:
- * выдача и снятие прав на объекты и их дочерние элементы (реквизиты,
- * табличные части, команды, каналы сервисов интеграции), управление RLS,
- * глобальными флагами и шаблонами ограничений.
+ * Точечное редактирование Rights.xml существующей роли (edit_role): выдача и снятие
+ * прав, RLS, глобальные флаги и шаблоны ограничений.
  *
- * Парсит Rights.xml в state, применяет операции, сериализует обратно через
- * общий serializeRightsXml — стиль и порядок такой же, как у role-compile.
+ * Файл правится splice'ом по диапазонам (`RightsXmlDocument`), а не пересборкой:
+ * повтор уже выданного права не должен трогать файл вовсе — ни байтов, ни mtime, —
+ * иначе git показывал бы «изменение» всей роли, а конфигурация помечалась бы
+ * изменённой на пустом месте.
+ *
+ * Файл читается целиком сознательно (эталонные роли — до 24 МБ): порог потоковой
+ * обработки 16 МиБ относится к ГБ-файлам выгрузки, которым структура не нужна, а
+ * правке XML нужен весь текст.
  */
 export class RoleRightsEditService {
   edit(options: RoleRightsEditOptions): RoleRightsEditResult {
@@ -50,23 +45,22 @@ export class RoleRightsEditService {
     if (!rightsPath) {
       return fail(options.rightsPath, `Rights.xml не найден: ${options.rightsPath}`);
     }
+    // Исходный текст — отдельной константой: он же эталон BOM/EOL при записи (CLAUDE.md, запрет №12).
     const original = fs.readFileSync(rightsPath, 'utf-8');
-    const root = parseRightsRoot(original);
-    if (!root) {
-      return fail(rightsPath, 'Не удалось распарсить Rights.xml.');
+    const document = parseRightsXmlDocument(original);
+    if ('error' in document) {
+      return fail(rightsPath, `Не удалось распарсить Rights.xml: ${document.error}`);
     }
 
-    const state = loadState(root);
+    const ctx = lazyNameContext(document, rightsPath);
     const warnings: string[] = [];
     const errors: string[] = [];
     let applied = 0;
-
     for (const operation of options.operations) {
-      const before = snapshotKey(state);
       try {
-        const opWarnings = applyOperation(state, operation);
-        warnings.push(...opWarnings);
-        if (snapshotKey(state) !== before) {
+        const outcome = applyOperation(document, operation, ctx);
+        warnings.push(...outcome.warnings);
+        if (outcome.changed) {
           applied += 1;
         }
       } catch (error) {
@@ -75,105 +69,63 @@ export class RoleRightsEditService {
     }
 
     if (errors.length > 0) {
-      return {
-        success: false,
-        changed: false,
-        rightsPath,
-        applied: 0,
-        changedFiles: [],
-        warnings,
-        errors,
-      };
+      return { success: false, changed: false, rightsPath, applied: 0, changedFiles: [], warnings, errors };
     }
-
-    const nextXml = serializeRightsXml({
-      setForNewObjects: state.setForNewObjects,
-      setForAttributesByDefault: state.setForAttributesByDefault,
-      independentRightsOfChildObjects: state.independentRightsOfChildObjects,
-      objects: stateToObjects(state),
-      templates: [...state.templates.entries()].map(([name, condition]) => ({ name, condition })),
-      formatVersion: state.formatVersion,
-    });
-
-    if (nextXml === original) {
-      return {
-        success: true,
-        changed: false,
-        rightsPath,
-        applied,
-        changedFiles: [],
-        warnings,
-        errors,
-      };
+    const next = document.render();
+    if (next === original) {
+      return { success: true, changed: false, rightsPath, applied, changedFiles: [], warnings, errors };
     }
-
-    writeTextFilePreservingBomAndEol(rightsPath, original, nextXml);
-    return {
-      success: true,
-      changed: true,
-      rightsPath,
-      applied,
-      changedFiles: [rightsPath],
-      warnings,
-      errors,
-    };
+    writeTextFilePreservingBomAndEol(rightsPath, original, next);
+    return { success: true, changed: true, rightsPath, applied, changedFiles: [rightsPath], warnings, errors };
   }
 }
 
-function loadState(root: RightsXmlRoot): RoleRightsState {
-  const state: RoleRightsState = {
-    setForNewObjects: parseFlag(root.setForNewObjects, false),
-    setForAttributesByDefault: parseFlag(root.setForAttributesByDefault, true),
-    independentRightsOfChildObjects: parseFlag(root.independentRightsOfChildObjects, false),
-    objects: new Map(),
-    templates: new Map(),
-    formatVersion: root['@_version'] ?? DEFAULT_FORMAT_VERSION,
-  };
-  for (const object of asArray(root.object)) {
-    const name = object.name?.trim();
-    if (!name) {
-      continue;
-    }
-    const rights = new Map<string, RightEntry>();
-    for (const right of asArray(object.right)) {
-      const rightName = right.name?.trim();
-      if (!rightName) {
-        continue;
+/**
+ * Имя конфигурации для `Configuration.*` вычисляется лениво: Configuration.xml большой
+ * конфигурации читать на каждый edit_role незачем. Приоритет — у объекта
+ * `Configuration.<Имя>`, уже записанного в роль (так платформа выгрузила именно эту базу).
+ */
+function lazyNameContext(document: RightsXmlDocument, rightsPath: string): RoleNameContext {
+  let resolved = false;
+  let name: string | undefined;
+  return {
+    get configurationName(): string | undefined {
+      if (!resolved) {
+        resolved = true;
+        const existing = document.objectNames().find((item) => item.startsWith('Configuration.'));
+        name = existing
+          ? existing.slice('Configuration.'.length)
+          : readConfigurationName(path.dirname(path.dirname(path.dirname(path.dirname(rightsPath)))));
       }
-      const value: 'true' | 'false' = right.value === 'true' ? 'true' : 'false';
-      const condition = right.restrictionByCondition?.condition;
-      rights.set(rightName, condition ? { value, condition } : { value });
-    }
-    state.objects.set(name, rights);
-  }
-  for (const template of asArray(root.restrictionTemplate)) {
-    const name = template.name?.trim();
-    if (!name) {
-      continue;
-    }
-    state.templates.set(name, template.condition ?? '');
-  }
-  return state;
+      return name;
+    },
+  };
 }
 
-function applyOperation(state: RoleRightsState, operation: RoleRightsEditOperation): string[] {
+function applyOperation(document: RightsXmlDocument, operation: RoleRightsEditOperation, ctx: RoleNameContext): OperationOutcome {
   switch (operation.op) {
     case 'grant':
-      return applyGrant(state, operation);
+      return applyGrant(document, operation, ctx);
     case 'revoke':
-      return applyRevoke(state, operation);
+      return applyRevoke(document, operation, ctx);
     case 'setRls':
-      return applySetRls(state, operation);
-    case 'setFlags':
-      return applySetFlags(state, operation);
-    case 'addTemplate':
-      state.templates.set(operation.name, operation.condition);
-      return [];
-    case 'removeTemplate':
-      if (!state.templates.delete(operation.name)) {
-        return [`Шаблон "${operation.name}" отсутствует.`];
+      return applySetRls(document, operation, ctx);
+    case 'setFlags': {
+      let changed = false;
+      for (const flag of ['setForNewObjects', 'setForAttributesByDefault', 'independentRightsOfChildObjects'] as const) {
+        const value = operation.flags[flag];
+        if (value !== undefined && document.setFlag(flag, value)) {
+          changed = true;
+        }
       }
-      return [];
+      return { changed, warnings: [] };
+    }
+    case 'addTemplate':
+      return { changed: document.setTemplate(operation.name, operation.condition), warnings: [] };
+    case 'removeTemplate': {
+      const changed = document.removeTemplate(operation.name);
+      return { changed, warnings: changed ? [] : [`Шаблон "${operation.name}" отсутствует.`] };
+    }
     default: {
       const exhaustive: never = operation;
       throw new Error(`Неизвестная операция: ${JSON.stringify(exhaustive)}`);
@@ -181,13 +133,16 @@ function applyOperation(state: RoleRightsState, operation: RoleRightsEditOperati
   }
 }
 
-function applyGrant(state: RoleRightsState, op: { object: string; preset?: string; rights?: readonly string[] | Record<string, boolean>; rls?: Record<string, string> }): string[] {
-  const warnings: string[] = [];
-  const objectName = translateObjectName(op.object);
-  if (!objectName) {
-    throw new Error('grant: пустое имя объекта.');
+/** grant — строгий: имя, которого платформа не знает, останавливает весь пакет без записи. */
+function applyGrant(document: RightsXmlDocument, op: GrantOperation, ctx: RoleNameContext): OperationOutcome {
+  const resolved = resolveRoleObjectName(op.object, ctx, 'strict');
+  if ('error' in resolved) {
+    throw new Error(`grant: ${resolved.error}`);
   }
-  const rights = state.objects.get(objectName) ?? new Map<string, RightEntry>();
+  const objectName = resolved.name;
+  const warnings: string[] = [];
+  let changed = false;
+  const has = (rightName: string): boolean => document.getObjectRights(objectName)?.some((right) => right.name === rightName) ?? false;
 
   if (op.preset) {
     const presetName = op.preset.replace(/^@/, '');
@@ -195,183 +150,100 @@ function applyGrant(state: RoleRightsState, op: { object: string; preset?: strin
     if (!presetRights) {
       warnings.push(`Пресет @${presetName} не определён для типа ${getObjectType(objectName)}.`);
     } else {
+      // Пресет только добавляет недостающее: явно снятые права (value=false) он не перетирает.
       for (const right of presetRights) {
-        if (!rights.has(right)) {
-          rights.set(right, { value: 'true' });
+        if (!has(right) && document.setRight(objectName, right, 'true')) {
+          changed = true;
         }
       }
     }
   }
 
-  if (Array.isArray(op.rights)) {
-    for (const raw of op.rights) {
-      const rightName = translateRightName(String(raw));
-      if (!isKnownRight(objectName, rightName)) {
-        warnings.push(unknownRightMessage(objectName, rightName));
-        continue;
-      }
-      rights.set(rightName, { ...(rights.get(rightName) ?? {}), value: 'true' });
+  const requested: [string, 'true' | 'false'][] = Array.isArray(op.rights)
+    ? op.rights.map((raw) => [translateRightName(String(raw)), 'true'])
+    : Object.entries(op.rights ?? {}).map(([raw, value]) => [translateRightName(raw), value ? 'true' : 'false']);
+  for (const [rightName, value] of requested) {
+    if (!isAllowedRight(objectName, rightName)) {
+      warnings.push(`${objectName}: право "${rightName}" не существует в платформе 1С 8.3 и пропущено — проверь имя или удали его из grant.rights.`);
+      continue;
     }
-  } else if (op.rights && typeof op.rights === 'object') {
-    for (const [raw, value] of Object.entries(op.rights)) {
-      const rightName = translateRightName(raw);
-      if (!isKnownRight(objectName, rightName)) {
-        warnings.push(unknownRightMessage(objectName, rightName));
-        continue;
-      }
-      rights.set(rightName, { ...(rights.get(rightName) ?? {}), value: value ? 'true' : 'false' });
+    if (document.setRight(objectName, rightName, value)) {
+      changed = true;
     }
   }
 
-  if (op.rls) {
-    for (const [raw, condition] of Object.entries(op.rls)) {
-      const rightName = translateRightName(raw);
-      const existing = rights.get(rightName);
-      if (!existing) {
-        warnings.push(`${objectName}: RLS задано для отсутствующего права ${rightName}; добавь его в grant.rights.`);
-        continue;
-      }
-      const next: RightEntry = { value: existing.value };
-      if (condition) {
-        next.condition = condition;
-      }
-      rights.set(rightName, next);
+  for (const [raw, condition] of Object.entries(op.rls ?? {})) {
+    const rightName = translateRightName(raw);
+    if (!has(rightName)) {
+      warnings.push(`${objectName}: RLS задано для отсутствующего права ${rightName}; добавь его в grant.rights.`);
+      continue;
+    }
+    if (document.setCondition(objectName, rightName, condition || undefined)) {
+      changed = true;
     }
   }
 
-  if (rights.size === 0 && !op.preset) {
+  if (!op.preset && requested.length === 0 && !document.getObjectRights(objectName)) {
     warnings.push(`grant ${objectName}: ничего не выдано — укажи rights, preset или rls.`);
-    return warnings;
   }
-
-  state.objects.set(objectName, rights);
-  return warnings;
+  return { changed, warnings };
 }
 
-function isKnownRight(objectName: string, rightName: string): boolean {
-  // Для вложенных объектов (Catalog.X.Attribute.Y, ...Command.Z, ...Channel.W) допустимы
-  // ограниченные наборы прав — иначе ориентируемся на KNOWN_RIGHTS по типу владельца.
-  const parts = objectName.split('.');
-  if (parts.length >= 3) {
-    const nestedKind = parts[parts.length - 2];
-    if (nestedKind === 'Command') {
-      return rightName === 'View';
-    }
-    if (nestedKind === 'Channel') {
-      return rightName === 'Use';
-    }
-    return rightName === 'View' || rightName === 'Edit';
+/**
+ * Объект для revoke/setRls (нестрогий режим): сначала каноническое имя, затем сырое —
+ * так удаляется мусор вроде `Справочники.Банки`, записанный в роль старым дефектом.
+ */
+function findLenientObject(document: RightsXmlDocument, raw: string, ctx: RoleNameContext): { name: string; nonCanonical: boolean } | undefined {
+  const resolved = resolveRoleObjectName(raw, ctx, 'lenient');
+  /* c8 ignore next -- lenient-режим ошибок не возвращает (контракт каталога); ветка нужна только типам */
+  const name = 'name' in resolved ? resolved.name : raw.trim();
+  if (document.getObjectRights(name)) {
+    return { name, nonCanonical: false };
   }
-  const objectType = getObjectType(objectName);
-  const allowed = KNOWN_RIGHTS[objectType];
-  if (!allowed) {
-    // Тип объекта не каталогизирован в KNOWN_RIGHTS — пропускаем без отбивки,
-    // чтобы не блокировать пользовательские/расширительные конструкции.
-    return true;
+  const trimmed = raw.trim();
+  if (trimmed !== name && document.getObjectRights(trimmed)) {
+    return { name: trimmed, nonCanonical: true };
   }
-  return allowed.includes(rightName);
+  return undefined;
 }
 
-function unknownRightMessage(objectName: string, rightName: string): string {
-  return `${objectName}: право "${rightName}" не существует в платформе 1С 8.3 и пропущено — проверь имя или удали его из grant.rights.`;
-}
-
-function applyRevoke(state: RoleRightsState, op: { object: string; rights?: readonly string[] }): string[] {
-  const warnings: string[] = [];
-  const objectName = translateObjectName(op.object);
-  if (!objectName) {
-    throw new Error('revoke: пустое имя объекта.');
+function applyRevoke(document: RightsXmlDocument, op: RevokeOperation, ctx: RoleNameContext): OperationOutcome {
+  const target = findLenientObject(document, op.object, ctx);
+  if (!target) {
+    return { changed: false, warnings: [`Объект ${op.object} отсутствует в Rights.xml.`] };
   }
+  const warnings: string[] = target.nonCanonical
+    ? [`${target.name}: удалён объект с неканоническим именем (так его записала прежняя версия инструмента).`]
+    : [];
   if (!op.rights || op.rights.length === 0) {
-    if (!state.objects.delete(objectName)) {
-      warnings.push(`Объект ${objectName} отсутствует в Rights.xml.`);
-    }
-    return warnings;
+    return { changed: document.removeObject(target.name), warnings };
   }
-  const rights = state.objects.get(objectName);
-  if (!rights) {
-    warnings.push(`Объект ${objectName} отсутствует в Rights.xml.`);
-    return warnings;
-  }
+  let changed = false;
   for (const raw of op.rights) {
     const rightName = translateRightName(raw);
-    if (!rights.delete(rightName)) {
-      warnings.push(`${objectName}: право ${rightName} не было задано.`);
+    if (document.removeRight(target.name, rightName)) {
+      changed = true;
+    } else {
+      warnings.push(`${target.name}: право ${rightName} не было задано.`);
     }
   }
-  if (rights.size === 0) {
-    state.objects.delete(objectName);
-  } else {
-    state.objects.set(objectName, rights);
+  if (changed && document.getObjectRights(target.name)?.length === 0) {
+    document.removeObject(target.name);
   }
-  return warnings;
+  return { changed, warnings };
 }
 
-function applySetRls(state: RoleRightsState, op: { object: string; right: string; condition?: string }): string[] {
-  const warnings: string[] = [];
-  const objectName = translateObjectName(op.object);
+function applySetRls(document: RightsXmlDocument, op: SetRlsOperation, ctx: RoleNameContext): OperationOutcome {
+  const target = findLenientObject(document, op.object, ctx);
+  if (!target) {
+    return { changed: false, warnings: [`Объект ${op.object} отсутствует — RLS не применено.`] };
+  }
   const rightName = translateRightName(op.right);
-  const rights = state.objects.get(objectName);
-  if (!rights) {
-    warnings.push(`Объект ${objectName} отсутствует — RLS не применено.`);
-    return warnings;
+  if (!document.getObjectRights(target.name)?.some((right) => right.name === rightName)) {
+    return { changed: false, warnings: [`${target.name}: право ${rightName} отсутствует — RLS не применено.`] };
   }
-  const existing = rights.get(rightName);
-  if (!existing) {
-    warnings.push(`${objectName}: право ${rightName} отсутствует — RLS не применено.`);
-    return warnings;
-  }
-  const next: RightEntry = { value: existing.value };
-  if (op.condition && op.condition.trim().length > 0) {
-    next.condition = op.condition;
-  }
-  rights.set(rightName, next);
-  return warnings;
-}
-
-function applySetFlags(state: RoleRightsState, op: { flags: { setForNewObjects?: boolean; setForAttributesByDefault?: boolean; independentRightsOfChildObjects?: boolean } }): string[] {
-  if (op.flags.setForNewObjects !== undefined) {
-    state.setForNewObjects = op.flags.setForNewObjects;
-  }
-  if (op.flags.setForAttributesByDefault !== undefined) {
-    state.setForAttributesByDefault = op.flags.setForAttributesByDefault;
-  }
-  if (op.flags.independentRightsOfChildObjects !== undefined) {
-    state.independentRightsOfChildObjects = op.flags.independentRightsOfChildObjects;
-  }
-  return [];
-}
-
-function parseFlag(value: string | undefined, fallback: boolean): boolean {
-  if (value === 'true') {
-    return true;
-  }
-  if (value === 'false') {
-    return false;
-  }
-  return fallback;
-}
-
-function stateToObjects(state: RoleRightsState): SerializableRoleObject[] {
-  return [...state.objects.entries()].map(([name, rights]) => ({
-    name,
-    rights: [...rights.entries()].map(([rightName, entry]) => ({
-      name: rightName,
-      value: entry.value,
-      condition: entry.condition,
-    })),
-  }));
-}
-
-function snapshotKey(state: RoleRightsState): string {
-  return JSON.stringify({
-    f: [state.setForNewObjects, state.setForAttributesByDefault, state.independentRightsOfChildObjects],
-    o: [...state.objects.entries()].map(([name, rights]) => [
-      name,
-      [...rights.entries()].map(([rightName, entry]) => [rightName, entry.value, entry.condition ?? '']),
-    ]),
-    t: [...state.templates.entries()],
-  });
+  const condition = op.condition && op.condition.trim().length > 0 ? op.condition : undefined;
+  return { changed: document.setCondition(target.name, rightName, condition), warnings: [] };
 }
 
 function fail(rightsPath: string, message: string): RoleRightsEditResult {

@@ -151,9 +151,10 @@ export function registerRoleTools(server: McpServer, deps: McpRegistrationDeps):
     {
       title: 'Точечное редактирование прав роли',
       description: [
-        'Применяет операции к Rights.xml роли. Объекты задаются именами 1С с типами',
-        '(Catalog.Контрагенты или Справочник.Контрагенты). Поддерживаются операции:',
-        'grant/revoke/setRls/setFlags/addTemplate/removeTemplate.',
+        'Применяет операции к Rights.xml роли. Объекты — имена 1С (Catalog.Контрагенты, Catalog.X.Attribute.Y),',
+        'канон MCP (Справочники.Контрагенты, Справочники.X.Реквизит.Y) или единственное число (Справочник.Контрагенты).',
+        'Повтор уже выданного права не меняет файл.',
+        'Поддерживаются операции: grant/revoke/setRls/setFlags/addTemplate/removeTemplate.',
         'Принимает канонический путь роли: Роли.БазовыеПрава.',
       ].join(' '),
       inputSchema: z.object({

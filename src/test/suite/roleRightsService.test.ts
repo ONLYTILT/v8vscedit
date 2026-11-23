@@ -5,6 +5,7 @@ import * as path from 'path';
 import { RoleRightsService } from '../../infra/role';
 import { ConfigurationInfoService, ConfigurationScaffoldService } from '../../infra/xml';
 import { EXAMPLE_GENERATIONS, hasCorpus } from './support/corpus';
+import { removeTreeSync } from './support/tempTree';
 
 suite('roleRightsService', () => {
   test('читает сводку прав роли из реального Rights.xml', function () {
@@ -229,6 +230,89 @@ suite('roleRightsService', () => {
     assert.deepStrictEqual([...cleared.roles], []);
     const finalXml = fs.readFileSync(configPath, 'utf-8');
     assert.ok(/<DefaultRoles\s*\/>/.test(finalXml));
+  });
+
+  test('фасад: compile принимает канон MCP и единственное число, повтор выданного права через edit не меняет файл', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-role-idempotent-'));
+    try {
+      new ConfigurationScaffoldService().createConfiguration({ name: 'Основа', outputDir: root, compatibilityMode: 'Version8_3_24' });
+      const service = new RoleRightsService();
+      const compiled = service.compile({
+        outputDir: root,
+        definition: { name: 'Идемпотентная', objects: ['РегистрСведений.Курсы: Read,View', 'Справочники.Банки: Read'] },
+      });
+      const before = fs.readFileSync(compiled.rightsPath);
+      assert.ok(before.toString('utf-8').includes('<name>InformationRegister.Курсы</name>'));
+      assert.ok(before.toString('utf-8').includes('<name>Catalog.Банки</name>'));
+
+      const repeat = service.edit({
+        rightsPath: compiled.rightsPath,
+        operations: [{ op: 'grant', object: 'РегистрСведений.Курсы', rights: ['Read', 'View'] }],
+      });
+      assert.strictEqual(repeat.success, true);
+      assert.strictEqual(repeat.changed, false);
+      assert.strictEqual(repeat.applied, 0);
+      assert.ok(fs.readFileSync(compiled.rightsPath).equals(before));
+    } finally {
+      removeTreeSync(root);
+    }
+  });
+
+  test('compile: объект с массивом rights и без поля name — права фильтруются каталогом, безымянный пропускается с предупреждением', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-role-compile-array-'));
+    try {
+      new ConfigurationScaffoldService().createConfiguration({ name: 'Основа', outputDir: root, compatibilityMode: 'Version8_3_24' });
+      const result = new RoleRightsService().compile({
+        outputDir: root,
+        definition: {
+          name: 'МассивПрав',
+          objects: [{ name: 'Catalog.Товары', rights: ['Read', 'Выдумка'] }, { preset: 'view' }],
+        },
+      });
+      assert.ok(result.warnings.includes('Объект прав без поля name пропущен.'), result.warnings.join('|'));
+      assert.ok(result.warnings.some((w) => w.includes('Catalog.Товары') && w.includes('Выдумка')), result.warnings.join('|'));
+      const rights = fs.readFileSync(result.rightsPath, 'utf-8');
+      assert.ok(rights.includes('<name>Catalog.Товары</name>'));
+      assert.ok(rights.includes('<name>Read</name>'));
+      assert.ok(!rights.includes('Выдумка'));
+    } finally {
+      removeTreeSync(root);
+    }
+  });
+
+  test('edit: RLS снимается пустым условием в grant; setRls для отсутствующего права объекта — предупреждение без правки файла', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'v8vscedit-role-edit-rls-'));
+    try {
+      new ConfigurationScaffoldService().createConfiguration({ name: 'Основа', outputDir: root, compatibilityMode: 'Version8_3_24' });
+      const service = new RoleRightsService();
+      const compiled = service.compile({ outputDir: root, definition: { name: 'РольRls', objects: ['Catalog.Товары: Read'] } });
+
+      const withRls = service.edit({
+        rightsPath: compiled.rightsPath,
+        operations: [{ op: 'grant', object: 'Catalog.Товары', rls: { Read: 'ГДЕ Код = 1' } }],
+      });
+      assert.strictEqual(withRls.changed, true);
+      assert.ok(fs.readFileSync(compiled.rightsPath, 'utf-8').includes('ГДЕ Код = 1'));
+
+      const cleared = service.edit({
+        rightsPath: compiled.rightsPath,
+        operations: [{ op: 'grant', object: 'Catalog.Товары', rls: { Read: '' } }],
+      });
+      assert.strictEqual(cleared.changed, true);
+      assert.ok(!fs.readFileSync(compiled.rightsPath, 'utf-8').includes('restrictionByCondition'));
+
+      const before = fs.readFileSync(compiled.rightsPath);
+      const absent = service.edit({
+        rightsPath: compiled.rightsPath,
+        operations: [{ op: 'setRls', object: 'Catalog.Товары', right: 'Update', condition: 'ГДЕ 1' }],
+      });
+      assert.strictEqual(absent.success, true);
+      assert.strictEqual(absent.changed, false);
+      assert.deepStrictEqual(absent.warnings, ['Catalog.Товары: право Update отсутствует — RLS не применено.']);
+      assert.ok(fs.readFileSync(compiled.rightsPath).equals(before));
+    } finally {
+      removeTreeSync(root);
+    }
   });
 
   test('находит ошибки в некорректном Rights.xml', () => {
