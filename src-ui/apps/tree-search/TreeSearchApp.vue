@@ -13,6 +13,7 @@ const searchQuery = ref(props.initialState?.searchQuery ?? '');
 const initialized = ref(props.initialState?.initialized ?? false);
 const serverStatus = ref(props.initialState?.serverStatus ?? { state: 'unconfigured' as const });
 
+const searchInputRef = ref<HTMLElement | null>(null);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 
 function onSearchInput(value: string): void {
@@ -24,8 +25,20 @@ function onSearchInput(value: string): void {
 }
 
 function clearSearch(): void {
+  // Без отмены отложенный запрос через 400 мс вернул бы только что сброшенный фильтр.
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = undefined;
   searchQuery.value = '';
   props.messageBus.send({ type: 'command', command: 'v8vscedit.clearSearch' });
+}
+
+/**
+ * Эхо хоста (нормализованный запрос: trim, <3 символов → '') приходит позже, чем
+ * пользователь допечатывает; пока поле в фокусе, перезапись откатывала бы набранное.
+ * У веб-компонента фокус внутри shadow DOM, activeElement — сам хост-элемент.
+ */
+function isSearchInputFocused(): boolean {
+  return searchInputRef.value !== null && document.activeElement === searchInputRef.value;
 }
 
 function executeCommand(command: string): void {
@@ -35,7 +48,7 @@ function executeCommand(command: string): void {
 function handleHostMessage(msg: HostToUiMessage): void {
   if (msg.type === 'state') {
     const state = msg.state as Partial<TreeSearchState>;
-    if (state.searchQuery !== undefined) searchQuery.value = state.searchQuery;
+    if (state.searchQuery !== undefined && !isSearchInputFocused()) searchQuery.value = state.searchQuery;
     if (state.initialized !== undefined) initialized.value = state.initialized;
     if (state.serverStatus) serverStatus.value = state.serverStatus as TreeSearchState['serverStatus'];
   }
@@ -56,6 +69,7 @@ onUnmounted(() => {
       <div class="search-input-wrapper">
         <span class="search-icon codicon codicon-search" aria-hidden="true"></span>
         <vscode-textfield
+          ref="searchInputRef"
           class="search-input"
           :value="searchQuery"
           placeholder="Поиск по метаданным..."

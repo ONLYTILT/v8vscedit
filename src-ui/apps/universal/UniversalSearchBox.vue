@@ -11,9 +11,15 @@ const emit = defineEmits<{
 }>();
 
 const localQuery = ref(props.query);
+const inputRef = ref<HTMLInputElement | null>(null);
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
+// Состояние хоста — эхо уже отправленного (и нормализованного: trim, <3 символов → '')
+// запроса, оно приходит позже, чем пользователь допечатывает. Пока поле в фокусе,
+// перезапись откатывала бы набранные символы, поэтому внешнее значение принимаем
+// только без фокуса (сброс поиска из другой панели/команды).
 watch(() => props.query, (query) => {
+  if (inputRef.value && document.activeElement === inputRef.value) return;
   localQuery.value = query;
 });
 
@@ -23,6 +29,12 @@ function onInput(value: string): void {
   debounceTimer = setTimeout(() => {
     emit('search', value);
   }, 400);
+}
+
+function submit(): void {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = undefined;
+  emit('search', localQuery.value);
 }
 
 function clear(): void {
@@ -42,6 +54,7 @@ onUnmounted(() => {
 <template>
   <div class="search">
     <input
+      ref="inputRef"
       :value="localQuery"
       type="text"
       placeholder="Поиск по метаданным"
@@ -49,7 +62,7 @@ onUnmounted(() => {
       autocomplete="off"
       spellcheck="false"
       @input="onInput(($event.target as HTMLInputElement).value)"
-      @keydown.enter="emit('search', localQuery)"
+      @keydown.enter="submit"
       @keydown.escape="clear"
     />
     <button
