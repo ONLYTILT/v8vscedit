@@ -22,6 +22,7 @@ const processing = ref(props.initialState?.processing ?? false);
 const processingTitle = ref(props.initialState?.processingTitle ?? '');
 const processingMessage = ref(props.initialState?.processingMessage ?? '');
 const searchQuery = ref(props.initialState?.searchQuery ?? '');
+const lockedOnly = ref(props.initialState?.lockedOnly ?? false);
 const openNodeIds = ref<IdMap>(toIdMap(props.initialState?.openNodeIds));
 const loadingNodeIds = ref<IdMap>(Object.freeze({}));
 const rootNodes = ref<TreeNodeDto[]>([...(props.initialState?.rootNodes ?? [])]);
@@ -36,6 +37,7 @@ const treeContainer = ref<HTMLElement | null>(null);
  * `searchQuery` меняется уже при вводе, и по нему не понять, что фильтр снят.
  */
 let appliedSearchQuery = props.initialState?.searchQuery ?? '';
+let appliedLockedOnly = props.initialState?.lockedOnly ?? false;
 
 /**
  * После снятия фильтра дерево снова полное, и выбранный узел оказывается вне
@@ -174,6 +176,16 @@ function onSearch(query: string): void {
   });
 }
 
+function onToggleLockedFilter(): void {
+  lockedOnly.value = !lockedOnly.value;
+  props.messageBus.send({
+    type: 'request',
+    requestId: 'setLockedFilter',
+    name: 'setLockedFilter',
+    payload: { enabled: lockedOnly.value },
+  });
+}
+
 function onClearSearch(): void {
   searchQuery.value = '';
   onSearch('');
@@ -232,12 +244,17 @@ function handleHostMessage(msg: HostToUiMessage): void {
     if (state.processing !== undefined) processing.value = state.processing;
     if (state.processingTitle !== undefined) processingTitle.value = state.processingTitle;
     if (state.processingMessage !== undefined) processingMessage.value = state.processingMessage;
-    let filterCleared = false;
+    const wasFiltered = appliedSearchQuery !== '' || appliedLockedOnly;
     if (state.searchQuery !== undefined) {
-      filterCleared = appliedSearchQuery !== '' && state.searchQuery === '';
       appliedSearchQuery = state.searchQuery;
       searchQuery.value = state.searchQuery;
     }
+    if (state.lockedOnly !== undefined) {
+      appliedLockedOnly = state.lockedOnly;
+      lockedOnly.value = state.lockedOnly;
+    }
+    // Последний фильтр снят (поиск очищен и/или отбор захваченных выключен) — дерево снова полное.
+    const filterCleared = wasFiltered && appliedSearchQuery === '' && !appliedLockedOnly;
     if (state.openNodeIds) openNodeIds.value = toIdMap(state.openNodeIds);
     if (state.selectedNodeId !== undefined) selectedNodeId.value = state.selectedNodeId;
     if (state.rootNodes) {
@@ -379,11 +396,25 @@ onUnmounted(() => {
           :message-bus="messageBus"
         />
 
-        <UniversalSearchBox
-          :query="searchQuery"
-          @search="onSearch"
-          @clear="onClearSearch"
-        />
+        <div class="search-row">
+          <UniversalSearchBox
+            class="search-box"
+            :query="searchQuery"
+            @search="onSearch"
+            @clear="onClearSearch"
+          />
+          <button
+            class="filter-toggle"
+            :class="{ active: lockedOnly }"
+            type="button"
+            title="Только захваченные в хранилище"
+            aria-label="Только захваченные в хранилище"
+            :aria-pressed="lockedOnly"
+            @click="onToggleLockedFilter"
+          >
+            <span class="codicon codicon-lock" aria-hidden="true" />
+          </button>
+        </div>
       </template>
     </section>
 
@@ -470,6 +501,21 @@ button {
 button:hover {
   background: var(--vscode-toolbar-hoverBackground);
   outline: 1px solid var(--vscode-toolbar-hoverOutline, transparent);
+}
+.search-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+}
+.search-box {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Включённый переключатель — как опции поиска VS Code («Учитывать регистр» и т.п.). */
+.filter-toggle.active {
+  color: var(--vscode-inputOption-activeForeground);
+  background: var(--vscode-inputOption-activeBackground);
+  border-color: var(--vscode-inputOption-activeBorder, transparent);
 }
 .ai-mark {
   font-size: 11px;

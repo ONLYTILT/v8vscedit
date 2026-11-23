@@ -24,6 +24,8 @@ export interface UniversalPanelState {
   readonly processingTitle?: string;
   readonly processingMessage?: string;
   readonly searchQuery: string;
+  /** Отбор «только захваченные в хранилище» включён. */
+  readonly lockedOnly: boolean;
   readonly openNodeIds: readonly string[];
   /** `null` — выбранного узла нет в текущем дереве (например, отфильтрован поиском). */
   readonly selectedNodeId: string | null;

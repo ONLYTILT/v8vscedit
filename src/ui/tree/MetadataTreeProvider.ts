@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { ConfigEntry } from '../../infra/fs/ConfigLocator';
 import type { RepositoryService } from '../../infra/repository/RepositoryService';
+import { createLockedObjectFilter, type LockedObjectFilter } from '../../infra/repository/RepositoryLockedObjectFilter';
 import { parseConfigXml } from '../../infra/xml';
 import { getObjectLocationFromXml } from '../../infra/fs/MetaPathResolver';
 import type { SupportInfoService } from '../../infra/support/SupportInfoService';
@@ -28,6 +29,7 @@ export class MetadataTreeProvider implements vscode.TreeDataProvider<MetadataNod
   private roots: MetadataNode[] = [];
   private parentByNode = new WeakMap<MetadataNode, MetadataNode>();
   private searchQuery = '';
+  private lockedOnly = false;
 
   constructor(
     private entries: ConfigEntry[],
@@ -141,6 +143,27 @@ export class MetadataTreeProvider implements vscode.TreeDataProvider<MetadataNod
   /** Возвращает текущий фильтр дерева для повторного открытия строки поиска. */
   getSearchQuery(): string {
     return this.searchQuery;
+  }
+
+  /**
+   * Отбор «только захваченные в хранилище» (по локальному учёту захватов). Сочетается с
+   * поиском по тексту: поиск идёт уже по отобранному дереву.
+   */
+  setLockedOnlyFilter(enabled: boolean): void {
+    this.lockedOnly = enabled;
+    this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  isLockedOnlyFilter(): boolean {
+    return this.lockedOnly;
+  }
+
+  /**
+   * Активен ли какой-либо фильтр. При нём предки оставшихся узлов приходят с `Expanded` —
+   * потребитель дерева (webview) раскрывает их, иначе отбор показал бы свёрнутый корень.
+   */
+  hasActiveFilter(): boolean {
+    return this.lockedOnly || this.searchQuery !== '';
   }
 
   /** Сбрасывает активный фильтр дерева. */
@@ -442,11 +465,70 @@ export class MetadataTreeProvider implements vscode.TreeDataProvider<MetadataNod
   }
 
   private getVisibleRoots(): MetadataNode[] {
-    if (!this.searchQuery) {
-      return this.roots;
+    let roots = this.roots;
+    if (this.lockedOnly) {
+      // Без сервиса хранилища захватов нет — пустое дерево, а не полное: иначе включённая
+      // кнопка отбора выглядела бы как не сработавшая.
+      roots = this.repositoryService ? this.filterLocked(roots, this.repositoryService, null) : [];
     }
+    if (this.searchQuery) {
+      roots = this.filterNodes(roots, this.normalizeSearchText(this.searchQuery));
+    }
+    return roots;
+  }
 
-    return this.filterNodes(this.roots, this.normalizeSearchText(this.searchQuery));
+  /**
+   * Оставляет захваченные объекты и путь к ним. Захваченный объект возвращается как есть — со
+   * всем составом: захват в учёте ведётся по объекту целиком. Срез учёта строится один раз на
+   * корень конфигурации/расширения; до первого корня (узел «Расширения») `scope` пуст.
+   */
+  private filterLocked(
+    nodes: MetadataNode[],
+    repository: RepositoryService,
+    scope: LockedObjectFilter | null
+  ): MetadataNode[] {
+    const result: MetadataNode[] = [];
+    for (const node of nodes) {
+      if (this.isRootRepositoryNode(node)) {
+        /* c8 ignore next -- корень конфигурации/расширения всегда строится с xmlPath (Configuration.xml) */
+        const rootScope = node.xmlPath ? createLockedObjectFilter(repository, node.xmlPath) : null;
+        if (!rootScope) {
+          continue;
+        }
+        const children = this.filterLocked(this.childrenOf(node), repository, rootScope);
+        if (children.length > 0 || rootScope.rootLocked) {
+          result.push(this.cloneFilteredBranch(node, children));
+        }
+        continue;
+      }
+
+      const verdict = scope
+        ? scope.classify({ nodeKind: node.nodeKind, label: node.textLabel, xmlPath: node.xmlPath, metaContext: node.metaContext })
+        : 'descend';
+      if (verdict === 'locked') {
+        result.push(node);
+        continue;
+      }
+      if (verdict === 'skip') {
+        continue;
+      }
+      const children = this.filterLocked(this.childrenOf(node), repository, scope);
+      if (children.length > 0) {
+        result.push(this.cloneFilteredBranch(node, children));
+      }
+    }
+    return result;
+  }
+
+  /** Узел-предок отобранных: раскрыт и показывает только их; без них — лист. */
+  private cloneFilteredBranch(node: MetadataNode, children: MetadataNode[]): MetadataNode {
+    return children.length > 0
+      ? this.cloneNode(node, vscode.TreeItemCollapsibleState.Expanded, () => children)
+      : this.cloneNode(node, vscode.TreeItemCollapsibleState.None);
+  }
+
+  private childrenOf(node: MetadataNode): MetadataNode[] {
+    return node.childrenLoader ? node.childrenLoader() : [];
   }
 
   private filterNodes(nodes: MetadataNode[], normalizedQuery: string): MetadataNode[] {

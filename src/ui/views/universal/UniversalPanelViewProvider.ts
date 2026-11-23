@@ -64,6 +64,8 @@ interface UniversalPanelState {
   readonly processingTitle?: string;
   readonly processingMessage?: string;
   readonly searchQuery: string;
+  /** Отбор «только захваченные в хранилище» включён. */
+  readonly lockedOnly: boolean;
   readonly openNodeIds: readonly string[];
   /**
    * `null`, а не отсутствие поля: id позиционные, и при сериализации `undefined`
@@ -302,6 +304,7 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
       processingTitle: processingState.title,
       processingMessage: processingState.message,
       searchQuery: this.services.treeProvider.getSearchQuery(),
+      lockedOnly: this.services.treeProvider.isLockedOnlyFilter(),
       openNodeIds: [...this.currentOpenNodeIds],
       selectedNodeId: this.currentSelectedNodeId ?? null,
       rootNodes: this.cachedRootNodes,
@@ -321,6 +324,7 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
         processingTitle: processingState.title,
         processingMessage: processingState.message,
         searchQuery: this.services.treeProvider.getSearchQuery(),
+        lockedOnly: this.services.treeProvider.isLockedOnlyFilter(),
         openNodeIds: [...this.currentOpenNodeIds],
         selectedNodeId: this.currentSelectedNodeId ?? null,
         rootNodes: this.cachedRootNodes,
@@ -401,6 +405,12 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
       return;
     }
 
+    if (name === 'setLockedFilter') {
+      this.services.treeProvider.setLockedOnlyFilter((payload as { enabled?: unknown } | undefined)?.enabled === true);
+      this.postState();
+      return;
+    }
+
     if (name === 'refreshStandaloneStatus') {
       const status = await this.services.refreshStandaloneServerStatus();
       await this.postStandaloneStatus(status);
@@ -453,7 +463,11 @@ export class UniversalPanelViewProvider implements vscode.WebviewViewProvider, v
 
     const hasChildren = Boolean(node.childrenLoader);
     const ctxValue = node.contextValue ?? '';
-    const open = this.openNodeKeys.has(nodeKey) || this.isSelectedAncestor(nodeKey);
+    // Под фильтром предки оставшихся узлов приходят с Expanded (см. MetadataTreeProvider.hasActiveFilter):
+    // без этого отбор/поиск показывали бы свёрнутые ветки, которые пришлось бы раскрывать вручную.
+    const open = this.openNodeKeys.has(nodeKey)
+      || this.isSelectedAncestor(nodeKey)
+      || (node.collapsibleState === vscode.TreeItemCollapsibleState.Expanded && this.services.treeProvider.hasActiveFilter());
     const selected = this.selectedNodeKey === nodeKey;
     if (open) {
       this.currentOpenNodeIds.add(id);

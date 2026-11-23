@@ -17,6 +17,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { ConfigEntry } from '../../../infra/fs/ConfigLocator';
+import type { RepositoryService } from '../../../infra/repository/RepositoryService';
 import type { SupportInfoService } from '../../../infra/support/SupportInfoService';
 import { GitMetadataStatusService } from '../../../infra/git/GitMetadataStatusService';
 import { MetadataTreeProvider } from '../../../ui/tree/MetadataTreeProvider';
@@ -56,6 +57,8 @@ export interface TreeNodeDtoLike {
 export interface UniversalPanelFixtureOptions {
   readonly entries?: ConfigEntry[];
   readonly supportService?: SupportInfoService;
+  /** Реальный сервис хранилища над временным каталогом: учёт захватов и привязка в env.json. */
+  readonly repositoryService?: RepositoryService;
 }
 
 interface InitialStateLike {
@@ -72,6 +75,7 @@ interface ChildrenLoadedMessage {
 /** Полный снимок состояния панели, который хост шлёт сообщением `state`. */
 export interface PanelStateLike {
   readonly searchQuery: string;
+  readonly lockedOnly: boolean;
   readonly openNodeIds: readonly string[];
   readonly selectedNodeId?: string | null;
   readonly rootNodes: readonly TreeNodeDtoLike[];
@@ -89,6 +93,10 @@ export interface UniversalPanelFixture {
   sendCommand(command: string, payload?: unknown): void;
   /** Шлёт запрос поиска (как поле поиска webview) и возвращает следующий снимок `state`. */
   search(query: string): Promise<PanelStateLike>;
+  /** Шлёт произвольный запрос webview и возвращает следующий снимок `state`. */
+  requestState(name: string, payload?: unknown): Promise<PanelStateLike>;
+  /** Шлёт запрос webview и ждёт ответное сообщение хоста указанного типа. */
+  request(name: string, payload: unknown, responseType: string): Promise<unknown>;
   dispose(): void;
 }
 
@@ -135,7 +143,7 @@ export function createUniversalPanelFixture(options: UniversalPanelFixtureOption
     { kind: 'cfe', rootPath: CFE_EVOLC_ROOT },
   ];
   const treeProvider = new MetadataTreeProvider(
-    entries, vscode.Uri.file(EXTENSION_ROOT), cacheRoot, undefined, options.supportService
+    entries, vscode.Uri.file(EXTENSION_ROOT), cacheRoot, undefined, options.supportService, options.repositoryService
   );
 
   const standaloneStatus = {
@@ -184,6 +192,19 @@ export function createUniversalPanelFixture(options: UniversalPanelFixtureOption
   const initialState = extractInitialState(webview.html);
 
   let requestCounter = 0;
+  const request = async (name: string, payload: unknown, responseType: string): Promise<unknown> => {
+    const sentAt = postedMessages.length;
+    requestCounter += 1;
+    messageEmitter.fire({ type: 'request', requestId: `${name}-${String(requestCounter)}`, name, payload });
+    return waitFor(
+      () => postedMessages.slice(sentAt).find(
+        (item) => typeof item === 'object' && item !== null && (item as { type?: string }).type === responseType
+      ),
+      `не получено сообщение ${responseType} после запроса «${name}»`
+    );
+  };
+  const requestState = async (name: string, payload?: unknown): Promise<PanelStateLike> =>
+    ((await request(name, payload, 'state')) as { state: PanelStateLike }).state;
   return {
     rootNodes: initialState.state.rootNodes,
     loadChildren: async (nodeId: string) => {
@@ -214,19 +235,9 @@ export function createUniversalPanelFixture(options: UniversalPanelFixtureOption
     sendCommand: (command: string, payload?: unknown) => {
       messageEmitter.fire({ type: 'command', command, payload });
     },
-    search: async (query: string) => {
-      const sentAt = postedMessages.length;
-      requestCounter += 1;
-      messageEmitter.fire({ type: 'request', requestId: `search-${String(requestCounter)}`, name: 'search', payload: { query } });
-      const message = await waitFor(
-        () => postedMessages.slice(sentAt).find(
-          (item): item is { type: 'state'; state: PanelStateLike } =>
-            typeof item === 'object' && item !== null && (item as { type?: string }).type === 'state'
-        ),
-        `не получен снимок state после поиска «${query}»`
-      );
-      return message.state;
-    },
+    search: (query: string) => requestState('search', { query }),
+    requestState,
+    request,
     dispose: () => {
       treeProvider.dispose();
       fs.rmSync(cacheRoot, { recursive: true, force: true });
